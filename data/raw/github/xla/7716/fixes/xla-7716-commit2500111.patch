@@ -1,0 +1,23 @@
+From 2500111022fc9791bd9134134258c2606be50c4d Mon Sep 17 00:00:00 2001
+From: xla authors <google-ml-automation@google.com>
+Date: Tue, 3 Dec 2024 05:16:33 -0800
+Subject: [PATCH] Turn on by default multi-process autotune shard
+
+PiperOrigin-RevId: 702300808
+---
+ xla/debug_options_flags.cc | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/xla/debug_options_flags.cc b/xla/debug_options_flags.cc
+index 1588a4587db08..d33c479587c0f 100644
+--- a/xla/debug_options_flags.cc
++++ b/xla/debug_options_flags.cc
+@@ -269,7 +269,7 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
+ 
+   opts.set_xla_gpu_nccl_terminate_on_error(false);
+ 
+-  opts.set_xla_gpu_shard_autotuning(false);
++  opts.set_xla_gpu_shard_autotuning(true);
+ 
+   opts.set_xla_syntax_sugar_async_ops(false);
+ 

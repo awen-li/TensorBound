@@ -1,0 +1,36 @@
+{
+  "accounted_reports": 264,
+  "analysis_status": {
+    "repair_backed_duplicate": 13,
+    "repair_backed_primary": 149,
+    "reviewed_no_traceable_landed_repair": 102
+  },
+  "by_stack": {
+    "iree": {
+      "repair_backed_duplicate": 3,
+      "repair_backed_primary": 46,
+      "reviewed_no_traceable_landed_repair": 25
+    },
+    "pytorch-inductor-triton": {
+      "repair_backed_duplicate": 8,
+      "repair_backed_primary": 55,
+      "reviewed_no_traceable_landed_repair": 36
+    },
+    "xla-jax-pjrt": {
+      "repair_backed_duplicate": 2,
+      "repair_backed_primary": 48,
+      "reviewed_no_traceable_landed_repair": 41
+    }
+  },
+  "cohort_reports": 264,
+  "distinct_repair_backed_causes": 149,
+  "interpretation": {
+    "repair_backed_duplicate": "The report maps to a repaired cause represented by another report in the 264-report cohort.",
+    "repair_backed_primary": "The report has a complete implemented-relation-to-landed-repair chain.",
+    "reviewed_no_traceable_landed_repair": "The report remains in the confirmed in-scope cohort, but the collected public evidence does not identify a landed repair that completes the causal chain."
+  },
+  "repair_backed_reports": 162,
+  "schema_version": "1.0.0",
+  "scope_note": "These counts measure documentary causal-reconstruction coverage within the confirmed 264-report cohort. They do not estimate bug prevalence.",
+  "status": "complete"
+}

@@ -1,0 +1,653 @@
+{
+  "schema_version": "1.0.0",
+  "documentation_snapshot_date": "2026-10-01",
+  "scope": "Study-derived families for the 149 published repaired causes. This revision documents existing labels; it does not recode them.",
+  "historical_precomparison_freeze_verified": false,
+  "initial_basis": "TEB dimensions, open native-system coding, and repair semantics; archived root-cause codebook v2 and cohort extension v3.",
+  "normalization_rule": "Group native concepts by their causal role at the first invalid decision, retaining the native description and source evidence.",
+  "primary_rule": "Choose the condition whose violation first permits the effect. Preserve later mechanisms without counting them as primary.",
+  "secondary_rule": "Use only obligations selected by both recorded passes, excluding the primary obligation, for compound analysis.",
+  "freeze_policy": "This documentation snapshot is versioned separately from archived A/B labels. Earlier files preserve vocabularies and reconciled assignments but do not establish a complete definition freeze before comparison. Any future semantic definition change requires a new version, recoding and recomputed agreement and RQ tables.",
+  "dimensions": {
+    "relation_family": {
+      "logical value--storage content": {
+        "definition": "The logical value is represented by the current bytes or initialized state of storage.",
+        "inclusion_rule": "Content initialization or updates determine validity.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Use content for which bytes must be present; use layout for where elements reside.",
+        "nearest_competing_family": "value--storage/layout",
+        "tie_breaking_rule": "Use content for which bytes must be present; use layout for where elements reside.",
+        "positive_example": {
+          "cause_id": "cause-iree-12161-cached-buffer-publication",
+          "case_path": "data/final/iree/12161/report.md",
+          "native_relation": "The caching allocator binds a logical parameter and initial_data to a free-pool HAL buffer.",
+          "root_cause": "The old caching allocator treated a matching reusable allocation as initialized even when initial_data was supplied.",
+          "repair": "Commit 7be84611 writes initial_data into an existing buffer, checks the write status, and returns the buffer only after successful initialization."
+        }
+      },
+      "operation--completion": {
+        "definition": "An operation is related to its readiness, completion, or dependency state.",
+        "inclusion_rule": "The operation must wait, finish, or make progress before another action.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Use completion for execution readiness; use lifetime for keeping the resource alive.",
+        "nearest_competing_family": "storage--ownership/lifetime",
+        "tie_breaking_rule": "Use completion for execution readiness; use lifetime for keeping the resource alive.",
+        "positive_example": {
+          "cause_id": "cause-iree-13451-incomplete-multibuffering-still-pipelined",
+          "case_path": "data/final/iree/13451/report.md",
+          "native_relation": "The tensor-core strategy binds loop iterations, async copies, shared-memory stages, and mma.sync consumers.",
+          "root_cause": "The old strategy allowed a pipeline schedule after multibuffering failed to separate every participating shared-memory operand.",
+          "repair": "PR 13971 makes the mma.sync schedule explicit, rejects incomplete scheduling ingredients, strengthens strategy validation, and adds conservative size and depth guards."
+        }
+      },
+      "operation--execution context": {
+        "definition": "An operation is bound to a device, backend, stream, or execution configuration.",
+        "inclusion_rule": "The consuming decision selects or uses an execution environment.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Use context for where or under which configuration execution occurs; identity for which logical entity is selected.",
+        "nearest_competing_family": "value--operation/identity",
+        "tie_breaking_rule": "Use context for where or under which configuration execution occurs; identity for which logical entity is selected.",
+        "positive_example": {
+          "cause_id": "cause-iree-14208-musl-linked-when-embedded-linking-disabled",
+          "case_path": "data/final/iree/14208/report.md",
+          "native_relation": "LLVMCPU linking binds generated math calls to embedded or externally supplied implementations.",
+          "root_cause": "LLVMCPUTarget linked the musl module independently of the user's linkEmbedded setting.",
+          "repair": "PR 14246 places musl bitcode linking under options_.linkEmbedded, leaving those symbols for the external static link when the option is false."
+        }
+      },
+      "storage--ownership/lifetime": {
+        "definition": "Storage or an associated resource is linked to owners, references, and its valid lifetime.",
+        "inclusion_rule": "Retain, release, donation, or reclamation controls legal use.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Use lifetime for continued validity of a resource; shared storage for aliasing between observable values.",
+        "nearest_competing_family": "value--shared storage",
+        "tie_breaking_rule": "Use lifetime for continued validity of a resource; shared storage for aliasing between observable values.",
+        "positive_example": {
+          "cause_id": "cause-iree-11317-retire-before-poller-unlink",
+          "case_path": "data/final/iree/11317/report.md",
+          "native_relation": "The task poller binds an execution wait to its list membership until completion retirement.",
+          "root_cause": "The old poller retired the wait task before removing it from the poller's working set and wait list.",
+          "repair": "PR 11352 returns the retire status to the caller, erases the task from the wait list, retires it afterward, and clears the now-invalid local pointer."
+        }
+      },
+      "value--operation/identity": {
+        "definition": "A logical value, argument, or resource role corresponds to a concrete operation or slot.",
+        "inclusion_rule": "The decision selects the entity or argument position serving a logical role.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Use identity for which entity or slot; storage/layout for an element address or view within storage.",
+        "nearest_competing_family": "value--storage/layout",
+        "tie_breaking_rule": "Use identity for which entity or slot; storage/layout for an element address or view within storage.",
+        "positive_example": {
+          "cause_id": "cause-iree-10414-dummy-push-descriptor-layout",
+          "case_path": "data/final/iree/10414/report.md",
+          "native_relation": "Each pipeline set position refers either to the active bound resources or to an empty placeholder needed only to preserve set numbering.",
+          "root_cause": "BuiltinExecutables created every placeholder with binding count one, and native layout creation enabled the push-descriptor flag independently of whether a set had real bindings.",
+          "repair": "PR 10448 creates dummy layouts with zero bindings and enables the push-descriptor flag only when a layout contains at least one binding."
+        }
+      },
+      "value--representation": {
+        "definition": "A value is related to its type, precision, encoding, or lowered carrier.",
+        "inclusion_rule": "Conversion or metadata determines how a value is represented.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Use representation for meaning of encoded values; layout for their arrangement in storage.",
+        "nearest_competing_family": "value--storage/layout",
+        "tie_breaking_rule": "Use representation for meaning of encoded values; layout for their arrangement in storage.",
+        "positive_example": {
+          "cause_id": "cause-iree-14634-spirv-subbyte-extension-keeps-carrier-bits",
+          "case_path": "data/final/iree/14634/report.md",
+          "native_relation": "Arith-to-SPIR-V conversion binds a logical sub-byte integer to a wider legal SPIR-V carrier and its extension semantics.",
+          "root_cause": "The conversion treated equal converted carrier types as if no semantic extension or truncation remained necessary.",
+          "repair": "LLVM commit 2b066501 adds masking and logical/arithmetic shifts for emulated integer extension and truncation. Commit 69a3c9cd permits sub-byte vector conversion. IREE PR 14652 imports them and adds the reported ui4-to-f32 end-to-end regression."
+        }
+      },
+      "value--shared storage": {
+        "definition": "Distinct values or operations share storage through aliasing, reuse, or mutation.",
+        "inclusion_rule": "Validity depends on whether another observable value shares the selected storage.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Use sharing for interference between values; lifetime for resource validity through last use.",
+        "nearest_competing_family": "storage--ownership/lifetime",
+        "tie_breaking_rule": "Use sharing for interference between values; lifetime for resource validity through last use.",
+        "positive_example": {
+          "cause_id": "cause-iree-17087-unsafe-external-update-fold",
+          "case_path": "data/final/iree/17087/report.md",
+          "native_relation": "The update connects the computed value to an externally supplied target that may be tied to another value.",
+          "root_cause": "The folder used type/extent equality as sufficient evidence for folding without proving value semantics.",
+          "repair": "The fold now requires hasValueSemantics(target), excluding external, tied, and subview resources."
+        }
+      },
+      "value--storage/layout": {
+        "definition": "Logical elements correspond to storage positions, shapes, strides, or offsets.",
+        "inclusion_rule": "A view, layout, or address mapping determines which physical elements are accessed.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Use layout for position and arrangement; representation for numerical or type encoding.",
+        "nearest_competing_family": "value--representation",
+        "tie_breaking_rule": "Use layout for position and arrangement; representation for numerical or type encoding.",
+        "positive_example": {
+          "cause_id": "cause-iree-12480-subspan-offset-loss",
+          "case_path": "data/final/iree/12480/report.md",
+          "native_relation": "A binding number and byte offset jointly identify the physical subspan passed to each microkernel argument.",
+          "root_cause": "The memref representation treated a nonzero binding-subspan offset as if the memref began at offset zero on a backend without pointer-arithmetic lowering.",
+          "repair": "PR 12510 represents nonzero subspan offsets in strided memref metadata, preserves them during flattening, wires the passes into affected backends, and adds offset-sensitive tests."
+        }
+      }
+    },
+    "transition_family": {
+      "identity or index remapping": {
+        "definition": "A decision changes correspondence among logical identities, arguments, indices, or slots.",
+        "inclusion_rule": "The operation renumbers, compacts, substitutes, or resolves a correspondence.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Use remapping when identity or ordinal correspondence changes; representation/layout when the carrier or view contract changes.",
+        "nearest_competing_family": "representation or layout change",
+        "tie_breaking_rule": "Use remapping when identity or ordinal correspondence changes; representation/layout when the carrier or view contract changes.",
+        "positive_example": {
+          "cause_id": "cause-iree-10414-dummy-push-descriptor-layout",
+          "case_path": "data/final/iree/10414/report.md",
+          "native_relation": "Each pipeline set position refers either to the active bound resources or to an empty placeholder needed only to preserve set numbering.",
+          "root_cause": "BuiltinExecutables created every placeholder with binding count one, and native layout creation enabled the push-descriptor flag independently of whether a set had real bindings.",
+          "repair": "PR 10448 creates dummy layouts with zero bindings and enables the push-descriptor flag only when a layout contains at least one binding."
+        }
+      },
+      "initialization or content update": {
+        "definition": "A decision initializes, publishes, overwrites, or updates stored content.",
+        "inclusion_rule": "The transition changes the state or bytes associated with a logical value.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Use content update when content validity is primary; storage change when aliasing or allocation choice is primary.",
+        "nearest_competing_family": "storage, alias, or mutation change",
+        "tie_breaking_rule": "Use content update when content validity is primary; storage change when aliasing or allocation choice is primary.",
+        "positive_example": {
+          "cause_id": "cause-iree-12161-cached-buffer-publication",
+          "case_path": "data/final/iree/12161/report.md",
+          "native_relation": "The caching allocator binds a logical parameter and initial_data to a free-pool HAL buffer.",
+          "root_cause": "The old caching allocator treated a matching reusable allocation as initialized even when initial_data was supplied.",
+          "repair": "Commit 7be84611 writes initial_data into an existing buffer, checks the write status, and returns the buffer only after successful initialization."
+        }
+      },
+      "ordering or completion handoff": {
+        "definition": "A decision changes a dependency, readiness, scheduling, or completion relation.",
+        "inclusion_rule": "A launch, wait, notification, scheduling, or completion handoff is the causal transition.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Use handoff for relative execution or progress; lifetime for transfer or end of resource validity.",
+        "nearest_competing_family": "ownership or lifetime change",
+        "tie_breaking_rule": "Use handoff for relative execution or progress; lifetime for transfer or end of resource validity.",
+        "positive_example": {
+          "cause_id": "cause-iree-13451-incomplete-multibuffering-still-pipelined",
+          "case_path": "data/final/iree/13451/report.md",
+          "native_relation": "The tensor-core strategy binds loop iterations, async copies, shared-memory stages, and mma.sync consumers.",
+          "root_cause": "The old strategy allowed a pipeline schedule after multibuffering failed to separate every participating shared-memory operand.",
+          "repair": "PR 13971 makes the mma.sync schedule explicit, rejects incomplete scheduling ingredients, strengthens strategy validation, and adds conservative size and depth guards."
+        }
+      },
+      "ownership or lifetime change": {
+        "definition": "A decision transfers ownership or changes resource liveness.",
+        "inclusion_rule": "Retain, release, donation, retirement, or reclamation is the causal transition.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Use lifetime when the state change ends or transfers legal use, even if safe release also requires ordering.",
+        "nearest_competing_family": "ordering or completion handoff",
+        "tie_breaking_rule": "Use lifetime when the state change ends or transfers legal use, even if safe release also requires ordering.",
+        "positive_example": {
+          "cause_id": "cause-iree-11317-retire-before-poller-unlink",
+          "case_path": "data/final/iree/11317/report.md",
+          "native_relation": "The task poller binds an execution wait to its list membership until completion retirement.",
+          "root_cause": "The old poller retired the wait task before removing it from the poller's working set and wait list.",
+          "repair": "PR 11352 returns the retire status to the caller, erases the task from the wait list, retires it afterward, and clears the now-invalid local pointer."
+        }
+      },
+      "placement or context change": {
+        "definition": "A decision selects or changes device, backend, stream, or execution configuration.",
+        "inclusion_rule": "A placement, dispatch, transfer route, or context selection changes execution binding.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Use context for selection of the execution environment; remapping for correspondence within that environment.",
+        "nearest_competing_family": "identity or index remapping",
+        "tie_breaking_rule": "Use context for selection of the execution environment; remapping for correspondence within that environment.",
+        "positive_example": {
+          "cause_id": "cause-iree-14208-musl-linked-when-embedded-linking-disabled",
+          "case_path": "data/final/iree/14208/report.md",
+          "native_relation": "LLVMCPU linking binds generated math calls to embedded or externally supplied implementations.",
+          "root_cause": "LLVMCPUTarget linked the musl module independently of the user's linkEmbedded setting.",
+          "repair": "PR 14246 places musl bitcode linking under options_.linkEmbedded, leaving those symbols for the external static link when the option is false."
+        }
+      },
+      "representation or layout change": {
+        "definition": "A decision changes value encoding, type, shape, stride, view, or lowering representation.",
+        "inclusion_rule": "Conversion or layout transformation is the causal operation.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Use representation/layout for the transformed carrier or view; remapping for logical entity or slot correspondence.",
+        "nearest_competing_family": "identity or index remapping",
+        "tie_breaking_rule": "Use representation/layout for the transformed carrier or view; remapping for logical entity or slot correspondence.",
+        "positive_example": {
+          "cause_id": "cause-iree-13809-webgpu-subspan-cast-as-allocated-buffer",
+          "case_path": "data/final/iree/13809/report.md",
+          "native_relation": "IREE HAL buffer views refer to logical buffers that can be subspans of concrete WebGPU allocations.",
+          "root_cause": "iree_hal_webgpu_buffer_handle and process_call_outputs used the logical subspan object where the concrete allocated buffer was required.",
+          "repair": "PR 14163 resolves a HAL buffer through iree_hal_buffer_allocated_buffer before casting it or placing it in a transfer command, retains the original subspan offset, resets the mapped readback offset to zero, and propagates asynchronous mapping errors."
+        }
+      },
+      "storage, alias, or mutation change": {
+        "definition": "A decision changes allocation, storage sharing, reuse, or mutation behavior.",
+        "inclusion_rule": "Buffer assignment, reinplacement, aliasing, or reuse changes who observes storage.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Use this family for storage-sharing decisions; content update for an omitted or incorrect write after storage is selected.",
+        "nearest_competing_family": "initialization or content update",
+        "tie_breaking_rule": "Use this family for storage-sharing decisions; content update for an omitted or incorrect write after storage is selected.",
+        "positive_example": {
+          "cause_id": "cause-iree-17087-unsafe-external-update-fold",
+          "case_path": "data/final/iree/17087/report.md",
+          "native_relation": "The update connects the computed value to an externally supplied target that may be tied to another value.",
+          "root_cause": "The folder used type/extent equality as sufficient evidence for folding without proving value semantics.",
+          "repair": "The fold now requires hasValueSemantics(target), excluding external, tied, and subview resources."
+        }
+      }
+    },
+    "obligation_family": {
+      "alias independence": {
+        "definition": "Mutation or reuse must not affect another value that must remain observable.",
+        "inclusion_rule": "The critical condition is absence of conflicting storage overlap.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Use alias independence for interference between live values; lifetime for whether the resource remains valid.",
+        "nearest_competing_family": "ownership and lifetime",
+        "tie_breaking_rule": "Use alias independence for interference between live values; lifetime for whether the resource remains valid.",
+        "positive_example": {
+          "cause_id": "cause-iree-17087-unsafe-external-update-fold",
+          "case_path": "data/final/iree/17087/report.md",
+          "native_relation": "The update connects the computed value to an externally supplied target that may be tied to another value.",
+          "root_cause": "The folder used type/extent equality as sufficient evidence for folding without proving value semantics.",
+          "repair": "The fold now requires hasValueSemantics(target), excluding external, tied, and subview resources."
+        }
+      },
+      "completion and progress": {
+        "definition": "A required operation must complete and its completion must remain reachable.",
+        "inclusion_rule": "Readiness, pending work, or a schedulable completion path is required.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Use completion for whether work finishes or progresses; ordering for a relation between two events.",
+        "nearest_competing_family": "happens-before ordering",
+        "tie_breaking_rule": "Use completion for whether work finishes or progresses; ordering for a relation between two events.",
+        "positive_example": {
+          "cause_id": "cause-iree-16535-worker-exits-before-cuda-host-callback",
+          "case_path": "data/final/iree/16535/report.md",
+          "native_relation": "pending_queue_actions binds an action's lifetime across worker execution and CUDA/HIP host callbacks.",
+          "root_cause": "Worker liveness tracked only immediately visible ready work, not actions executing through host callbacks.",
+          "repair": "PR 16621 counts pending actions until cleanup, posts the state notification from callbacks, delays worker exit until the count is zero, and mirrors the protocol in HIP."
+        }
+      },
+      "happens-before ordering": {
+        "definition": "Conflicting operations must occur in the required temporal order.",
+        "inclusion_rule": "A dependency, barrier, or schedule must order two events.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Use ordering for predecessor-successor constraints; completion for pending-work accounting or progress itself.",
+        "nearest_competing_family": "completion and progress",
+        "tie_breaking_rule": "Use ordering for predecessor-successor constraints; completion for pending-work accounting or progress itself.",
+        "positive_example": {
+          "cause_id": "cause-iree-13451-incomplete-multibuffering-still-pipelined",
+          "case_path": "data/final/iree/13451/report.md",
+          "native_relation": "The tensor-core strategy binds loop iterations, async copies, shared-memory stages, and mma.sync consumers.",
+          "root_cause": "The old strategy allowed a pipeline schedule after multibuffering failed to separate every participating shared-memory operand.",
+          "repair": "PR 13971 makes the mma.sync schedule explicit, rejects incomplete scheduling ingredients, strengthens strategy validation, and adds conservative size and depth guards."
+        }
+      },
+      "identity correspondence": {
+        "definition": "The selected concrete entity must serve the intended logical identity or role.",
+        "inclusion_rule": "A value, object, argument, or slot must refer to the correct entity.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Use identity for which entity is selected; index/offset for preserving position within a mapping.",
+        "nearest_competing_family": "index and offset preservation",
+        "tie_breaking_rule": "Use identity for which entity is selected; index/offset for preserving position within a mapping.",
+        "positive_example": {
+          "cause_id": "cause-iree-12670-import-stack-growth-leaves-stale-register-pointers",
+          "case_path": "data/final/iree/12670/report.md",
+          "native_relation": "The bytecode dispatcher binds encoded register ordinals to storage in the current VM stack frame.",
+          "root_cause": "The variadic-import path resumed dispatch without refreshing its cached register pointers.",
+          "repair": "PR 12809 restores regs_i32, regs_ref, and pc after every bytecode or import call that may have changed the stack."
+        }
+      },
+      "index and offset preservation": {
+        "definition": "Index or offset transformations must preserve the intended element or region.",
+        "inclusion_rule": "Composition, compression, or translation must retain positional meaning.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Use index preservation for selecting the right region; range safety for staying inside a legal region.",
+        "nearest_competing_family": "range and alignment safety",
+        "tie_breaking_rule": "Use index preservation for selecting the right region; range safety for staying inside a legal region.",
+        "positive_example": {
+          "cause_id": "cause-iree-12480-subspan-offset-loss",
+          "case_path": "data/final/iree/12480/report.md",
+          "native_relation": "A binding number and byte offset jointly identify the physical subspan passed to each microkernel argument.",
+          "root_cause": "The memref representation treated a nonzero binding-subspan offset as if the memref began at offset zero on a backend without pointer-arithmetic lowering.",
+          "repair": "PR 12510 represents nonzero subspan offsets in strided memref metadata, preserves them during flattening, wires the passes into affected backends, and adds offset-sensitive tests."
+        }
+      },
+      "initialization before publication": {
+        "definition": "Required content or state must be established before it becomes visible.",
+        "inclusion_rule": "Newly published or reused storage must contain the requested initial value.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Use initialization for the first valid published state; value semantics for an already-defined value through a later change.",
+        "nearest_competing_family": "value semantics preservation",
+        "tie_breaking_rule": "Use initialization for the first valid published state; value semantics for an already-defined value through a later change.",
+        "positive_example": {
+          "cause_id": "cause-iree-12161-cached-buffer-publication",
+          "case_path": "data/final/iree/12161/report.md",
+          "native_relation": "The caching allocator binds a logical parameter and initial_data to a free-pool HAL buffer.",
+          "root_cause": "The old caching allocator treated a matching reusable allocation as initialized even when initial_data was supplied.",
+          "repair": "Commit 7be84611 writes initial_data into an existing buffer, checks the write status, and returns the buffer only after successful initialization."
+        }
+      },
+      "layout compatibility": {
+        "definition": "Producer, consumer, and interface shape/stride contracts must agree.",
+        "inclusion_rule": "The same value must be interpreted under compatible layout descriptions.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Use layout for a shape/stride contract; index/offset for a particular positional transformation.",
+        "nearest_competing_family": "index and offset preservation",
+        "tie_breaking_rule": "Use layout for a shape/stride contract; index/offset for a particular positional transformation.",
+        "positive_example": {
+          "cause_id": "cause-pytorch-146377-flex-backward-meta-layout-mismatch-fuses-overlapping-copy",
+          "case_path": "data/final/pytorch/146377/report.md",
+          "native_relation": "FlexAttention backward binds higher-order-operation metadata to Inductor intermediate and returned gradient buffers.",
+          "root_cause": "The backward contract reused raw input strides for differently shaped intermediates and did not distinguish broadcasted gradient storage from final correctly strided outputs.",
+          "repair": "Commit 69feef5 defines broadcasted K/V gradient shapes explicitly, derives dense nonoverlapping strides that preserve input stride order, copies reduced gradients into correctly strided returned buffers, aligns fake-mode metadata with lowering, and adds strided backward correctness and stride-order tests."
+        }
+      },
+      "ownership and lifetime": {
+        "definition": "Owners and references must keep a resource valid through last use and release it correctly.",
+        "inclusion_rule": "Reference, ownership, or reclamation state governs legal access.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Use lifetime for resource validity; ordering when the primary obligation is precedence between live operations.",
+        "nearest_competing_family": "happens-before ordering",
+        "tie_breaking_rule": "Use lifetime for resource validity; ordering when the primary obligation is precedence between live operations.",
+        "positive_example": {
+          "cause_id": "cause-iree-11317-retire-before-poller-unlink",
+          "case_path": "data/final/iree/11317/report.md",
+          "native_relation": "The task poller binds an execution wait to its list membership until completion retirement.",
+          "root_cause": "The old poller retired the wait task before removing it from the poller's working set and wait list.",
+          "repair": "PR 11352 returns the retire status to the caller, erases the task from the wait list, retires it afterward, and clears the now-invalid local pointer."
+        }
+      },
+      "placement and context consistency": {
+        "definition": "Execution must use the intended device, stream, sharding, backend, or context.",
+        "inclusion_rule": "The selected execution environment must match the value or operation contract.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Use placement for selecting the right environment; capability for whether that environment supplies a requirement.",
+        "nearest_competing_family": "resource and capability agreement",
+        "tie_breaking_rule": "Use placement for selecting the right environment; capability for whether that environment supplies a requirement.",
+        "positive_example": {
+          "cause_id": "cause-iree-15100-rocm-uuid-selection-creates-default-device",
+          "case_path": "data/final/iree/15100/report.md",
+          "native_relation": "The ROCm HAL binds a user-visible UUID path to a HIP device and its execution context.",
+          "root_cause": "The ROCm driver lacked a supported UUID path and a consistent conversion between the default HAL sentinel and zero-based HIP ordinals.",
+          "repair": "PR 15234 publishes GPU UUID paths, parses UUID and index paths, introduces explicit HIP-to-HAL ID conversions, and retains then sets the selected device's primary context."
+        }
+      },
+      "policy and configuration propagation": {
+        "definition": "A governing policy or configuration must reach every consuming decision.",
+        "inclusion_rule": "A copy policy, option, precision mode, or cache-key component must retain its meaning.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Use propagation for carrying the governing fact; representation for interpreting encoded values correctly.",
+        "nearest_competing_family": "representation fidelity",
+        "tie_breaking_rule": "Use propagation for carrying the governing fact; representation for interpreting encoded values correctly.",
+        "positive_example": {
+          "cause_id": "cause-iree-14208-musl-linked-when-embedded-linking-disabled",
+          "case_path": "data/final/iree/14208/report.md",
+          "native_relation": "LLVMCPU linking binds generated math calls to embedded or externally supplied implementations.",
+          "root_cause": "LLVMCPUTarget linked the musl module independently of the user's linkEmbedded setting.",
+          "repair": "PR 14246 places musl bitcode linking under options_.linkEmbedded, leaving those symbols for the external static link when the option is false."
+        }
+      },
+      "range and alignment safety": {
+        "definition": "An address, extent, ordinal, or resource allocation must fit its bounds and alignment.",
+        "inclusion_rule": "Safety depends on sufficient capacity, valid range, or hardware alignment.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Use safety for legal bounds; index/offset for selecting the intended element even when both choices are in bounds.",
+        "nearest_competing_family": "index and offset preservation",
+        "tie_breaking_rule": "Use safety for legal bounds; index/offset for selecting the intended element even when both choices are in bounds.",
+        "positive_example": {
+          "cause_id": "cause-iree-14313-branch-remap-register-underallocation",
+          "case_path": "data/final/iree/14313/report.md",
+          "native_relation": "VM register allocation binds multiword SSA values and branch remaps to i32 register-bank slots.",
+          "root_cause": "RegisterAllocation counted a >4-byte remapping as one scratch slot even though bytecode dispatch performs two 32-bit moves.",
+          "repair": "PR 14332 reserves ceil(bitwidth/32) scratch registers for multiword remaps; PR 17829 makes IREE_VM_VERIFY_REG_ANY reject out-of-range i32 and ref ordinals."
+        }
+      },
+      "representation fidelity": {
+        "definition": "Conversion must preserve the meaning of the represented value.",
+        "inclusion_rule": "Bit width, signedness, precision, type, or packing must be handled correctly.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Use representation for an encoding-specific requirement; value semantics for observable behavior without an encoding-specific condition.",
+        "nearest_competing_family": "value semantics preservation",
+        "tie_breaking_rule": "Use representation for an encoding-specific requirement; value semantics for observable behavior without an encoding-specific condition.",
+        "positive_example": {
+          "cause_id": "cause-iree-14634-spirv-subbyte-extension-keeps-carrier-bits",
+          "case_path": "data/final/iree/14634/report.md",
+          "native_relation": "Arith-to-SPIR-V conversion binds a logical sub-byte integer to a wider legal SPIR-V carrier and its extension semantics.",
+          "root_cause": "The conversion treated equal converted carrier types as if no semantic extension or truncation remained necessary.",
+          "repair": "LLVM commit 2b066501 adds masking and logical/arithmetic shifts for emulated integer extension and truncation. Commit 69a3c9cd permits sub-byte vector conversion. IREE PR 14652 imports them and adds the reported ui4-to-f32 end-to-end regression."
+        }
+      },
+      "resource and capability agreement": {
+        "definition": "Compiled or runtime requirements must match available resources and capabilities.",
+        "inclusion_rule": "An executable or interface requires compatible bindings, features, or capacity classes.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Use capability for what an environment provides; placement for which environment is selected.",
+        "nearest_competing_family": "placement and context consistency",
+        "tie_breaking_rule": "Use capability for what an environment provides; placement for which environment is selected.",
+        "positive_example": {
+          "cause_id": "cause-iree-10414-dummy-push-descriptor-layout",
+          "case_path": "data/final/iree/10414/report.md",
+          "native_relation": "Each pipeline set position refers either to the active bound resources or to an empty placeholder needed only to preserve set numbering.",
+          "root_cause": "BuiltinExecutables created every placeholder with binding count one, and native layout creation enabled the push-descriptor flag independently of whether a set had real bindings.",
+          "repair": "PR 10448 creates dummy layouts with zero bindings and enables the push-descriptor flag only when a layout contains at least one binding."
+        }
+      },
+      "transformation equivalence": {
+        "definition": "A rewrite, fusion, substitution, or fast path must preserve program behavior under its preconditions.",
+        "inclusion_rule": "The critical condition governs legality of a transformation as a whole.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Prefer a more specific obligation when its violation first permits the effect; use transformation equivalence for remaining rewrite-level conditions.",
+        "nearest_competing_family": "value semantics preservation",
+        "tie_breaking_rule": "Prefer a more specific obligation when its violation first permits the effect; use transformation equivalence for remaining rewrite-level conditions.",
+        "positive_example": {
+          "cause_id": "cause-iree-19189-multi-consumer-fusion-yield-conflict",
+          "case_path": "data/final/iree/19189/report.md",
+          "native_relation": "TileDispatchUsingForall binds tensor producers and consumers to yielded tiled-loop values and workgroup distribution.",
+          "root_cause": "TileDispatchUsingForall yielded a replacement for a value with multiple tilable consumers.",
+          "repair": "PR 19212 declines yielded replacement when a fused value has multiple tilable consumers, queues fusion work, and performs another producer-fusion pass with a softmax-shaped regression."
+        }
+      },
+      "value semantics preservation": {
+        "definition": "A decision must preserve the specified observable value behavior.",
+        "inclusion_rule": "The first violated condition concerns value identity, mutation visibility, or numerical behavior without a more specific primary condition.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Use value semantics for the value-level condition; transformation equivalence for validity of a program rewrite.",
+        "nearest_competing_family": "transformation equivalence",
+        "tie_breaking_rule": "Use value semantics for the value-level condition; transformation equivalence for validity of a program rewrite.",
+        "positive_example": {
+          "cause_id": "cause-jax-40564-max-jvp-compares-rematerialized-value-to-forward-result",
+          "case_path": "data/final/jax/40564/report.md",
+          "native_relation": "The max/min JVP rule binds operand-order comparisons to tangent routing in the backward computation.",
+          "root_cause": "The max/min JVP rule derived branch identity from equality with a separately computed forward result.",
+          "repair": "PR 40578 replaces answer-equality masks with _balanced_cmp on the two operands, keeps half gradients for ties and zero gradients for NaNs, and adds the reported GPU regression."
+        }
+      }
+    },
+    "failure_mode": {
+      "incorrect mapping or translation": {
+        "definition": "A required fact reaches the decision but is resolved to the wrong target, index, offset, layout, placement, or encoding.",
+        "inclusion_rule": "A present fact is mapped or translated incorrectly.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Choose mapping for an incorrect correspondence; inference when the decision instead derives a semantic property from insufficient premises.",
+        "nearest_competing_family": "unsound assumption or inference",
+        "tie_breaking_rule": "Choose mapping for an incorrect correspondence; inference when the decision instead derives a semantic property from insufficient premises.",
+        "positive_example": {
+          "cause_id": "cause-iree-10414-dummy-push-descriptor-layout",
+          "case_path": "data/final/iree/10414/report.md",
+          "native_relation": "Each pipeline set position refers either to the active bound resources or to an empty placeholder needed only to preserve set numbering.",
+          "root_cause": "BuiltinExecutables created every placeholder with binding count one, and native layout creation enabled the push-descriptor flag independently of whether a set had real bindings.",
+          "repair": "PR 10448 creates dummy layouts with zero bindings and enables the push-descriptor flag only when a layout contains at least one binding."
+        }
+      },
+      "lost or omitted relation": {
+        "definition": "An upstream relation lacks a faithful representation at the consuming decision.",
+        "inclusion_rule": "A field, edge, or propagation step drops required information.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Choose lost relation when the fact is absent; mapping when it arrives but is translated incorrectly.",
+        "nearest_competing_family": "incorrect mapping or translation",
+        "tie_breaking_rule": "Choose lost relation when the fact is absent; mapping when it arrives but is translated incorrectly.",
+        "positive_example": {
+          "cause_id": "cause-iree-12480-subspan-offset-loss",
+          "case_path": "data/final/iree/12480/report.md",
+          "native_relation": "A binding number and byte offset jointly identify the physical subspan passed to each microkernel argument.",
+          "root_cause": "The memref representation treated a nonzero binding-subspan offset as if the memref began at offset zero on a backend without pointer-arithmetic lowering.",
+          "repair": "PR 12510 represents nonzero subspan offsets in strided memref metadata, preserves them during flattening, wires the passes into affected backends, and adds offset-sensitive tests."
+        }
+      },
+      "missing eligibility check": {
+        "definition": "A decision proceeds without evaluating a required precondition.",
+        "inclusion_rule": "Admission, reuse, fusion, or transformation omits its guard.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Choose missing check when the predicate is not evaluated; inference when an evaluated premise does not justify the conclusion.",
+        "nearest_competing_family": "unsound assumption or inference",
+        "tie_breaking_rule": "Choose missing check when the predicate is not evaluated; inference when an evaluated premise does not justify the conclusion.",
+        "positive_example": {
+          "cause_id": "cause-iree-13451-incomplete-multibuffering-still-pipelined",
+          "case_path": "data/final/iree/13451/report.md",
+          "native_relation": "The tensor-core strategy binds loop iterations, async copies, shared-memory stages, and mma.sync consumers.",
+          "root_cause": "The old strategy allowed a pipeline schedule after multibuffering failed to separate every participating shared-memory operand.",
+          "repair": "PR 13971 makes the mma.sync schedule explicit, rejects incomplete scheduling ingredients, strengthens strategy validation, and adds conservative size and depth guards."
+        }
+      },
+      "missing ordering or enforcement": {
+        "definition": "No dependency, wait, barrier, or protocol edge establishes a required temporal relation.",
+        "inclusion_rule": "The ordering mechanism itself is absent.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Choose missing enforcement for an absent edge; premature transition when temporal state exists but an action occurs too early.",
+        "nearest_competing_family": "premature or unordered transition",
+        "tie_breaking_rule": "Choose missing enforcement for an absent edge; premature transition when temporal state exists but an action occurs too early.",
+        "positive_example": {
+          "cause_id": "cause-iree-8871-pthread-notification-misses-prewait-post",
+          "case_path": "data/final/iree/8871/report.md",
+          "native_relation": "IREE binds a condition predicate to an event-count token that coordinates producer posts with pthread wait commitment.",
+          "root_cause": "The pthread implementation signaled a condition variable but did not maintain the event-count epoch used by the notification contract.",
+          "repair": "PR 8877 gives the pthread path a mutex-protected epoch and waiter count; prepare snapshots the epoch, post increments it, and commit waits only while the epoch still equals the captured token."
+        }
+      },
+      "omitted operation": {
+        "definition": "A required concrete action is absent from the executed path.",
+        "inclusion_rule": "A write, copy, conversion, retain, or release is not performed.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Choose omitted operation for absent action; lost relation for information dropped before a later action.",
+        "nearest_competing_family": "lost or omitted relation",
+        "tie_breaking_rule": "Choose omitted operation for absent action; lost relation for information dropped before a later action.",
+        "positive_example": {
+          "cause_id": "cause-iree-12161-cached-buffer-publication",
+          "case_path": "data/final/iree/12161/report.md",
+          "native_relation": "The caching allocator binds a logical parameter and initial_data to a free-pool HAL buffer.",
+          "root_cause": "The old caching allocator treated a matching reusable allocation as initialized even when initial_data was supplied.",
+          "repair": "Commit 7be84611 writes initial_data into an existing buffer, checks the write status, and returns the buffer only after successful initialization."
+        }
+      },
+      "premature invalidation or stale state": {
+        "definition": "A recorded relation is invalidated before last use or remains cached after its source changes.",
+        "inclusion_rule": "A consumer uses a stale relation or a relation removed too early.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Choose stale state when validity of a recorded relation is primary; premature transition when the action's event order is primary.",
+        "nearest_competing_family": "premature or unordered transition",
+        "tie_breaking_rule": "Choose stale state when validity of a recorded relation is primary; premature transition when the action's event order is primary.",
+        "positive_example": {
+          "cause_id": "cause-iree-12670-import-stack-growth-leaves-stale-register-pointers",
+          "case_path": "data/final/iree/12670/report.md",
+          "native_relation": "The bytecode dispatcher binds encoded register ordinals to storage in the current VM stack frame.",
+          "root_cause": "The variadic-import path resumed dispatch without refreshing its cached register pointers.",
+          "repair": "PR 12809 restores regs_i32, regs_ref, and pc after every bytecode or import call that may have changed the stack."
+        }
+      },
+      "premature or unordered transition": {
+        "definition": "A transition occurs before a represented predecessor or completion condition is satisfied.",
+        "inclusion_rule": "Temporal state exists but an action executes too early.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Choose premature transition when the mechanism represents the temporal state; missing enforcement when no required edge is present.",
+        "nearest_competing_family": "missing ordering or enforcement",
+        "tie_breaking_rule": "Choose premature transition when the mechanism represents the temporal state; missing enforcement when no required edge is present.",
+        "positive_example": {
+          "cause_id": "cause-iree-11317-retire-before-poller-unlink",
+          "case_path": "data/final/iree/11317/report.md",
+          "native_relation": "The task poller binds an execution wait to its list membership until completion retirement.",
+          "root_cause": "The old poller retired the wait task before removing it from the poller's working set and wait list.",
+          "repair": "PR 11352 returns the retire status to the caller, erases the task from the wait list, retires it afterward, and clears the now-invalid local pointer."
+        }
+      },
+      "unsound assumption or inference": {
+        "definition": "A decision derives a semantic property from premises that do not entail it.",
+        "inclusion_rule": "A checked property is treated as sufficient for a different semantic property.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Choose inference for an unjustified semantic conclusion; mapping for a wrong correspondence computed from a present fact.",
+        "nearest_competing_family": "incorrect mapping or translation",
+        "tie_breaking_rule": "Choose inference for an unjustified semantic conclusion; mapping for a wrong correspondence computed from a present fact.",
+        "positive_example": {
+          "cause_id": "cause-iree-14566-multi-result-sparse-emplacement-order",
+          "case_path": "data/final/iree/14566/report.md",
+          "native_relation": "Dispatch result position implicitly determines its associated read-write resource position.",
+          "root_cause": "EmplaceAllocations allowed non-prefix sparse emplacement even though the downstream representation relies on implicit ordering.",
+          "repair": "The pass stops emplacement at the first unemplaceable result, preserving a contiguous result prefix."
+        }
+      }
+    },
+    "repair_strategy": {
+      "constrain unsafe transformation": {
+        "definition": "The fix restricts or disables a transformation or execution path to a sound domain.",
+        "inclusion_rule": "The semantic change narrows which transformations or paths are permitted.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Choose constraint when behavior is removed or restricted as the repair; stronger check when an explicit required predicate is added to retain safe cases.",
+        "nearest_competing_family": "strengthen eligibility check",
+        "tie_breaking_rule": "Choose constraint when behavior is removed or restricted as the repair; stronger check when an explicit required predicate is added to retain safe cases.",
+        "positive_example": {
+          "cause_id": "cause-iree-14208-musl-linked-when-embedded-linking-disabled",
+          "case_path": "data/final/iree/14208/report.md",
+          "native_relation": "LLVMCPU linking binds generated math calls to embedded or externally supplied implementations.",
+          "root_cause": "LLVMCPUTarget linked the musl module independently of the user's linkEmbedded setting.",
+          "repair": "PR 14246 places musl bitcode linking under options_.linkEmbedded, leaving those symbols for the external static link when the option is false."
+        }
+      },
+      "correct mapping or representation": {
+        "definition": "The fix corrects a correspondence, target, index, offset, layout, or encoding.",
+        "inclusion_rule": "The semantic edit changes how an available fact maps to its concrete representation.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Choose mapping for a corrected correspondence; propagation when the upstream fact was already correct but was lost before use.",
+        "nearest_competing_family": "preserve or propagate relation",
+        "tie_breaking_rule": "Choose mapping for a corrected correspondence; propagation when the upstream fact was already correct but was lost before use.",
+        "positive_example": {
+          "cause_id": "cause-iree-10414-dummy-push-descriptor-layout",
+          "case_path": "data/final/iree/10414/report.md",
+          "native_relation": "Each pipeline set position refers either to the active bound resources or to an empty placeholder needed only to preserve set numbering.",
+          "root_cause": "BuiltinExecutables created every placeholder with binding count one, and native layout creation enabled the push-descriptor flag independently of whether a set had real bindings.",
+          "repair": "PR 10448 creates dummy layouts with zero bindings and enables the push-descriptor flag only when a layout contains at least one binding."
+        }
+      },
+      "correct ownership or lifetime": {
+        "definition": "The fix restores owners, references, or release eligibility through last use.",
+        "inclusion_rule": "The repair changes ownership transfer, retain/release, or reclamation behavior.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Choose lifetime for resource validity and release; ordering when the semantic edit orders events independently of ownership.",
+        "nearest_competing_family": "restore ordering or synchronization",
+        "tie_breaking_rule": "Choose lifetime for resource validity and release; ordering when the semantic edit orders events independently of ownership.",
+        "positive_example": {
+          "cause_id": "cause-iree-11317-retire-before-poller-unlink",
+          "case_path": "data/final/iree/11317/report.md",
+          "native_relation": "The task poller binds an execution wait to its list membership until completion retirement.",
+          "root_cause": "The old poller retired the wait task before removing it from the poller's working set and wait list.",
+          "repair": "PR 11352 returns the retire status to the caller, erases the task from the wait list, retires it afterward, and clears the now-invalid local pointer."
+        }
+      },
+      "perform omitted operation": {
+        "definition": "The fix executes a previously missing required action.",
+        "inclusion_rule": "A write, copy, conversion, or other concrete operation is newly performed.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Choose operation for supplying the action itself; propagation for carrying information needed by an existing consumer.",
+        "nearest_competing_family": "preserve or propagate relation",
+        "tie_breaking_rule": "Choose operation for supplying the action itself; propagation for carrying information needed by an existing consumer.",
+        "positive_example": {
+          "cause_id": "cause-iree-12161-cached-buffer-publication",
+          "case_path": "data/final/iree/12161/report.md",
+          "native_relation": "The caching allocator binds a logical parameter and initial_data to a free-pool HAL buffer.",
+          "root_cause": "The old caching allocator treated a matching reusable allocation as initialized even when initial_data was supplied.",
+          "repair": "Commit 7be84611 writes initial_data into an existing buffer, checks the write status, and returns the buffer only after successful initialization."
+        }
+      },
+      "preserve or propagate relation": {
+        "definition": "The fix carries an already-correct upstream fact to its consumer.",
+        "inclusion_rule": "A policy, relation, metadata field, or dependency is retained across a boundary.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Choose propagation for restoring transmission; mapping when the transmitted fact must instead be translated differently.",
+        "nearest_competing_family": "correct mapping or representation",
+        "tie_breaking_rule": "Choose propagation for restoring transmission; mapping when the transmitted fact must instead be translated differently.",
+        "positive_example": {
+          "cause_id": "cause-iree-12480-subspan-offset-loss",
+          "case_path": "data/final/iree/12480/report.md",
+          "native_relation": "A binding number and byte offset jointly identify the physical subspan passed to each microkernel argument.",
+          "root_cause": "The memref representation treated a nonzero binding-subspan offset as if the memref began at offset zero on a backend without pointer-arithmetic lowering.",
+          "repair": "PR 12510 represents nonzero subspan offsets in strided memref metadata, preserves them during flattening, wires the passes into affected backends, and adds offset-sensitive tests."
+        }
+      },
+      "restore ordering or synchronization": {
+        "definition": "The fix establishes or repairs a dependency, wait, notification, barrier, or completion protocol.",
+        "inclusion_rule": "The semantic repair restores relative event order or progress.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Choose ordering for execution protocol; lifetime when ownership or reference validity is the changed condition.",
+        "nearest_competing_family": "correct ownership or lifetime",
+        "tie_breaking_rule": "Choose ordering for execution protocol; lifetime when ownership or reference validity is the changed condition.",
+        "positive_example": {
+          "cause_id": "cause-iree-16535-worker-exits-before-cuda-host-callback",
+          "case_path": "data/final/iree/16535/report.md",
+          "native_relation": "pending_queue_actions binds an action's lifetime across worker execution and CUDA/HIP host callbacks.",
+          "root_cause": "Worker liveness tracked only immediately visible ready work, not actions executing through host callbacks.",
+          "repair": "PR 16621 counts pending actions until cleanup, posts the state notification from callbacks, delays worker exit until the count is zero, and mirrors the protocol in HIP."
+        }
+      },
+      "strengthen eligibility check": {
+        "definition": "The fix adds or strengthens a predicate governing a potentially invalid decision.",
+        "inclusion_rule": "Safe cases remain eligible after checking the previously omitted condition.",
+        "exclusion_rule": "Exclude the competing case according to this boundary: Choose stronger check for explicit validation; constraint when the transformation or path is restricted without that validation.",
+        "nearest_competing_family": "constrain unsafe transformation",
+        "tie_breaking_rule": "Choose stronger check for explicit validation; constraint when the transformation or path is restricted without that validation.",
+        "positive_example": {
+          "cause_id": "cause-iree-13451-incomplete-multibuffering-still-pipelined",
+          "case_path": "data/final/iree/13451/report.md",
+          "native_relation": "The tensor-core strategy binds loop iterations, async copies, shared-memory stages, and mma.sync consumers.",
+          "root_cause": "The old strategy allowed a pipeline schedule after multibuffering failed to separate every participating shared-memory operand.",
+          "repair": "PR 13971 makes the mma.sync schedule explicit, rejects incomplete scheduling ingredients, strengthens strategy validation, and adds conservative size and depth guards."
+        }
+      }
+    }
+  }
+}

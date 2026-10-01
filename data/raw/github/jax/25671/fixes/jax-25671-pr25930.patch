@@ -1,0 +1,71 @@
+From f2f552c1086b44ac8d4b8be01554cc0d0f01bfbe Mon Sep 17 00:00:00 2001
+From: Parker Schuh <parkers@google.com>
+Date: Thu, 16 Jan 2025 11:23:39 -0800
+Subject: [PATCH] Allow resharding between tokens on a single device and
+ multiple devices.
+
+Whenever this happens we can essentially introduce an effects barrier
+instead of doing the normal device -> host -> device transfer.
+
+Fixes https://github.com/jax-ml/jax/issues/25671.
+
+PiperOrigin-RevId: 716309978
+---
+ jax/_src/array.py  |  8 ++++++--
+ tests/pjit_test.py | 24 ++++++++++++++++++++++++
+ 2 files changed, 30 insertions(+), 2 deletions(-)
+
+diff --git a/jax/_src/array.py b/jax/_src/array.py
+index 2ee8b01c77d4..802a3f5f6a5d 100644
+--- a/jax/_src/array.py
++++ b/jax/_src/array.py
+@@ -1205,8 +1205,12 @@ def _array_local_result_handler(aval, sharding, indices):
+ # Token handlers
+ 
+ def _token_shard_arg(xs, shardings, layouts, copy_semantics):
+-  return _array_shard_arg([x._buf for x in xs], shardings, layouts,
+-                          copy_semantics)
++  results = []
++  for x, sharding, layout in safe_zip(xs, shardings, layouts):
++    x.block_until_ready()
++    x = np.array([], dtype=bool)
++    results.append(api.device_put(x, Layout(layout, sharding)))
++  return results
+ pxla.shard_arg_handlers[core.Token] = _token_shard_arg
+ 
+ 
+diff --git a/tests/pjit_test.py b/tests/pjit_test.py
+index 92bbf57ef0df..6abc832253ec 100644
+--- a/tests/pjit_test.py
++++ b/tests/pjit_test.py
+@@ -4327,6 +4327,30 @@ def _f(x, y):
+         out_specs=P(None, 'i')))
+     f(jnp.zeros((2, 16)), jnp.ones(2))
+ 
++  def test_empty_io_callback_under_shard_map_reshard_to_singledev(self):
++    if config.use_shardy_partitioner.value:
++      self.skipTest("Shardy errors out on empty callbacks.")
++    mesh = jtu.create_mesh((4,), 'i')
++
++    def empty_callback(x):
++      return
++
++    def _f(x, y):
++      jax.experimental.io_callback(
++          empty_callback, (), x, ordered=True)
++      return x + y[..., jnp.newaxis]
++
++    f = jax.jit(shard_map(
++        _f, mesh, in_specs=(P(None, 'i'), P(None)),
++        out_specs=P(None, 'i')))
++    f(jnp.zeros((2, 16)), jnp.ones(2))
++
++    _f(jnp.zeros((2, 16)), jnp.ones(2))
++
++    jax.jit(_f)(jnp.zeros((2, 16)), jnp.ones(2))
++
++    jax.effects_barrier()
++
+   def test_jit_trace_lower_and_compile(self):
+     def f(x):
+       return x * 2

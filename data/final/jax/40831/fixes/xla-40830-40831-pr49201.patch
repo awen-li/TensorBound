@@ -1,0 +1,1485 @@
+From f07f240fd39e7eb3424c05b46983788553f83806 Mon Sep 17 00:00:00 2001
+From: Peter Hawkins <phawkins@google.com>
+Date: Tue, 22 Sep 2026 10:14:04 -0700
+Subject: [PATCH] [XLA:CPU] Reimplement Gloo reduce-scatter.
+
+Gloo's built-in ReduceScatterHalvingDoubling has several data races that cause
+data corruption on large buffers, and does not support timeouts. Replace its
+use in GlooCommunicator with our own halving-doubling reduce-scatter
+implementation that avoids the races and respects the collective timeout.
+
+Issue https://github.com/jax-ml/jax/issues/40830
+
+PiperOrigin-RevId: 986074025
+---
+ xla/backends/cpu/collectives/BUILD            |  20 +-
+ .../cpu/collectives/gloo_collectives_test.cc  | 311 ++++++-
+ .../cpu/collectives/gloo_communicator.cc      | 127 +--
+ .../cpu/collectives/gloo_communicator.h       |   2 +-
+ .../cpu/collectives/gloo_reduce_scatter.cc    | 756 ++++++++++++++++++
+ .../cpu/collectives/gloo_reduce_scatter.h     |  69 ++
+ 6 files changed, 1148 insertions(+), 137 deletions(-)
+ create mode 100644 xla/backends/cpu/collectives/gloo_reduce_scatter.cc
+ create mode 100644 xla/backends/cpu/collectives/gloo_reduce_scatter.h
+
+diff --git a/xla/backends/cpu/collectives/BUILD b/xla/backends/cpu/collectives/BUILD
+index e9882d7ba9592..0d552d0c74177 100644
+--- a/xla/backends/cpu/collectives/BUILD
++++ b/xla/backends/cpu/collectives/BUILD
+@@ -240,13 +240,16 @@ xla_cc_test(
+         ":cpu_clique_key",
+         ":cpu_collectives",
+         ":gloo_collectives",
++        ":gloo_communicator",
+         ":gloo_kv_store",
+         "//xla:executable_run_options",
++        "//xla:types",
+         "//xla:xla_data_proto_cc",
+         "//xla/core/collectives:clique_id",
+         "//xla/core/collectives:clique_key",
+         "//xla/core/collectives:communicator",
+         "//xla/core/collectives:rank_id",
++        "//xla/core/collectives:reduction_kind",
+         "//xla/pjrt/distributed:in_memory_key_value_store",
+         "//xla/pjrt/distributed:key_value_store_interface",
+         "//xla/runtime:device_id",
+@@ -255,10 +258,9 @@ xla_cc_test(
+         "//xla/tsl/concurrency:async_value",
+         "//xla/tsl/lib/core:status_test_util",
+         "//xla/tsl/platform:env",
+-        "//xla/tsl/platform:errors",
+-        "//xla/tsl/platform:statusor",
+         "//xla/tsl/platform:test",
+         "//xla/tsl/platform:test_benchmark",
++        "@com_google_absl//absl/status",
+         "@com_google_absl//absl/status:status_macros",
+         "@com_google_absl//absl/status:statusor",
+         "@com_google_absl//absl/time",
+@@ -277,8 +279,14 @@ xla_cc_test(
+ 
+ cc_library(
+     name = "gloo_communicator",
+-    srcs = ["gloo_communicator.cc"],
+-    hdrs = ["gloo_communicator.h"],
++    srcs = [
++        "gloo_communicator.cc",
++        "gloo_reduce_scatter.cc",
++    ],
++    hdrs = [
++        "gloo_communicator.h",
++        "gloo_reduce_scatter.h",
++    ],
+     copts = [
+         "-fexceptions",
+         "-fno-strict-aliasing",
+@@ -294,10 +302,8 @@ cc_library(
+         "//xla:xla_data_proto_cc",
+         "//xla/core/collectives:communicator",
+         "//xla/core/collectives:rank_id",
+-        "//xla/service:collective_ops_utils",
++        "//xla/core/collectives:reduction_kind",
+         "//xla/stream_executor:device_address",
+-        "//xla/tsl/platform:errors",
+-        "//xla/tsl/platform:statusor",
+         "@com_google_absl//absl/container:inlined_vector",
+         "@com_google_absl//absl/log",
+         "@com_google_absl//absl/status",
+diff --git a/xla/backends/cpu/collectives/gloo_collectives_test.cc b/xla/backends/cpu/collectives/gloo_collectives_test.cc
+index dc5f327a0f285..0efa37d89994d 100644
+--- a/xla/backends/cpu/collectives/gloo_collectives_test.cc
++++ b/xla/backends/cpu/collectives/gloo_collectives_test.cc
+@@ -17,13 +17,17 @@ limitations under the License.
+ 
+ #include <unistd.h>
+ 
++#include <algorithm>
++#include <complex>
+ #include <cstddef>
+ #include <cstdint>
+ #include <memory>
+ #include <optional>
++#include <tuple>
+ #include <utility>
+ #include <vector>
+ 
++#include "absl/status/status.h"
+ #include "absl/status/status_macros.h"
+ #include "absl/status/statusor.h"
+ #include "absl/time/time.h"
+@@ -31,8 +35,10 @@ limitations under the License.
+ #include "xla/backends/cpu/collectives/cpu_clique_key.h"
+ #include "xla/backends/cpu/collectives/cpu_collectives.h"
+ #include "xla/backends/cpu/collectives/gloo_kv_store.h"
++#include "xla/backends/cpu/collectives/gloo_reduce_scatter.h"
+ #include "xla/core/collectives/communicator.h"
+ #include "xla/core/collectives/rank_id.h"
++#include "xla/core/collectives/reduction_kind.h"
+ #include "xla/executable_run_options.h"
+ #include "xla/pjrt/distributed/in_memory_key_value_store.h"
+ #include "xla/pjrt/distributed/key_value_store_interface.h"
+@@ -41,10 +47,9 @@ limitations under the License.
+ #include "xla/stream_executor/device_address.h"
+ #include "xla/tsl/lib/core/status_test_util.h"
+ #include "xla/tsl/platform/env.h"
+-#include "xla/tsl/platform/errors.h"
+-#include "xla/tsl/platform/statusor.h"
+ #include "xla/tsl/platform/test.h"
+ #include "xla/tsl/platform/threadpool.h"
++#include "xla/types.h"
+ #include "xla/xla_data.pb.h"
+ 
+ #if defined(__linux__)
+@@ -65,7 +70,7 @@ constexpr size_t kBufferSize = 256;
+ constexpr absl::Duration kTimeout = absl::Seconds(5);
+ 
+ absl::StatusOr<std::unique_ptr<Communicator>> GetCommunicator(
+-    size_t kNumParticipants, absl::Span<GlobalDeviceId const> global_devices,
++    absl::Span<GlobalDeviceId const> global_devices,
+     const std::shared_ptr<xla::KeyValueStoreInterface>& kv_store, int rank) {
+   auto collectives = std::make_shared<cpu::GlooCollectives>(
+       std::make_unique<cpu::GlooKeyValueStore>(kv_store),
+@@ -87,7 +92,7 @@ absl::StatusOr<std::unique_ptr<Communicator>> GetCommunicator(
+ }
+ 
+ RendezvousKey MakeRendezvousKey(std::vector<GlobalDeviceId> global_devices) {
+-  return RendezvousKey(RunId(0), global_devices, kNumParticipants,
++  return RendezvousKey(RunId(0), global_devices, global_devices.size(),
+                        RendezvousKey::CollectiveOpKind::kCrossModule,
+                        /*op_id=*/0);
+ }
+@@ -106,9 +111,8 @@ absl::StatusOr<std::vector<uint8_t>> AllReduce(
+     std::vector<GlobalDeviceId> global_devices, int rank) {
+   std::vector<uint8_t> output_buffer(kBufferSize);
+   RendezvousKey rendezvous_key = MakeRendezvousKey(global_devices);
+-  ABSL_ASSIGN_OR_RETURN(
+-      auto communicator,
+-      GetCommunicator(kNumParticipants, global_devices, kv_store, rank));
++  ABSL_ASSIGN_OR_RETURN(auto communicator,
++                        GetCommunicator(global_devices, kv_store, rank));
+ 
+   CpuCollectives::Executor executor(rendezvous_key, kTimeout);
+   auto event = communicator->AllReduce(
+@@ -154,9 +158,302 @@ TEST(GlooCollectives, AllReduce) {
+   }
+   // Verify that all participants received the expected result.
+   for (int rank = 0; rank < kNumParticipants; ++rank) {
++    ASSERT_TRUE(output_buffers[rank].ok()) << output_buffers[rank].status();
+     EXPECT_THAT(output_buffers[rank].value(),
+                 Each(Eq(kNumParticipants * (kNumParticipants + 1) / 2)));
+   }
+ }
++
++template <typename T>
++absl::StatusOr<std::vector<T>> RunReduceScatter(
++    const std::shared_ptr<xla::KeyValueStoreInterface>& kv_store,
++    const std::vector<T>& input_buffer,
++    std::vector<GlobalDeviceId> global_devices, int rank, PrimitiveType dtype,
++    size_t chunk_count, ReductionKind reduction_kind) {
++  std::vector<T> output_buffer(chunk_count);
++  RendezvousKey rendezvous_key = MakeRendezvousKey(global_devices);
++  ABSL_ASSIGN_OR_RETURN(auto communicator,
++                        GetCommunicator(global_devices, kv_store, rank));
++
++  CpuCollectives::Executor executor(rendezvous_key, kTimeout);
++  auto event = communicator->ReduceScatter(
++      AsDeviceMemory(input_buffer), AsDeviceMemory(output_buffer), dtype,
++      chunk_count, reduction_kind, executor);
++
++  ABSL_RETURN_IF_ERROR(event.Await());
++
++  return output_buffer;
++}
++
++template <typename T>
++void TestReduceScatter(int num_participants, size_t chunk_count,
++                       PrimitiveType dtype,
++                       ReductionKind reduction_kind = ReductionKind::SUM,
++                       int num_iterations = 1) {
++  std::vector<GlobalDeviceId> global_devices;
++  global_devices.reserve(num_participants);
++  for (int rank = 0; rank < num_participants; ++rank) {
++    global_devices.push_back(GlobalDeviceId(rank));
++  }
++
++  auto kv_store = std::make_shared<xla::InMemoryKeyValueStore>();
++  const size_t total_count = chunk_count * num_participants;
++  std::vector<absl::Status> statuses(num_participants, absl::OkStatus());
++
++  auto elem_value = [](int r, int iter, size_t idx) -> T {
++    return static_cast<T>(static_cast<int>((r + 1) + ((iter + idx) % 5)));
++  };
++
++  {
++    tsl::thread::ThreadPool thread_pool(
++        tsl::Env::Default(), "ReduceScatterParticipants", num_participants);
++    for (int rank = 0; rank < num_participants; ++rank) {
++      thread_pool.Schedule([rank, num_participants, chunk_count, total_count,
++                            reduction_kind, num_iterations, elem_value,
++                            &statuses, &kv_store, &global_devices, dtype]() {
++        auto comm_or = GetCommunicator(global_devices, kv_store, rank);
++        if (!comm_or.ok()) {
++          statuses[rank] = comm_or.status();
++          return;
++        }
++        std::vector<T> input_buffer(total_count);
++        std::vector<T> output_buffer(chunk_count);
++
++        for (int iter = 0; iter < num_iterations; ++iter) {
++          for (size_t i = 0; i < total_count; ++i) {
++            input_buffer[i] = elem_value(rank, iter, i);
++          }
++          RendezvousKey rendezvous_key = MakeRendezvousKey(global_devices);
++          CpuCollectives::Executor executor(rendezvous_key, kTimeout);
++          auto event = (*comm_or)->ReduceScatter(
++              AsDeviceMemory(input_buffer), AsDeviceMemory(output_buffer),
++              dtype, chunk_count, reduction_kind, executor);
++          statuses[rank] = event.Await();
++          if (!statuses[rank].ok()) {
++            return;
++          }
++          for (size_t i = 0; i < chunk_count; ++i) {
++            const size_t global_idx = rank * chunk_count + i;
++            T expected = elem_value(0, iter, global_idx);
++            for (int r = 1; r < num_participants; ++r) {
++              const T v = elem_value(r, iter, global_idx);
++              switch (reduction_kind) {
++                case ReductionKind::SUM:
++                  expected = expected + v;
++                  break;
++                case ReductionKind::PRODUCT:
++                  expected = expected * v;
++                  break;
++                case ReductionKind::MIN:
++                  if constexpr (!is_complex_v<T>) {
++                    expected = std::min(expected, v);
++                  }
++                  break;
++                case ReductionKind::MAX:
++                  if constexpr (!is_complex_v<T>) {
++                    expected = std::max(expected, v);
++                  }
++                  break;
++              }
++            }
++            if (output_buffer[i] != expected) {
++              statuses[rank] = absl::InternalError("Output mismatch");
++              return;
++            }
++          }
++        }
++      });
++    }
++  }
++
++  for (int rank = 0; rank < num_participants; ++rank) {
++    TF_ASSERT_OK(statuses[rank])
++        << "num_participants=" << num_participants << " rank=" << rank;
++  }
++}
++
++class ReduceScatterSweepTest
++    : public ::testing::TestWithParam<std::tuple<int, size_t>> {};
++
++TEST_P(ReduceScatterSweepTest, PowerOfTwoAndNonPowerOfTwo) {
++  auto [num_participants, chunk_count] = GetParam();
++  TestReduceScatter<int32_t>(num_participants, chunk_count,
++                             xla::PrimitiveType::S32);
++}
++
++INSTANTIATE_TEST_SUITE_P(
++    GlooCollectives, ReduceScatterSweepTest,
++    ::testing::Combine(::testing::Range(1, 17),
++                       ::testing::Values(size_t{1}, size_t{3}, size_t{5},
++                                         size_t{7}, size_t{13}, size_t{31},
++                                         size_t{64}, size_t{127}, size_t{256},
++                                         size_t{1000}, size_t{4096})));
++
++TEST(GlooCollectives, ReduceScatterAliasedBuffer) {
++  constexpr int kParticipants = 3;
++  constexpr size_t kChunkCount = 7;
++  constexpr size_t kTotalCount = kParticipants * kChunkCount;
++
++  std::vector<GlobalDeviceId> global_devices;
++  for (int rank = 0; rank < kParticipants; ++rank) {
++    global_devices.push_back(GlobalDeviceId(rank));
++  }
++
++  for (bool partial_overlap : {false, true}) {
++    auto kv_store = std::make_shared<xla::InMemoryKeyValueStore>();
++    std::vector<absl::Status> statuses(kParticipants);
++    std::vector<std::vector<int32_t>> buffers(kParticipants);
++
++    {
++      tsl::thread::ThreadPool thread_pool(
++          tsl::Env::Default(), "ReduceScatterAliased", kParticipants);
++      for (int rank = 0; rank < kParticipants; ++rank) {
++        thread_pool.Schedule([rank, partial_overlap, &statuses, &buffers,
++                              &kv_store, &global_devices]() {
++          buffers[rank].resize(kTotalCount);
++          for (size_t i = 0; i < kTotalCount; ++i) {
++            buffers[rank][i] = (rank + 1) * 1000 + static_cast<int32_t>(i);
++          }
++          auto comm_or = GetCommunicator(global_devices, kv_store, rank);
++          if (!comm_or.ok()) {
++            statuses[rank] = comm_or.status();
++            return;
++          }
++          se::DeviceAddressBase send_mem(buffers[rank].data(),
++                                         kTotalCount * sizeof(int32_t));
++          const size_t recv_elem_offset =
++              partial_overlap ? rank * kChunkCount : 0;
++          se::DeviceAddressBase recv_mem(
++              buffers[rank].data() + recv_elem_offset,
++              kChunkCount * sizeof(int32_t));
++          RendezvousKey rendezvous_key = MakeRendezvousKey(global_devices);
++          CpuCollectives::Executor executor(rendezvous_key, kTimeout);
++          auto event = (*comm_or)->ReduceScatter(
++              send_mem, recv_mem, xla::PrimitiveType::S32, kChunkCount,
++              xla::ReductionKind::SUM, executor);
++          statuses[rank] = event.Await();
++        });
++      }
++    }
++
++    const int32_t rank_sum = kParticipants * (kParticipants + 1) / 2;
++    for (int rank = 0; rank < kParticipants; ++rank) {
++      TF_ASSERT_OK(statuses[rank]);
++      const size_t recv_elem_offset = partial_overlap ? rank * kChunkCount : 0;
++      for (size_t i = 0; i < kChunkCount; ++i) {
++        const size_t global_idx = rank * kChunkCount + i;
++        const int32_t expected =
++            rank_sum * 1000 + static_cast<int32_t>(kParticipants * global_idx);
++        EXPECT_EQ(buffers[rank][recv_elem_offset + i], expected);
++      }
++    }
++  }
++}
++
++TEST(GlooCollectives, ReduceScatterLargeBuffer) {
++  constexpr size_t kChunkCount = 1 << 20;  // 4 MiB per rank
++  for (int num_participants : {4, 6}) {
++    TestReduceScatter<uint32_t>(num_participants, kChunkCount,
++                                xla::PrimitiveType::U32, ReductionKind::SUM,
++                                /*num_iterations=*/3);
++  }
++}
++
++TEST(GlooCollectives, ReduceScatterTypesAndReductionKinds) {
++  constexpr int kParticipants = 3;
++  constexpr size_t kChunkCount = 7;
++
++  for (ReductionKind kind : {ReductionKind::SUM, ReductionKind::PRODUCT,
++                             ReductionKind::MIN, ReductionKind::MAX}) {
++    TestReduceScatter<int32_t>(kParticipants, kChunkCount,
++                               xla::PrimitiveType::S32, kind);
++    TestReduceScatter<float>(kParticipants, kChunkCount,
++                             xla::PrimitiveType::F32, kind);
++    TestReduceScatter<double>(kParticipants, kChunkCount,
++                              xla::PrimitiveType::F64, kind);
++    TestReduceScatter<xla::half>(kParticipants, kChunkCount,
++                                 xla::PrimitiveType::F16, kind);
++    TestReduceScatter<xla::bfloat16>(kParticipants, kChunkCount,
++                                     xla::PrimitiveType::BF16, kind);
++  }
++
++  for (ReductionKind kind : {ReductionKind::SUM, ReductionKind::PRODUCT}) {
++    TestReduceScatter<std::complex<float>>(kParticipants, kChunkCount,
++                                           xla::PrimitiveType::C64, kind);
++    TestReduceScatter<std::complex<double>>(kParticipants, kChunkCount,
++                                            xla::PrimitiveType::C128, kind);
++  }
++}
++
++TEST(GlooCollectives, ReduceScatterMinMaxOnComplexFails) {
++  std::vector<GlobalDeviceId> global_devices = {GlobalDeviceId(0),
++                                                GlobalDeviceId(1)};
++  constexpr size_t kChunkCount = 4;
++
++  for (PrimitiveType dtype :
++       {xla::PrimitiveType::C64, xla::PrimitiveType::C128}) {
++    for (ReductionKind kind : {ReductionKind::MIN, ReductionKind::MAX}) {
++      auto kv_store = std::make_shared<xla::InMemoryKeyValueStore>();
++      std::vector<absl::StatusOr<std::vector<std::complex<double>>>> results(2);
++      {
++        tsl::thread::ThreadPool thread_pool(tsl::Env::Default(),
++                                            "ComplexMinMax", 2);
++        for (int rank = 0; rank < 2; ++rank) {
++          thread_pool.Schedule(
++              [rank, &results, &kv_store, &global_devices, dtype, kind]() {
++                std::vector<std::complex<double>> input(2 * kChunkCount,
++                                                        {1.0, 2.0});
++                results[rank] = RunReduceScatter<std::complex<double>>(
++                    kv_store, input, global_devices, rank, dtype, kChunkCount,
++                    kind);
++              });
++        }
++      }
++      for (int rank = 0; rank < 2; ++rank) {
++        EXPECT_EQ(results[rank].status().code(),
++                  absl::StatusCode::kInvalidArgument);
++      }
++    }
++  }
++}
++
++TEST(GlooCollectives, ReverseLastNBits) {
++  EXPECT_EQ(internal::ReverseLastNBits(0, 0), 0u);
++  EXPECT_EQ(internal::ReverseLastNBits(0xffffffffu, 0), 0u);
++
++  // n = 1: only lowest bit is kept; high bits are ignored.
++  EXPECT_EQ(internal::ReverseLastNBits(0xa5a5a5a0u | 0b0u, 1), 0b0u);
++  EXPECT_EQ(internal::ReverseLastNBits(0x5a5a5a50u | 0b1u, 1), 0b1u);
++
++  // n = 2: 00 -> 00, 01 -> 10, 10 -> 01, 11 -> 11; high bits are ignored.
++  EXPECT_EQ(internal::ReverseLastNBits(0xdeadbee0u | 0b00u, 2), 0b00u);
++  EXPECT_EQ(internal::ReverseLastNBits(0xfeedfac0u | 0b01u, 2), 0b10u);
++  EXPECT_EQ(internal::ReverseLastNBits(0x12345670u | 0b10u, 2), 0b01u);
++  EXPECT_EQ(internal::ReverseLastNBits(0xabcdef00u | 0b11u, 2), 0b11u);
++
++  // n = 3: 0..7 bit-reversed in 3 bits; high bits are ignored.
++  EXPECT_EQ(internal::ReverseLastNBits(0x76543210u | 0b001u, 3), 0b100u);
++  EXPECT_EQ(internal::ReverseLastNBits(0xf0e1d2c0u | 0b010u, 3), 0b010u);
++  EXPECT_EQ(internal::ReverseLastNBits(0x89abcde0u | 0b011u, 3), 0b110u);
++  EXPECT_EQ(internal::ReverseLastNBits(0x31415920u | 0b100u, 3), 0b001u);
++  EXPECT_EQ(internal::ReverseLastNBits(0x27182818u | 0b001u, 3), 0b100u);
++
++  // Reversing the lowest n bits twice recovers the original lowest n bits
++  // (with upper bits cleared), and single bit b maps to bit n - 1 - b.
++  for (uint32_t n = 1; n <= 32; ++n) {
++    const uint32_t mask = n == 32 ? 0xffffffffu : ((uint32_t{1} << n) - 1);
++    const uint32_t high_garbage = 0xa5c3f19eu & ~mask;
++    for (uint32_t b = 0; b < n; ++b) {
++      EXPECT_EQ(
++          internal::ReverseLastNBits(high_garbage | (uint32_t{1} << b), n),
++          uint32_t{1} << (n - 1 - b));
++    }
++    const uint32_t sample = 0x12345678u;
++    EXPECT_EQ(internal::ReverseLastNBits(
++                  high_garbage | internal::ReverseLastNBits(sample, n), n),
++              sample & mask);
++  }
++}
++
+ }  // namespace
+ }  // namespace xla::cpu
+diff --git a/xla/backends/cpu/collectives/gloo_communicator.cc b/xla/backends/cpu/collectives/gloo_communicator.cc
+index 37fc820a56377..b9d403c32980b 100644
+--- a/xla/backends/cpu/collectives/gloo_communicator.cc
++++ b/xla/backends/cpu/collectives/gloo_communicator.cc
+@@ -33,24 +33,21 @@ limitations under the License.
+ #include "absl/time/clock.h"
+ #include "absl/time/time.h"
+ #include "absl/types/span.h"
+-#include "gloo/algorithm.h"
+ #include "gloo/allgather.h"
+ #include "gloo/allreduce.h"
+ #include "gloo/context.h"
+ #include "gloo/math.h"
+-#include "gloo/reduce_scatter.h"
+ #include "gloo/transport/device.h"
+ #include "gloo/transport/unbound_buffer.h"
+ #include "gloo/types.h"
+ #include "xla/backends/cpu/collectives/cpu_collectives.h"
++#include "xla/backends/cpu/collectives/gloo_reduce_scatter.h"
+ #include "xla/core/collectives/rank_id.h"
++#include "xla/core/collectives/reduction_kind.h"
+ #include "xla/future.h"
+ #include "xla/primitive_util.h"
+-#include "xla/service/collective_ops_utils.h"
+ #include "xla/status_macros.h"
+ #include "xla/stream_executor/device_address.h"
+-#include "xla/tsl/platform/errors.h"
+-#include "xla/tsl/platform/statusor.h"
+ #include "xla/types.h"
+ #include "xla/xla_data.pb.h"
+ 
+@@ -187,8 +184,6 @@ Future<> GlooCommunicator::AllReduce(se::DeviceAddressBase send_buffer,
+   return absl::OkStatus();
+ }
+ 
+-static constexpr uint8_t kCollectivePermuteSlotPrefix = 0x40;
+-
+ Future<> GlooCommunicator::CollectivePermute(
+     se::DeviceAddressBase send_buffer, se::DeviceAddressBase recv_buffer,
+     PrimitiveType dtype, size_t count, std::optional<RankId> source_rank,
+@@ -321,126 +316,14 @@ Future<> GlooCommunicator::AllGather(se::DeviceAddressBase send_buffer,
+   return absl::OkStatus();
+ }
+ 
+-template <typename T>
+-absl::Status ReduceScatterHelper(std::shared_ptr<gloo::Context> context,
+-                                 ReductionKind reduction_kind, void* buffer,
+-                                 size_t chunk_elems) {
+-  const gloo::ReductionFunction<T>* reduction_function = nullptr;
+-  if constexpr (is_complex_v<T>) {
+-    switch (reduction_kind) {
+-      case ReductionKind::SUM:
+-        reduction_function = gloo::ReductionFunction<T>::sum;
+-        break;
+-      case ReductionKind::PRODUCT:
+-        reduction_function = gloo::ReductionFunction<T>::product;
+-        break;
+-      default:
+-        return absl::InvalidArgumentError(absl::StrCat(
+-            "Unsupported reduction kind: ", static_cast<int>(reduction_kind)));
+-    }
+-  } else {
+-    switch (reduction_kind) {
+-      case ReductionKind::SUM:
+-        reduction_function = gloo::ReductionFunction<T>::sum;
+-        break;
+-      case ReductionKind::PRODUCT:
+-        reduction_function = gloo::ReductionFunction<T>::product;
+-        break;
+-      case ReductionKind::MAX:
+-        reduction_function = gloo::ReductionFunction<T>::max;
+-        break;
+-      case ReductionKind::MIN:
+-        reduction_function = gloo::ReductionFunction<T>::min;
+-        break;
+-      default:
+-        return absl::InvalidArgumentError(absl::StrCat(
+-            "Unsupported reduction kind: ", static_cast<int>(reduction_kind)));
+-    }
+-  }
+-  try {
+-    std::vector<int> recv_elems(context->size, chunk_elems);
+-    gloo::ReduceScatterHalvingDoubling<T> algorithm(
+-        context, std::vector<T*>{reinterpret_cast<T*>(buffer)},
+-        chunk_elems * context->size, recv_elems, reduction_function);
+-    algorithm.run();
+-  } catch (std::exception& e) {
+-    return absl::UnknownError(
+-        absl::StrCat("Gloo ReduceScatter failed: ", e.what()));
+-  }
+-  return absl::OkStatus();
+-}
+-
+ Future<> GlooCommunicator::ReduceScatter(se::DeviceAddressBase send_buffer,
+                                          se::DeviceAddressBase recv_buffer,
+                                          PrimitiveType dtype, size_t count,
+                                          ReductionKind reduction_kind,
+                                          const Executor& executor) {
+-  size_t chunk_bytes = count * primitive_util::ByteWidth(dtype);
+-  std::unique_ptr<char[]> temp(new char[chunk_bytes * context_->size]);
+-  std::memcpy(temp.get(), send_buffer.opaque(), chunk_bytes * context_->size);
+-  switch (dtype) {
+-    case S8:
+-      ABSL_RETURN_IF_ERROR(ReduceScatterHelper<int8_t>(context_, reduction_kind,
+-                                                       temp.get(), count));
+-      break;
+-    case PRED:
+-    case U8:
+-      ABSL_RETURN_IF_ERROR(ReduceScatterHelper<uint8_t>(
+-          context_, reduction_kind, temp.get(), count));
+-      break;
+-    case S16:
+-      ABSL_RETURN_IF_ERROR(ReduceScatterHelper<int16_t>(
+-          context_, reduction_kind, temp.get(), count));
+-      break;
+-    case U16:
+-      ABSL_RETURN_IF_ERROR(ReduceScatterHelper<uint16_t>(
+-          context_, reduction_kind, temp.get(), count));
+-      break;
+-    case S32:
+-      ABSL_RETURN_IF_ERROR(ReduceScatterHelper<int32_t>(
+-          context_, reduction_kind, temp.get(), count));
+-      break;
+-    case U32:
+-      ABSL_RETURN_IF_ERROR(ReduceScatterHelper<uint32_t>(
+-          context_, reduction_kind, temp.get(), count));
+-      break;
+-    case S64:
+-      ABSL_RETURN_IF_ERROR(ReduceScatterHelper<int64_t>(
+-          context_, reduction_kind, temp.get(), count));
+-      break;
+-    case U64:
+-      ABSL_RETURN_IF_ERROR(ReduceScatterHelper<uint64_t>(
+-          context_, reduction_kind, temp.get(), count));
+-      break;
+-    case BF16:
+-      ABSL_RETURN_IF_ERROR(ReduceScatterHelper<bfloat16>(
+-          context_, reduction_kind, temp.get(), count));
+-      break;
+-    case F16:
+-      ABSL_RETURN_IF_ERROR(ReduceScatterHelper<gloo::float16>(
+-          context_, reduction_kind, temp.get(), count));
+-      break;
+-    case F32:
+-      ABSL_RETURN_IF_ERROR(ReduceScatterHelper<float>(context_, reduction_kind,
+-                                                      temp.get(), count));
+-      break;
+-    case F64:
+-      ABSL_RETURN_IF_ERROR(ReduceScatterHelper<double>(context_, reduction_kind,
+-                                                       temp.get(), count));
+-      break;
+-    case C64:
+-      ABSL_RETURN_IF_ERROR(ReduceScatterHelper<std::complex<float>>(
+-          context_, reduction_kind, temp.get(), count));
+-      break;
+-    case C128:
+-      ABSL_RETURN_IF_ERROR(ReduceScatterHelper<std::complex<double>>(
+-          context_, reduction_kind, temp.get(), count));
+-      break;
+-    default:
+-      return absl::InvalidArgumentError("Unknown datatype in reducescatter");
+-  }
+-  std::memcpy(recv_buffer.opaque(), temp.get(), chunk_bytes);
+-  return absl::OkStatus();
++  ABSL_ASSIGN_OR_RETURN(auto cpu_executor, CpuCollectives::TryCast(&executor));
++  return GlooReduceScatter(context_, send_buffer, recv_buffer, dtype, count,
++                           reduction_kind, cpu_executor->timeout());
+ }
+ 
+ }  // namespace xla::cpu
+diff --git a/xla/backends/cpu/collectives/gloo_communicator.h b/xla/backends/cpu/collectives/gloo_communicator.h
+index 7df290060ad16..758aef71c45ee 100644
+--- a/xla/backends/cpu/collectives/gloo_communicator.h
++++ b/xla/backends/cpu/collectives/gloo_communicator.h
+@@ -28,8 +28,8 @@ limitations under the License.
+ #include "gloo/context.h"
+ #include "xla/core/collectives/communicator.h"
+ #include "xla/core/collectives/rank_id.h"
++#include "xla/core/collectives/reduction_kind.h"
+ #include "xla/future.h"
+-#include "xla/service/collective_ops_utils.h"
+ #include "xla/stream_executor/device_address.h"
+ #include "xla/util.h"
+ #include "xla/xla_data.pb.h"
+diff --git a/xla/backends/cpu/collectives/gloo_reduce_scatter.cc b/xla/backends/cpu/collectives/gloo_reduce_scatter.cc
+new file mode 100644
+index 0000000000000..166fe7bec92f9
+--- /dev/null
++++ b/xla/backends/cpu/collectives/gloo_reduce_scatter.cc
+@@ -0,0 +1,756 @@
++/* Copyright 2026 The OpenXLA Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++
++#include "xla/backends/cpu/collectives/gloo_reduce_scatter.h"
++
++#include <algorithm>
++#include <chrono>  // NOLINT
++#include <complex>
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <exception>
++#include <memory>
++#include <utility>
++#include <vector>
++
++#include "absl/status/status.h"
++#include "absl/status/status_macros.h"
++#include "absl/status/statusor.h"
++#include "absl/strings/str_cat.h"
++#include "absl/time/clock.h"
++#include "absl/time/time.h"
++#include "gloo/common/error.h"
++#include "gloo/context.h"
++#include "gloo/math.h"
++#include "gloo/transport/unbound_buffer.h"
++#include "gloo/types.h"
++#include "xla/core/collectives/reduction_kind.h"
++#include "xla/primitive_util.h"
++#include "xla/stream_executor/device_address.h"
++#include "xla/types.h"
++#include "xla/util.h"
++#include "xla/xla_data.pb.h"
++
++// Halving-doubling reduce-scatter across `world_size` ranks, inspired by
++// Gloo's `ReduceScatterHalvingDoubling` (`gloo/reduce_scatter.h`), adapted to
++// Gloo's `UnboundBuffer` transport API with per-operation timeouts.
++//
++// Each rank starts with `total_count = world_size * count` elements and
++// finishes with the sum of its own shard `[rank * count, (rank + 1) * count)`
++// across all ranks.
++//
++// We divide the buffer into `chunks = 2^floor(log2(world_size))` chunks (the
++// largest power of two <= `world_size`) and run three phases.
++//
++// Running example: `world_size = 6` (`= 4 + 2`), so `chunks = 4` and the
++// buffer is divided into 4 chunks `[A, B, C, D]`.
++//
++// Phase 1 (Intra-block recursive halving):
++//   Recursive halving requires a power-of-two number of ranks, so we split the
++//   ranks into power-of-two blocks matching the binary bits of `world_size`.
++//   For `world_size = 6`:
++//     - Block 0 (size 4): ranks 0, 1, 2, 3
++//     - Block 1 (size 2): ranks 4, 5
++//
++//   Within each block of size 2^k, ranks run k halving steps LSB-first
++//   (`bitmask = 1, 2, ..., 2^{k-1}`):
++//     - Step 0: pair ranks at within-block distance 1 (`rank_in_block ^ 1`).
++//       Even ranks keep the first half of their active buffer; odd ranks keep
++//       the second half. Each pair exchanges the half it is discarding and
++//       reduces into the half it keeps.
++//     - Step 1: pair ranks at within-block distance 2 (`rank_in_block ^ 2`)
++//       and repeat on the half kept in step 0.
++//     - ...
++//     - Step i: pair ranks at within-block distance 2^i (`rank_in_block ^
++//     2^i`).
++//   Stepping LSB-first (rather than textbook MSB-first) ensures that smaller
++//   and larger binary blocks share identical halving splits for their first
++//   `log2(B_small)` steps, allowing each rank `r` in `B_large` to receive from
++//   a single rank `r % B_small` in `B_small` in Phase 2.
++//
++//   In our 6-rank example:
++//     - Block 0 (ranks 0..3) runs 2 steps:
++//         Step 0: pair (0, 1) and (2, 3).
++//                 Ranks 0, 2 keep [A, B]; ranks 1, 3 keep [C, D].
++//         Step 1: pair (0, 2) and (1, 3).
++//                 Rank 0 (00) keeps A (chunk 0 = 00)  \
++//                 Rank 1 (01) keeps C (chunk 2 = 10)   | reduced across
++//                 Rank 2 (10) keeps B (chunk 1 = 01)   | ranks 0..3
++//                 Rank 3 (11) keeps D (chunk 3 = 11)  /
++//       Notice that within a block of size 2^k, `rank_in_block` ends up holding
++//       chunk `ReverseLastNBits(rank_in_block, k)`.
++//     - Block 1 (ranks 4..5) runs 1 step:
++//         Step 0: pair (4, 5).
++//                 Rank 4 keeps [A, B]  \ reduced across
++//                 Rank 5 keeps [C, D]  / ranks 4..5
++//
++// Phase 2 (Inter-block reduction, only when `world_size` is not a power of 2):
++//   After Phase 1, each block only has the sum across its own members, and a
++//   rank in a smaller block of size B_small holds `num_sends = B_large /
++//   B_small` times as much data as each rank in the next larger block of size
++//   B_large. So each rank in the smaller block splits its reduced slice into
++//   `num_sends` pieces and sends each piece to the rank in the larger block
++//   that holds that same chunk.
++//
++//   In our 6-rank example (`num_sends = 4 / 2 = 2`):
++//     - Rank 4 holds [A, B]: it sends A to rank 0 and B to rank 2.
++//     - Rank 5 holds [C, D]: it sends C to rank 1 and D to rank 3.
++//     - Ranks 0..3 add those incoming chunks into their own chunks.
++//   If there are more than two blocks (e.g. `world_size = 7 = 4 + 2 + 1`), this
++//   cascades from smallest to largest (block of 1 -> block of 2 -> block of 4).
++//   At the end of Phase 2, the largest block holds the sum across all ranks:
++//     Rank 0 has A, Rank 1 has C, Rank 2 has B, Rank 3 has D.
++//
++// Phase 3 (Distribution):
++//   Phase 3 serves two purposes:
++//     1. Even when `world_size` is a power of two, Phase 1's LSB-first halving
++//        leaves chunk `c` on rank `ReverseLastNBits(c, steps)`, so Phase 3
++//        unscrambles that bit-reversal permutation (e.g. swapping ranks 1 and 2
++//        when `world_size = 4`) and copies self-owned shards from `work` into
++//        `recv_ptr`.
++//     2. When `world_size` is not a power of two, it simultaneously re-slices
++//        the `chunks = 2^steps` chunks of size
++//        `chunk_size = ceil(total_count / chunks)` into `world_size` output
++//        shards of size `count`.
++//
++//   In our 6-rank example, the 4 chunks `[A, B, C, D]` each have size
++//   `chunk_size = ceil(total_count / 4)`, whereas the 6 output shards each have
++//   size `count = total_count / 6`. Because the 4 chunks and the 6 output
++//   shards divide the same array at different boundaries, each chunk covers
++//   parts of one or more output shards.
++//
++//   For example, if `count = 2` (`total_count = 12` elements `0..11`), then
++//   each chunk has `chunk_size = 3` elements and each rank wants `count = 2`:
++//
++//     Chunks held after Phase 2:        Output shards wanted by each rank:
++//       A = [0, 1, 2]   (on rank 0)       rank 0 wants [0, 1]
++//       B = [3, 4, 5]   (on rank 2)       rank 1 wants [2, 3]
++//       C = [6, 7, 8]   (on rank 1)       rank 2 wants [4, 5]
++//       D = [9, 10, 11] (on rank 3)       rank 3 wants [6, 7]
++//                                         rank 4 wants [8, 9]
++//                                         rank 5 wants [10, 11]
++//
++//   Each rank in the largest block sends each piece of its chunk to the rank
++//   that wants those elements:
++//     - Rank 0 (holds A = [0, 1, 2]):  keeps [0, 1], sends [2] to rank 1.
++//     - Rank 2 (holds B = [3, 4, 5]):  sends [3] to rank 1, keeps [4, 5].
++//     - Rank 1 (holds C = [6, 7, 8]):  sends [6, 7] to rank 3, [8] to rank 4.
++//     - Rank 3 (holds D = [9, 10, 11]): sends [9] to rank 4, [10, 11] to
++//     rank 5.
++
++namespace xla::cpu {
++namespace {
++
++using ReduceFn = void (*)(void*, const void*, const void*, size_t);
++
++template <typename T>
++absl::StatusOr<ReduceFn> GetReduceFunction(ReductionKind reduction_kind) {
++  switch (reduction_kind) {
++    case ReductionKind::SUM:
++      return static_cast<ReduceFn>(&gloo::sum<T>);
++    case ReductionKind::PRODUCT:
++      return static_cast<ReduceFn>(&gloo::product<T>);
++    case ReductionKind::MIN:
++      if constexpr (!is_complex_v<T>) {
++        return static_cast<ReduceFn>(&gloo::min<T>);
++      } else {
++        return absl::InvalidArgumentError(
++            "MIN reduction not supported for complex types");
++      }
++    case ReductionKind::MAX:
++      if constexpr (!is_complex_v<T>) {
++        return static_cast<ReduceFn>(&gloo::max<T>);
++      } else {
++        return absl::InvalidArgumentError(
++            "MAX reduction not supported for complex types");
++      }
++  }
++  return absl::InvalidArgumentError(absl::StrCat(
++      "Unsupported reduction kind: ", static_cast<int>(reduction_kind)));
++}
++
++}  // namespace
++
++namespace internal {
++
++uint32_t ReverseLastNBits(uint32_t ctr, uint32_t n) {
++  if (n == 0) {
++    return 0;
++  }
++#if defined(__has_builtin) && __has_builtin(__builtin_bitreverse32)
++  return __builtin_bitreverse32(ctr) >> (32 - n);
++#else
++  ctr = ((ctr >> 1) & 0x55555555) | ((ctr & 0x55555555) << 1);
++  ctr = ((ctr >> 2) & 0x33333333) | ((ctr & 0x33333333) << 2);
++  ctr = ((ctr >> 4) & 0x0f0f0f0f) | ((ctr & 0x0f0f0f0f) << 4);
++  ctr = ((ctr >> 8) & 0x00ff00ff) | ((ctr & 0x00ff00ff) << 8);
++  return ((ctr >> 16) | (ctr << 16)) >> (32 - n);
++#endif
++}
++
++}  // namespace internal
++
++namespace {
++
++using internal::ReverseLastNBits;
++
++// Membership of a single rank in the power-of-two block decomposition of
++// `world_size` (see Phase 1 above).
++struct BlockMembership {
++  // Starting rank ID of this rank's block (in ranks). This block covers ranks
++  // `[offset_to_my_block, offset_to_my_block + my_block_size)`.
++  uint32_t offset_to_my_block = 0;
++
++  // Number of ranks in this block (always a power of two).
++  uint32_t my_block_size = 0;
++
++  // Number of ranks in the adjacent smaller block (at rank IDs immediately
++  // above this block), or 0 if this is already the smallest block.
++  uint32_t next_smaller_block_size = 0;
++
++  // Number of ranks in the adjacent larger block (at rank IDs immediately
++  // below this block), or 0 if this is already the largest block.
++  uint32_t next_larger_block_size = 0;
++};
++
++BlockMembership GetBlockMembership(uint32_t world_size, uint32_t rank) {
++  BlockMembership info;
++  // Walk the set bits of `world_size` from largest block to smallest block,
++  // assigning contiguous rank ranges starting at rank 0.
++  // For example, for world_size = 7 (4 + 2 + 1):
++  //   bit 4 -> ranks [0, 4)
++  //   bit 2 -> ranks [4, 6)
++  //   bit 1 -> rank  [6, 7)
++  uint32_t offset = 0;
++  uint32_t larger_block_size = 0;
++  for (uint32_t block_size = uint32_t{1} << Log2Floor(world_size);
++       block_size > 0; block_size >>= 1) {
++    if ((world_size & block_size) == 0) {
++      continue;
++    }
++    if (rank >= offset && rank < offset + block_size) {
++      info.offset_to_my_block = offset;
++      info.my_block_size = block_size;
++      info.next_larger_block_size = larger_block_size;
++      // The remaining ranks `world_size - (offset + block_size)` live to our
++      // right; the next block to our right is the highest set bit of that
++      // remainder (or 0 if no ranks remain).
++      uint32_t rem = world_size - (offset + block_size);
++      info.next_smaller_block_size =
++          rem == 0 ? 0 : (uint32_t{1} << Log2Floor(rem));
++      break;
++    }
++    offset += block_size;
++    larger_block_size = block_size;
++  }
++  return info;
++}
++
++// Slice of `work` that holds this rank's reduced elements after Phase 1.
++struct ReducedSlice {
++  // Starting element index in `work`.
++  int64_t offset = 0;
++
++  // Number of valid elements starting at `offset` (`count >= 0`).
++  int64_t count = 0;
++};
++
++// Phase 1: Recursive halving within each power-of-two block.
++ReducedSlice ReduceWithinBlock(const std::shared_ptr<gloo::Context>& context,
++                               const BlockMembership& block_info,
++                               uint32_t steps, int64_t chunk_size,
++                               int64_t total_count, size_t element_size,
++                               ReduceFn reduce_fn, gloo::Slot base_slot,
++                               std::chrono::system_clock::time_point deadline,
++                               std::vector<char>& work) {
++  const uint32_t steps_within_block = Log2Floor(block_info.my_block_size);
++  int64_t step_chunk_size = chunk_size << (steps - 1);
++  if (steps_within_block == 0) {
++    return ReducedSlice{0, total_count};
++  }
++
++  const uint32_t rank = context->rank;
++  // `[active_offset, active_offset + active_count)` is the slice of `work`
++  // currently owned by this rank. Each step splits the active slice in half:
++  // this rank abandons one half (sending it to `dest_rank`) and keeps the other
++  // half (reducing `dest_rank`'s data into it), so after the final step
++  // `[active_offset, active_offset + active_count)` is the single reduced slice
++  // this rank holds for Phases 2 and 3.
++  int64_t active_offset = 0;
++  int64_t active_count = total_count;
++
++  std::vector<char> scratch(step_chunk_size * element_size);
++  auto work_buf = context->createUnboundBuffer(work.data(), work.size());
++  auto scratch_buf =
++      context->createUnboundBuffer(scratch.data(), scratch.size());
++
++  for (uint32_t i = 0, bitmask = 1; i < steps_within_block;
++       ++i, bitmask <<= 1) {
++    // Because `offset_to_my_block` is a multiple of `my_block_size` and
++    // `bitmask < my_block_size`, `rank ^ bitmask` equals
++    // `offset_to_my_block + (rank_in_block ^ bitmask)`.
++    const uint32_t dest_rank = rank ^ bitmask;
++
++    // Element offsets into `work` for this step:
++    //   - `step_send_offset`: start of the half this rank sends to `dest_rank`
++    //     (`[step_send_offset, step_send_offset + send_count)`).
++    //   - `step_recv_offset`: start of the half this rank keeps and reduces the
++    //     received data into
++    //     (`[step_recv_offset, step_recv_offset + recv_count)`).
++    const int64_t step_send_offset =
++        active_offset + ((dest_rank & bitmask) ? step_chunk_size : 0);
++    const int64_t step_recv_offset =
++        active_offset + ((rank & bitmask) ? step_chunk_size : 0);
++
++    const int64_t send_count = std::max<int64_t>(
++        0, std::min(step_chunk_size, total_count - step_send_offset));
++    const int64_t recv_count = std::max<int64_t>(
++        0, std::min(step_chunk_size, total_count - step_recv_offset));
++
++    const auto step_slot = base_slot + static_cast<uint8_t>(i);
++    if (send_count > 0) {
++      work_buf->send(dest_rank, step_slot, step_send_offset * element_size,
++                     send_count * element_size);
++    }
++    if (recv_count > 0) {
++      scratch_buf->recv(dest_rank, step_slot, 0, recv_count * element_size);
++    }
++    if (send_count > 0) {
++      work_buf->waitSend(deadline);
++    }
++    if (recv_count > 0) {
++      scratch_buf->waitRecv(deadline);
++      char* dst = work.data() + step_recv_offset * element_size;
++      reduce_fn(dst, dst, scratch.data(), recv_count);
++    }
++
++    active_offset = step_recv_offset;
++    active_count = recv_count;
++
++    step_chunk_size >>= 1;
++  }
++
++  return ReducedSlice{active_offset, active_count};
++}
++
++// Phase 2: Fold smaller blocks into larger blocks (non-power-of-two sizes).
++//
++// Blocks fold from smallest up to largest (e.g. for 7 = 4 + 2 + 1, block 1
++// folds into block 2, which then folds into block 4). A rank in a smaller
++// block holds a slice `num_sends = larger_size / my_size` times larger than
++// a rank in the next larger block, so it splits its slice into `num_sends`
++// pieces and sends them to the corresponding ranks in the larger block.
++void ReduceAcrossBlocks(const std::shared_ptr<gloo::Context>& context,
++                        const BlockMembership& block_info, uint32_t steps,
++                        int64_t chunk_size, int64_t total_count,
++                        size_t element_size, ReduceFn reduce_fn,
++                        gloo::Slot base_slot,
++                        std::chrono::system_clock::time_point deadline,
++                        const ReducedSlice& slice, std::vector<char>& work) {
++  const uint32_t rank_in_block = context->rank - block_info.offset_to_my_block;
++  const auto inter_block_slot = base_slot + static_cast<uint8_t>(steps);
++  if (block_info.next_smaller_block_size != 0) {
++    // The next smaller block starts immediately after this block's rank range
++    // `[offset_to_my_block, offset_to_my_block + my_block_size)`.
++    const uint32_t offset_to_smaller_block =
++        block_info.offset_to_my_block + block_info.my_block_size;
++    // Because Phase 1 runs halving steps LSB-first, ranks in this block share
++    // the same first `log2(next_smaller_block_size)` halving choices as the
++    // smaller-block rank with the same low bits (`rank_in_block %
++    // next_smaller_block_size`), whose slice therefore contains our chunk.
++    const uint32_t src_rank =
++        offset_to_smaller_block +
++        (rank_in_block % block_info.next_smaller_block_size);
++    if (slice.count > 0) {
++      std::vector<char> smaller_scratch(slice.count * element_size);
++      auto recv_buf = context->createUnboundBuffer(smaller_scratch.data(),
++                                                   smaller_scratch.size());
++      recv_buf->recv(src_rank, inter_block_slot);
++      recv_buf->waitRecv(deadline);
++      char* dst = work.data() + slice.offset * element_size;
++      reduce_fn(dst, dst, smaller_scratch.data(), slice.count);
++    }
++  }
++
++  if (block_info.next_larger_block_size != 0) {
++    // The next larger block immediately precedes this block's starting rank:
++    // `[offset_to_my_block - next_larger_block_size, offset_to_my_block)`.
++    const uint32_t offset_to_larger_block =
++        block_info.offset_to_my_block - block_info.next_larger_block_size;
++    // Our slice is `num_sends` times wider than a rank's slice in the larger
++    // block, so we split our slice into `num_sends` pieces of size
++    // `send_count_to_larger` (the chunk size of ranks in that larger block).
++    const uint32_t num_sends =
++        block_info.next_larger_block_size / block_info.my_block_size;
++    const int64_t send_count_to_larger =
++        chunk_size << (steps - Log2Floor(block_info.next_larger_block_size));
++    // Map this sender rank to the destination ranks in the larger block:
++    //   1. `src_ordinal` is which slice of our block (`0 .. my_block_size - 1`,
++    //      in left-to-right array order) this rank holds after Phase 1.
++    //      In our 6-rank example (`my_block_size = 2`):
++    //        - rank 4 (`rank_in_block = 0`) -> `src_ordinal = 0` (`[A, B]`)
++    //        - rank 5 (`rank_in_block = 1`) -> `src_ordinal = 1` (`[C, D]`)
++    //   2. Splitting slice `src_ordinal` into `num_sends` pieces produces chunk
++    //      indices `dest_ordinal + i` (`i = 0 .. num_sends - 1`) in the larger
++    //      block:
++    //        - `src_ordinal = 0` (`[A, B]`) -> chunks `0, 1` (`A`, `B`)
++    //        - `src_ordinal = 1` (`[C, D]`) -> chunks `2, 3` (`C`, `D`)
++    //   3. In the larger block, chunk `c` lives on within-block rank
++    //      `ReverseLastNBits(c, log2(next_larger_block_size))`:
++    //        - chunks `0, 1` (`A, B`) -> ranks `0, 2`
++    //        - chunks `2, 3` (`C, D`) -> ranks `1, 3`.
++    const uint32_t src_ordinal =
++        ReverseLastNBits(rank_in_block, Log2Floor(block_info.my_block_size));
++    uint32_t dest_ordinal = src_ordinal * num_sends;
++
++    std::vector<std::unique_ptr<gloo::transport::UnboundBuffer>> send_bufs;
++    for (uint32_t i = 0; i < num_sends; ++i) {
++      // Global rank ID in the larger block that holds chunk `dest_ordinal + i`.
++      const uint32_t dest_rank =
++          offset_to_larger_block +
++          ReverseLastNBits(dest_ordinal + i,
++                           Log2Floor(block_info.next_larger_block_size));
++      // Starting element index in `work` of sub-piece `i` within our slice.
++      const int64_t my_offset = slice.offset + i * send_count_to_larger;
++      const int64_t item_count = std::max<int64_t>(
++          0, std::min(send_count_to_larger, total_count - my_offset));
++      if (item_count > 0) {
++        auto sb = context->createUnboundBuffer(
++            work.data() + my_offset * element_size, item_count * element_size);
++        sb->send(dest_rank, inter_block_slot);
++        send_bufs.push_back(std::move(sb));
++      }
++    }
++    for (auto& sb : send_bufs) {
++      sb->waitSend(deadline);
++    }
++  }
++}
++
++// Describes one contiguous slice transfer in Phase 3.
++//
++// Phase 3 serves two purposes:
++//   1. Even for power-of-two `world_size`, Phase 1's LSB-first halving leaves
++//      chunk `c` on rank `ReverseLastNBits(c, steps)`, so Phase 3 unscrambles
++//      that bit-reversal permutation and copies self-owned shards from `work`
++//      into `recv_ptr`.
++//   2. For non-power-of-two `world_size`, `chunk_size > count`, so source
++//      chunks in the largest block and destination shards don't align 1-to-1.
++//      For example, with world_size = 3 and count = 4 (N = 12, chunks = 2,
++//      chunk_size = 6):
++//        source chunks:      [   0 .. 6   )[   6 .. 12   )
++//        destination shards: [ 0..4 )[ 4..8 )[ 8..12 )
++//      Rank 1's output shard [4, 8) must be assembled from two pieces: [4, 6)
++//      from source chunk 0 and [6, 8) from source chunk 1.
++struct DistributionEntry {
++  // Peer rank ID for this transfer:
++  // - In `dist_map_for_send`: destination rank (`0 .. world_size - 1`).
++  // - In `dist_map_for_recv`: source rank (`0 .. chunks - 1`).
++  uint32_t rank;
++
++  // Starting element index of this piece in the global `[0, N)` array (in
++  // elements). On the sender, the data lives at `work + offset * element_size`.
++  size_t offset;
++
++  // Number of elements in this piece (`item_count * element_size` bytes).
++  size_t item_count;
++};
++
++// Finds which peer ranks overlap with `[src_offset, src_offset + src_count)`
++// given per-bucket sizes `recv_counts`.
++//
++// Used in two directions in Phase 3:
++// - Sending (`bit_reverse_ranks = false`): a rank in the largest block has
++//   reduced elements `[src_offset, src_offset + src_count)` and wants to know
++//   which target ranks `t` need pieces of it (bucket `i` -> rank `i`).
++// - Receiving (`bit_reverse_ranks = true`): target rank `t` wants elements
++//   `[t * count, (t + 1) * count)` and needs to know which ranks in the largest
++//   block hold them (bucket `i` -> rank `ReverseLastNBits(i, steps)`).
++std::vector<DistributionEntry> GetDistributionMap(
++    size_t src_offset, int64_t src_count,
++    const std::vector<size_t>& recv_counts, uint32_t world_size,
++    bool bit_reverse_ranks) {
++  std::vector<DistributionEntry> dist_map;
++  // Because `chunk_size = ceil(total_count / chunks)`, the last chunk(s) can
++  // lie entirely beyond `total_count` (e.g. `world_size = 5, count = 1` gives
++  // `chunk_size = 2`, so chunk 3 starts at offset 6 >= `total_count = 5`),
++  // giving `src_count == 0`.
++  if (src_count <= 0) {
++    return dist_map;
++  }
++
++  const uint32_t steps = Log2Floor(world_size);
++  const size_t size = recv_counts.size();
++
++  // Advance `start` to the first bucket in `recv_counts` that overlaps with
++  // `src_offset`, accumulating the starting element index of bucket `start` in
++  // `dest_offset`.
++  size_t dest_offset = 0;
++  size_t start = 0;
++  for (; start < size; ++start) {
++    if (dest_offset + recv_counts[start] > src_offset) {
++      break;
++    }
++    dest_offset += recv_counts[start];
++  }
++  // Convert `dest_offset` from bucket `start`'s global start offset into the
++  // within-bucket offset where our slice begins (`0 <= dest_offset <
++  // recv_counts[start]`).
++  dest_offset = src_offset - dest_offset;
++
++  // Walk consecutive buckets `i = start, start + 1, ...` and slice
++  // `[src_offset, src_offset + src_count)` along bucket boundaries until all
++  // `total_count` elements have been assigned to peer ranks.
++  size_t total_count = src_count;
++  for (size_t i = start; i < size; ++i) {
++    // Number of elements available in bucket `i` starting at `src_offset`.
++    // Only the first overlapping bucket (`i == start`) can start mid-bucket.
++    size_t recv_count = recv_counts[i];
++    if (dest_offset != 0) {
++      recv_count -= dest_offset;
++      dest_offset = 0;
++    }
++    // Peer rank that owns bucket `i`: either destination rank `i` (when
++    // sending) or `ReverseLastNBits(i, steps)` in the largest block (when
++    // receiving).
++    const uint32_t rank = bit_reverse_ranks ? ReverseLastNBits(i, steps)
++                                            : static_cast<uint32_t>(i);
++    // Clamp to the remaining unassigned elements of our slice.
++    recv_count = std::min(recv_count, total_count);
++    if (recv_count > 0) {
++      dist_map.push_back(DistributionEntry{rank, src_offset, recv_count});
++      src_offset += recv_count;
++      total_count -= recv_count;
++    }
++    if (total_count == 0) {
++      break;
++    }
++  }
++  return dist_map;
++}
++
++// Phase 3: Send final reduced shards from the largest block to destination
++// ranks.
++void DistributeShards(const std::shared_ptr<gloo::Context>& context,
++                      const BlockMembership& block_info, uint32_t steps,
++                      size_t chunks, size_t chunk_size, size_t count,
++                      size_t element_size, gloo::Slot base_slot,
++                      std::chrono::system_clock::time_point deadline,
++                      const ReducedSlice& slice, std::vector<char>& work,
++                      void* recv_ptr) {
++  const uint32_t world_size = context->size;
++  const uint32_t rank = context->rank;
++
++  // Send map (only populated on ranks in the largest block, where
++  // `next_larger_block_size == 0`): slice this rank's reduced chunk
++  // `[slice.offset, slice.offset + slice.count)` against the `world_size`
++  // output shards of size `count` to find which destination rank wants each
++  // piece.
++  std::vector<DistributionEntry> dist_map_for_send;
++  if (block_info.next_larger_block_size == 0) {
++    std::vector<size_t> recv_elems(world_size, count);
++    dist_map_for_send =
++        GetDistributionMap(slice.offset, slice.count, recv_elems, world_size,
++                           /*bit_reverse_ranks=*/false);
++  }
++
++  // Receive map (populated on every rank): slice this rank's wanted output
++  // shard `[rank * count, (rank + 1) * count)` against the `chunks` reduced
++  // chunks of size `chunk_size` in the largest block to find which source rank
++  // holds each piece (using `bit_reverse_ranks = true` because chunk `i` lives
++  // on rank `ReverseLastNBits(i, steps)`).
++  // Unlike Gloo, we pass uniform `chunk_size` for all `chunks` buckets without
++  // clamping tail buckets to `total_count`; these are equivalent because the
++  // clamped and unclamped prefix sums agree up through element `total_count -
++  // 1` and no shard offset exceeds `total_count`.
++  std::vector<size_t> recv_counts_largest_block(chunks, chunk_size);
++  const size_t my_dst_offset = rank * count;
++  const std::vector<DistributionEntry> dist_map_for_recv =
++      GetDistributionMap(my_dst_offset, count, recv_counts_largest_block,
++                         world_size, /*bit_reverse_ranks=*/true);
++
++  const auto dist_slot = base_slot + static_cast<uint8_t>(steps + 1);
++  std::vector<std::unique_ptr<gloo::transport::UnboundBuffer>> dist_sends;
++  std::vector<std::unique_ptr<gloo::transport::UnboundBuffer>> dist_recvs;
++  char* out_bytes = static_cast<char*>(recv_ptr);
++
++  // Post receives for all remote pieces of our output shard directly into their
++  // contiguous positions in `recv_ptr`. Self-pieces (`entry.rank == rank`) are
++  // skipped here and copied locally below, while still advancing `out_offset`.
++  size_t out_offset = 0;
++  for (const auto& entry : dist_map_for_recv) {
++    if (entry.rank != rank) {
++      auto rb =
++          context->createUnboundBuffer(out_bytes + out_offset * element_size,
++                                       entry.item_count * element_size);
++      rb->recv(entry.rank, dist_slot);
++      dist_recvs.push_back(std::move(rb));
++    }
++    out_offset += entry.item_count;
++  }
++
++  // Send each piece of our reduced chunk to its destination rank (or memcpy
++  // directly into `recv_ptr` if the destination is this rank itself).
++  for (const auto& entry : dist_map_for_send) {
++    if (entry.rank == rank) {
++      // Find the element offset within `recv_ptr` where our self-piece belongs.
++      size_t local_recv_offset = 0;
++      for (const auto& recv_entry : dist_map_for_recv) {
++        if (recv_entry.rank == rank) {
++          break;
++        }
++        local_recv_offset += recv_entry.item_count;
++      }
++      std::memcpy(out_bytes + local_recv_offset * element_size,
++                  work.data() + entry.offset * element_size,
++                  entry.item_count * element_size);
++    } else {
++      auto sb = context->createUnboundBuffer(
++          work.data() + entry.offset * element_size,
++          entry.item_count * element_size);
++      sb->send(entry.rank, dist_slot);
++      dist_sends.push_back(std::move(sb));
++    }
++  }
++
++  // Wait for all distribution sends and receives to complete.
++  for (auto& rb : dist_recvs) {
++    rb->waitRecv(deadline);
++  }
++  for (auto& sb : dist_sends) {
++    sb->waitSend(deadline);
++  }
++}
++
++absl::Status RunReduceScatterHalvingDoubling(
++    const std::shared_ptr<gloo::Context>& context, const void* send_ptr,
++    void* recv_ptr, size_t count, size_t element_size, ReduceFn reduce_fn,
++    absl::Duration timeout, uint32_t tag) {
++  const uint32_t world_size = context->size;
++  const uint32_t rank = context->rank;
++  const size_t total_count = count * world_size;
++  const size_t chunk_bytes = count * element_size;
++
++  // All ranks in the collective pass the same `count` and `world_size`, so all
++  // ranks take this early exit together without any communication.
++  if (count == 0 || world_size == 0) {
++    return absl::OkStatus();
++  }
++  if (world_size == 1) {
++    if (recv_ptr != send_ptr) {
++      std::memmove(recv_ptr, send_ptr, chunk_bytes);
++    }
++    return absl::OkStatus();
++  }
++
++  const uint32_t steps = Log2Floor(world_size);
++  const size_t chunks = size_t{1} << steps;
++  const size_t chunk_size = (total_count + chunks - 1) / chunks;
++  const BlockMembership block_info = GetBlockMembership(world_size, rank);
++
++  // Every send/recv/reduce offset in Phases 1, 2, and 3 is clamped against
++  // `total_count`, so `work` is never accessed at or beyond `total_count` and
++  // needs no tail padding.
++  // TODO(phawkins): Reduce memory usage for large arrays by allocating `work`
++  // for `total_count / 2` elements instead of `total_count`: step 0 can read
++  // inputs directly from `send_ptr`, receive into `work`, and reduce in-place
++  // into `work`, while subsequent steps can receive into the unused half of
++  // `work` instead of allocating a separate `scratch` buffer.
++  const char* send_bytes = static_cast<const char*>(send_ptr);
++  std::vector<char> work(send_bytes, send_bytes + total_count * element_size);
++
++  const auto base_slot = gloo::Slot::build(kReduceScatterSlotPrefix, tag);
++  const auto deadline = absl::ToChronoTime(absl::Now() + timeout);
++
++  // Note on `UnboundBuffer::waitSend` / `waitRecv`: Gloo throws
++  // `gloo::IoException` when `deadline` expires. Their `bool` return value is
++  // `false` only when explicitly aborted via `abortWaitSend` / `abortWaitRecv`,
++  // which XLA never calls.
++  try {
++    const ReducedSlice slice =
++        ReduceWithinBlock(context, block_info, steps, chunk_size, total_count,
++                          element_size, reduce_fn, base_slot, deadline, work);
++
++    ReduceAcrossBlocks(context, block_info, steps, chunk_size, total_count,
++                       element_size, reduce_fn, base_slot, deadline, slice,
++                       work);
++
++    DistributeShards(context, block_info, steps, chunks, chunk_size, count,
++                     element_size, base_slot, deadline, slice, work, recv_ptr);
++  } catch (const gloo::IoException& e) {
++    return absl::DeadlineExceededError(
++        absl::StrCat("Gloo ReduceScatter timed out: ", e.what()));
++  } catch (const std::exception& e) {
++    return absl::UnknownError(
++        absl::StrCat("Gloo ReduceScatter failed: ", e.what()));
++  }
++
++  return absl::OkStatus();
++}
++
++absl::StatusOr<ReduceFn> GetReduceFunctionForType(
++    PrimitiveType dtype, ReductionKind reduction_kind) {
++  switch (dtype) {
++    case S8:
++      return GetReduceFunction<int8_t>(reduction_kind);
++    case PRED:
++    case U8:
++      return GetReduceFunction<uint8_t>(reduction_kind);
++    case S16:
++      return GetReduceFunction<int16_t>(reduction_kind);
++    case U16:
++      return GetReduceFunction<uint16_t>(reduction_kind);
++    case S32:
++      return GetReduceFunction<int32_t>(reduction_kind);
++    case U32:
++      return GetReduceFunction<uint32_t>(reduction_kind);
++    case S64:
++      return GetReduceFunction<int64_t>(reduction_kind);
++    case U64:
++      return GetReduceFunction<uint64_t>(reduction_kind);
++    case BF16:
++      return GetReduceFunction<bfloat16>(reduction_kind);
++    case F16:
++      return GetReduceFunction<gloo::float16>(reduction_kind);
++    case F32:
++      return GetReduceFunction<float>(reduction_kind);
++    case F64:
++      return GetReduceFunction<double>(reduction_kind);
++    case C64:
++      return GetReduceFunction<std::complex<float>>(reduction_kind);
++    case C128:
++      return GetReduceFunction<std::complex<double>>(reduction_kind);
++    default:
++      return absl::InvalidArgumentError("Unknown datatype in reducescatter");
++  }
++}
++
++}  // namespace
++
++absl::Status GlooReduceScatter(const std::shared_ptr<gloo::Context>& context,
++                               se::DeviceAddressBase send_buffer,
++                               se::DeviceAddressBase recv_buffer,
++                               PrimitiveType dtype, size_t count,
++                               ReductionKind reduction_kind,
++                               absl::Duration timeout, uint32_t tag) {
++  ABSL_ASSIGN_OR_RETURN(ReduceFn reduce_fn,
++                        GetReduceFunctionForType(dtype, reduction_kind));
++  return RunReduceScatterHalvingDoubling(
++      context, send_buffer.opaque(), recv_buffer.opaque(), count,
++      primitive_util::ByteWidth(dtype), reduce_fn, timeout, tag);
++}
++
++}  // namespace xla::cpu
+diff --git a/xla/backends/cpu/collectives/gloo_reduce_scatter.h b/xla/backends/cpu/collectives/gloo_reduce_scatter.h
+new file mode 100644
+index 0000000000000..52905bc546923
+--- /dev/null
++++ b/xla/backends/cpu/collectives/gloo_reduce_scatter.h
+@@ -0,0 +1,69 @@
++/* Copyright 2026 The OpenXLA Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++
++#ifndef XLA_BACKENDS_CPU_COLLECTIVES_GLOO_REDUCE_SCATTER_H_
++#define XLA_BACKENDS_CPU_COLLECTIVES_GLOO_REDUCE_SCATTER_H_
++
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++
++#include "absl/status/status.h"
++#include "absl/time/time.h"
++#include "gloo/context.h"
++#include "xla/core/collectives/reduction_kind.h"
++#include "xla/stream_executor/device_address.h"
++#include "xla/xla_data.pb.h"
++
++namespace xla::cpu {
++
++// Gloo reserves slot prefixes 0x01..0x08 for its built-in collectives
++// (gloo/types.h). XLA uses 0x40+ for collectives implemented in XLA.
++inline constexpr uint8_t kCollectivePermuteSlotPrefix = 0x40;
++inline constexpr uint8_t kReduceScatterSlotPrefix = 0x41;
++
++// Performs a halving-doubling reduce-scatter collective operation.
++// We implement this ourselves because Gloo's built-in halving-doubling
++// reduce-scatter is buggy and does not support timeouts.
++//
++// Arguments:
++//   context: The Gloo communicator context (defines world size and rank).
++//   send_buffer: Input buffer containing `count * context->size` elements of
++//     type `dtype`. Reduction is not performed in-place.
++//   recv_buffer: Output buffer receiving `count` reduced elements for this
++//     rank. May alias or partially overlap `send_buffer`.
++//   dtype: Element primitive type.
++//   count: Number of output elements per rank (total input elements is
++//     `count * context->size`).
++//   reduction_kind: Reduction operator (SUM, PRODUCT, MIN, MAX).
++//   timeout: Maximum duration allowed for the collective before failing with a
++//     timeout error.
++//   tag: Caller-supplied tag used to disambiguate concurrent collectives on the
++//     same `context`.
++absl::Status GlooReduceScatter(const std::shared_ptr<gloo::Context>& context,
++                               se::DeviceAddressBase send_buffer,
++                               se::DeviceAddressBase recv_buffer,
++                               PrimitiveType dtype, size_t count,
++                               ReductionKind reduction_kind,
++                               absl::Duration timeout, uint32_t tag = 0);
++
++namespace internal {
++// Reverses the lowest `n` bits of `ctr`. Exposed for testing.
++uint32_t ReverseLastNBits(uint32_t ctr, uint32_t n);
++}  // namespace internal
++
++}  // namespace xla::cpu
++
++#endif  // XLA_BACKENDS_CPU_COLLECTIVES_GLOO_REDUCE_SCATTER_H_

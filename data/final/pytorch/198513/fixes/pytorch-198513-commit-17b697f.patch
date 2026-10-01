@@ -1,0 +1,165 @@
+From 17b697f26c25932d8987352dbd9a6c2484c7e03a Mon Sep 17 00:00:00 2001
+From: drisspg <drisspguessous@gmail.com>
+Date: Sat, 26 Sep 2026 03:55:28 +0000
+Subject: [PATCH] [FlexAttention] Freeze query layout before building the flex
+ decoding GQA view (#198543)
+
+## Human Note
+Simple fix we were freezing layouts too late in the lowering
+
+## Agent Report
+# Report: pytorch/pytorch#198513
+
+## Result
+
+Fixed. For `Q_LEN < 128`, Inductor lowers `flex_attention` to the flex decoding kernel. That lowering read q's strides while q was still an unfrozen pointwise buffer, then baked them into an `as_strided` GQA view. Later, the scheduler froze the buffer with a different stride order, so the kernel read q at the wrong offsets. Prologue fusion was not the cause: setting `prologue_fusion=False` did not hide the bug.
+
+## Root cause
+
+In `torch/_inductor/kernel/flex/flex_decoding.py`, `create_flex_decoding_kernel` calls `realize_input(query)`, reads `query.get_stride()`, and builds a `[B, Hkv, G, Mq, D]` `ReinterpretView` through `lowerings[aten.as_strided]`. For a pointwise producer such as `q * scale`, the buffer still has a `FlexibleLayout`, so the strides read are provisional contiguous values. Later, `ComputedBuffer.decide_layout` freezes the buffer to the fill order of its `[B, S, H, D]` input (`[4096, 32, 128, 1]` in the repro), while the kernel keeps `stride_qh=1024, stride_qm=32`.
+
+Why the conditions in the issue matter:
+- `seq_len >= 128` uses the regular flex template, which freezes its inputs with `always_freeze_layout=True`.
+- Without a pointwise producer, q is a view of the matmul output, whose layout is already fixed.
+
+This code dates to the GQA support commit (#131559).
+
+## Change
+
+- `flex_decoding.py`: after `realize_input(query)`, call `ir.as_storage_and_layout(query, freeze=True)` before reading strides. With no stride constraint, this runs `decide_layout()`, which locks in the same fill-order layout the scheduler would have chosen later. The strides baked into the view are now accurate, and nothing else about the graph changes. Queries that already have fixed layouts (views such as `mm.transpose()`) are unaffected and are still read in place, with no copy.
+- `test/inductor/test_flex_decoding.py::test_pointwise_query_producer`: q comes from a pointwise op on a `[B, S, H, D]` view, `Q_S=32`, parametrized over `test_Hq_Hkv` (MHA and GQA), fp32 with `@with_tf32_off`, and compiled output is compared against eager.
+
+## Validation (GB200, job venv)
+
+- Regression test: fails 3/3 without the fix (max abs diff ~1.4), passes 3/3 with it.
+- `flex_bug.py` from the issue: 2 mismatches before the fix, 0 after.
+- `pytest test/inductor/test_flex_decoding.py`: 558 passed, 13 skipped, 2 xfailed.
+- `pytest test/inductor/test_flex_attention.py -k "prologue or small or decod or strided or non_contig or gqa or GQA or captured_buffers or seq_masking"`: 51 passed, 17 skipped.
+- `lintrunner` on both files: clean. lintrunner was not initialized, so some linters may not have run.
+
+## CPU
+
+- Not run: this host is aarch64 (Neoverse-V2), where Inductor's CPU flex path raises `NotImplementedError` from `check_cpu_supported()`.
+- By code inspection, CPU dispatches to `lower_cpu` before the decode path, so this fix does not change CPU compile time or runtime. `flex_cpu.py` uses `query.get_stride()` only to choose output strides, which does not affect correctness.
+
+## Performance
+
+No performance hit: the fixed code runs as fast as the code before the fix, which kept the same layout but produced wrong output. Timings are for the whole compiled function on GB200, in us (lower is better), over 3 rotated rounds:
+
+| shape | before fix (wrong output) | this PR | no pointwise op (floor) |
+|---|---|---|---|
+| fp32 B=2 H=4 D=32 S=32 | 26.5-27.1 | 25.8-26.3 | 24.2-24.3 |
+| fp32 B=2 H=4 D=32 S=64 | 46.5-48.1 | 45.1-46.7 | 43.6-43.8 |
+| bf16 GQA 32/8 D=128 Sq=16 Skv=8192 | 547-549 | 549-552 | 543-549 |
+
+The gap to the floor is the `mul` kernel itself (~1.6 us), which runs with or without the fix. An earlier version of this PR froze q to contiguous instead. At S=32 that was ~3 us slower, because q could no longer reuse the matmul output buffer in place and needed its own allocation.
+
+Method: `transformer_nuggets` `benchmark_cuda_function_in_microseconds`, warm reused buffers, fresh Inductor cache per process. The "before fix" and "this PR" columns were measured in separate sweeps on the two identical GB200s. Separately, Sq=64 with GQA takes ~38-40 ms in every variant, including with no pointwise op. That is an existing slowdown in the decode path, unrelated to this PR.
+
+## Remaining uncertainty
+
+- Possibly related, not verified: `flex_mps.py` passes `query/key/value.get_stride()` as kernel scalars after `realize_inputs`, so MPS may have the same stale-stride bug with pointwise producers. It cannot be tested here.
+
+Fixes #198513
+
+<details>
+<summary>Agent Worklog</summary>
+
+# Worklog: pytorch/pytorch#198513
+
+## Reproduction (facts)
+
+- GB200 (sm_100), torch 2.15.0a0+git6b34af2, job venv. `flex_bug.py`: seq_len 32/64 with a pointwise q/k producer mismatch under Inductor (max abs 0.90/0.96); every other config is exact.
+- `agent_space/repro.py` (seq 32): `torch._inductor.config.prologue_fusion = False` does NOT hide the bug (err 7.9e-1 in both settings). The reporter's prologue-fusion hypothesis is wrong.
+
+## Root cause
+
+- Q_LEN < 128 routes to the flex decoding (split-KV) kernel (`create_flex_decoding_kernel`).
+- `flex_decoding.py` calls `ir.ExternKernel.realize_input(query)`, reads `query.get_stride()`, and builds a `[B, Hkv, G, Mq, D]` view via `lowerings[aten.as_strided]`. `as_strided` bakes those strides into a `ReinterpretView` with a `FixedLayout`, but does not freeze the underlying buffer.
+- When q is a pointwise `ComputedBuffer` (e.g. `q * scale`), its layout is still `FlexibleLayout` at this point, so the strides read are provisional contiguous ones (`4096, 1024, 32, 1`). The scheduler later runs `ComputedBuffer.decide_layout`, which freezes with the fill order of the permuted `[B, S, H, D]` input: `[4096, 32, 128, 1]`. The decode kernel reads q with the stale strides -> garbage.
+- Seq >= 128 uses the regular flex_attention template, whose inputs are frozen by `always_freeze_layout=True`. K/V are frozen that way in the decode template too; only Q goes through the `as_strided` view. Without a pointwise producer, q is a view of the mm output (already fixed layout), so it is correct.
+- Confirmed from output code (`agent_space/out_s32.py`): buffer `mul` has strides `[4096, 32, 128, 1]`, the template hardcodes `stride_qh, stride_qm = 1024, 32`.
+- The code dates back to the GQA support commit (#131559), so the bug is long-standing, not a recent regression.
+
+## Fix
+
+- `torch/_inductor/kernel/flex/flex_decoding.py`: freeze the realized query's layout (`freeze_irnodes`) before reading its strides. Buffers that already had fixed layouts are unaffected; a flexible pointwise q buffer becomes contiguous, matching how K/V are frozen by the template.
+
+## Regression test
+
+- `test/inductor/test_flex_decoding.py::test_pointwise_query_producer` (parametrized over `test_Hq_Hkv`, includes GQA), fp32 with `@with_tf32_off`, compiled vs eager flex_attention.
+- Without fix: 3/3 fail (max abs ~1.4). With fix: 3/3 pass. (Without `with_tf32_off`, the module-level `set_float32_matmul_precision("high")` gives a 2e-3 diff with the fix, so the decorator is needed.)
+- Post-fix `flex_bug.py`: 0 mismatches; repro at seq 32/64/127 exact.
+
+## CPU
+
+- This host is aarch64 (Neoverse-V2): `check_cpu_supported()` is false, so Inductor CPU flex attention raises NotImplementedError here. Could not run the CPU path.
+- By code: CPU goes through `lower_cpu` (flex_attention.py:184) before the decode dispatch (line 302), so this fix cannot change CPU compile or runtime. `flex_cpu.py` only uses `query.get_stride()` to pick output strides (`infer_dense_strides`), which affects layout choice, not correctness.
+
+## Possible related issue (unverified)
+
+- `flex_mps.py:219` passes `query/key/value.get_stride()` as kernel scalar args after `realize_inputs`; if those are flexible pointwise buffers, the same stale-stride bug may apply on MPS. Not testable here.
+
+## Validation
+
+- Full `test/inductor/test_flex_decoding.py` (with fix): 558 passed, 13 skipped, 2 xfailed (`agent_space/decoding_full.log`).
+- `test/inductor/test_flex_attention.py -k "prologue or small or decod or strided or non_contig or gqa or GQA or captured_buffers or seq_masking"`: 51 passed, 17 skipped (`agent_space/attn_subset.log`).
+- `lintrunner` on both files: no issues (lintrunner reported no prior init data, so this may not have run every linter).
+- PR artifacts: `pr_title.txt`, `pr_labels.txt` (`release notes: inductor`).
+
+</details>
+
+---
+*This PR was generated by [ptq](https://github.com/drisspg/pt_job_queue) with human review.*
+
+Pull Request resolved: https://github.com/pytorch/pytorch/pull/198543
+Approved by: https://github.com/eellison
+---
+ test/inductor/test_flex_decoding.py          | 20 ++++++++++++++++++++
+ torch/_inductor/kernel/flex/flex_decoding.py |  2 ++
+ 2 files changed, 22 insertions(+)
+
+diff --git a/test/inductor/test_flex_decoding.py b/test/inductor/test_flex_decoding.py
+index 8b862b5606a8e..4cea564062282 100644
+--- a/test/inductor/test_flex_decoding.py
++++ b/test/inductor/test_flex_decoding.py
+@@ -1001,6 +1001,26 @@ def test_strided_inputs(self, device, dtype: torch.dtype, k_s, v_s, head_dims):
+             ref_out, paged_compiled_out, atol=tolerance.atol, rtol=tolerance.rtol
+         )
+ 
++    @supported_platform
++    @common_utils.parametrize("head_dims", test_Hq_Hkv)
++    @with_tf32_off
++    def test_pointwise_query_producer(self, device, head_dims):
++        # https://github.com/pytorch/pytorch/issues/198513
++        # The pointwise producer's layout follows its [B, S, H, D] input, not the
++        # contiguous [B, H, S, D] strides it has when flex decoding is lowered.
++        Hq, Hkv = head_dims
++        Q_S, D = 4, 16
++        x = torch.randn(2, Q_S, Hq * D, device=device)
++        scale = torch.rand(D, device=device) + 0.5
++        k = torch.randn(2, Hkv, Q_S, D, device=device)
++        v = torch.randn(2, Hkv, Q_S, D, device=device)
++
++        def f(x, k, v):
++            q = x.view(2, Q_S, Hq, D).transpose(1, 2) * scale
++            return flex_attention(q, k, v, enable_gqa=Hq != Hkv)
++
++        self.assertEqual(torch.compile(f)(x, k, v), f(x, k, v))
++
+     @supported_platform
+     @parametrize_device_dtype("dtypes_fast")
+     @common_utils.parametrize("head_dims", test_Hq_Hkv)
+diff --git a/torch/_inductor/kernel/flex/flex_decoding.py b/torch/_inductor/kernel/flex/flex_decoding.py
+index 078aaba649c67..74b6a1e0026a1 100644
+--- a/torch/_inductor/kernel/flex/flex_decoding.py
++++ b/torch/_inductor/kernel/flex/flex_decoding.py
+@@ -324,6 +324,8 @@ def create_flex_decoding_kernel(*args, **kwargs):
+     )
+ 
+     query = ir.ExternKernel.realize_input(query)
++    # Decide the layout before reading strides: the as_strided view below bakes them in.
++    ir.as_storage_and_layout(query, freeze=True)
+     stride_b, stride_hq, stride_seq_len_q, stride_qk_head_dim = query.get_stride()
+ 
+     # Reshape query for GQA: [B, Hq, Mq, D] -> [B, Hkv, G, Mq, D]

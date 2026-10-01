@@ -1,0 +1,116 @@
+From aa80527dce0ce97ec1479b9116d2f41457337f0c Mon Sep 17 00:00:00 2001
+From: Thomas Raoux <thomas.raoux@openai.com>
+Date: Tue, 26 Aug 2025 21:47:26 -0700
+Subject: [PATCH] [BACKEND] Restrict MMAV5/MMV3 usage for N < 16 and fix
+ no-swizzle codegen
+
+This prevent generating miscompiles for cases where the N dimension is too small.
+Technically we could support N=8 but it would require padding the shared memory.
+---
+ lib/Analysis/Utility.cpp                      |  9 +++--
+ python/test/unit/language/test_matmul.py      |  2 +-
+ .../DotOpToLLVM/WGMMA.cpp                     | 34 ++++++++++++-------
+ 3 files changed, 30 insertions(+), 15 deletions(-)
+
+diff --git a/lib/Analysis/Utility.cpp b/lib/Analysis/Utility.cpp
+index 4a0224355e06..5076ec85c910 100644
+--- a/lib/Analysis/Utility.cpp
++++ b/lib/Analysis/Utility.cpp
+@@ -869,6 +869,8 @@ bool supportMMA(triton::DotOp op, int version) {
+   if (version == 5) {
+     if (triton::tools::getBoolEnv("DISABLE_MMA_V5"))
+       return false;
++    RankedTensorType typeA = op.getA().getType();
++    int k = typeA.getShape().back();
+     auto retType = op.getType();
+     auto retShapePerCTA = getShapePerCTA(retType);
+     auto rank = retShapePerCTA.size();
+@@ -882,8 +884,11 @@ bool supportMMA(triton::DotOp op, int version) {
+       // Currently only support numWarps 4 or 8 for TMEM load and store.
+       return false;
+     }
++    // If k size is smaller than the native mma size, we cannot use MMA.
++    if (k < 256 / aElemTy.getIntOrFloatBitWidth())
++      return false;
+     if (!(retShapePerCTA[rank - 2] % 64 == 0 &&
+-          retShapePerCTA[rank - 1] % 8 == 0))
++          retShapePerCTA[rank - 1] % 16 == 0))
+       return false;
+     return true;
+   }
+@@ -903,7 +908,7 @@ bool supportMMA(triton::DotOp op, int version) {
+     if (rank == 3)
+       return false;
+     if (!(numWarps % 4 == 0 && retShapePerCTA[rank - 2] % 64 == 0 &&
+-          retShapePerCTA[rank - 1] % 8 == 0 &&
++          retShapePerCTA[rank - 1] % 16 == 0 &&
+           (llvm::isa<Float8E5M2Type, Float8E4M3FNType>(aElemTy) ||
+            aElemTy.isInteger(8) || aElemTy.isF16() || aElemTy.isBF16() ||
+            aElemTy.isF32()))) {
+diff --git a/python/test/unit/language/test_matmul.py b/python/test/unit/language/test_matmul.py
+index 3aec821c4f00..85acf2608b41 100644
+--- a/python/test/unit/language/test_matmul.py
++++ b/python/test/unit/language/test_matmul.py
+@@ -91,7 +91,7 @@ def get_src_element_ty_size(dtype_str):
+ @pytest.mark.parametrize("dtype_dst_str", ["float32", "float16", "float64"])
+ @pytest.mark.parametrize("BLOCK_M, BLOCK_N, BLOCK_K, NUM_STAGES", [(128, 128, 16, 4), (64, 128, 32, 4), (32, 32, 32, 4),
+                                                                    (256, 128, 32, 4), (64, 512, 32, 2),
+-                                                                   (512, 64, 32, 2), (64, 16, 16, 4)])
++                                                                   (512, 64, 32, 2), (64, 16, 32, 4)])
+ @pytest.mark.parametrize("NUM_CTAS", [1, 2])
+ @pytest.mark.parametrize("NUM_WARPS", [4, 8])
+ @pytest.mark.parametrize("EPILOGUE_SUBTILE", [True, False])
+diff --git a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/WGMMA.cpp b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/WGMMA.cpp
+index 9ee89d8253c3..9a04b299d435 100644
+--- a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/WGMMA.cpp
++++ b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/WGMMA.cpp
+@@ -102,8 +102,13 @@ static Value createDescriptor(ConversionPatternRewriter &rewriter, Location loc,
+   default:
+     llvm::report_fatal_error("Unsupported swizzling size.");
+   }
+-  desc.strideDimensionBaseOffset = swizzling >> 1;
+-  desc.leadDimensionBaseOffset = (swizzling * stride) >> 4;
++  if (swizzling == 0) {
++    desc.leadDimensionBaseOffset = 16 >> 4; // 16 bytes.
++    desc.strideDimensionBaseOffset = (8 * 16) >> 4;
++  } else {
++    desc.leadDimensionBaseOffset = (swizzling * stride) >> 4;
++    desc.strideDimensionBaseOffset = swizzling >> 1;
++  }
+   return b.int_val(64, desc.descriptor);
+ }
+ 
+@@ -139,18 +144,23 @@ Value mlir::triton::NVIDIA::DotOpMmaV3SmemLoader::smemLoad(
+   if (trans) {
+     std::swap(k, m);
+   }
+-  Value leading_offset =
+-      tb.mul(tb.udiv(k, elemsPerSwizzlingRowVal),
+-             tb.i32_val(shape[1 - fastMovingDim] * elemsPerSwizzlingRow));
+-  Value stride_offset = tb.mul(m, elemsPerSwizzlingRowVal);
+-  Value offset = tb.add(tb.add(leading_offset, stride_offset),
+-                        tb.urem(k, elemsPerSwizzlingRowVal));
+   Value off1;
+-  // Avoid the runtime udiv if we know the elements are byte multiples
+-  if (elemBits % 8) {
+-    off1 = tb.udiv(tb.mul(tb.i32_val(elemBits), offset), tb.i32_val(8));
++  if (elemsPerSwizzlingRow > 0) {
++    Value leading_offset =
++        tb.mul(tb.udiv(k, elemsPerSwizzlingRowVal),
++               tb.i32_val(shape[1 - fastMovingDim] * elemsPerSwizzlingRow));
++    Value stride_offset = tb.mul(m, elemsPerSwizzlingRowVal);
++    Value offset = tb.add(tb.add(leading_offset, stride_offset),
++                          tb.urem(k, elemsPerSwizzlingRowVal));
++    // Avoid the runtime udiv if we know the elements are byte multiples
++    if (elemBits % 8) {
++      off1 = tb.udiv(tb.mul(tb.i32_val(elemBits), offset), tb.i32_val(8));
++    } else {
++      off1 = tb.mul(tb.i32_val(elemBits / 8), offset);
++    }
+   } else {
+-    off1 = tb.mul(tb.i32_val(elemBits / 8), offset);
++    off1 = tb.mul(k, tb.i32_val(shape[1 - fastMovingDim]));
++    off1 = tb.add(off1, tb.mul(m, tb.i32_val(1024)));
+   }
+   Value smemBase = tb.ptrtoint(i32_ty, base);
+   smemBase = tb.add(smemBase, off1);

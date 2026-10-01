@@ -1,0 +1,80 @@
+From 62a4f51cf34e32503ae138c8f977b434bb90a325 Mon Sep 17 00:00:00 2001
+From: Witold Dziurdz <witold.dziurdz@intel.com>
+Date: Mon, 27 Jul 2026 23:34:52 +0000
+Subject: [PATCH] [inductor] Add barrier before reading back a buffer stored in
+ a reduction loop (#190519)
+
+Fixes #190517
+
+If a kernel stores a buffer and then reads it back in a reduction loop, the
+store and the read-back can land on different warps, so a warp may read the
+value before another warp's write is visible.
+
+This is the read-after-write side of the write-after-read guard already in
+`store()` (triton #1615). `self.cse.invalidated_stores` already tracks the
+"stored, then reloaded across a reduction-loop boundary" set, so we add a
+`tl.debug_barrier()` before such a load.
+
+pit_b_224 (timm, XPU, AMP fp16 inference) now passes.
+
+Pull Request resolved: https://github.com/pytorch/pytorch/pull/190519
+Approved by: https://github.com/eellison, https://github.com/jansel, https://github.com/aorenste
+---
+ test/inductor/test_torchinductor.py | 23 +++++++++++++++++++++++
+ torch/_inductor/codegen/triton.py   |  9 +++++++++
+ 2 files changed, 32 insertions(+)
+
+diff --git a/test/inductor/test_torchinductor.py b/test/inductor/test_torchinductor.py
+index 96ba6d38cf0fe..0d7738cb614e5 100644
+--- a/test/inductor/test_torchinductor.py
++++ b/test/inductor/test_torchinductor.py
+@@ -19671,6 +19671,29 @@ def fn(x: torch.Tensor) -> torch.Tensor:
+ 
+             self.assertEqual(fn_opt(*inps), fn(*inps))
+ 
++        def test_barrier_on_reduction_loop_readback(self):
++            # A buffer stored in a reduction loop and read back after it needs
++            # a barrier, or one warp may read what another wrote.
++            def fn(a, b, w, bias):
++                y = a + b
++                mean = y.mean(-1, keepdim=True)
++                var = y.var(-1, keepdim=True, unbiased=False)
++                normed = (y - mean) * torch.rsqrt(var + 1e-6) * w + bias
++                return y, normed
++
++            N = 4096
++            inps = [
++                torch.randn(64, N, device=GPU_TYPE),
++                torch.randn(64, N, device=GPU_TYPE),
++                torch.randn(N, device=GPU_TYPE),
++                torch.randn(N, device=GPU_TYPE),
++            ]
++            fn_opt = torch.compile(fn, backend="inductor")
++            code = run_and_get_triton_code(fn_opt, *inps)
++            self.assertTrue("tl.debug_barrier()" in code)
++
++            self.assertEqual(fn_opt(*inps), fn(*inps))
++
+         def test_index_expr_pure_indexing_no_int64(self):
+             def fn(x: torch.Tensor) -> torch.Tensor:
+                 idx = torch.arange(0, 128, device=GPU_TYPE, dtype=torch.int64)
+diff --git a/torch/_inductor/codegen/triton.py b/torch/_inductor/codegen/triton.py
+index 9013080cdc806..a303a7f8d2c31 100644
+--- a/torch/_inductor/codegen/triton.py
++++ b/torch/_inductor/codegen/triton.py
+@@ -4913,6 +4913,15 @@ def decide_later():
+                 dtype = torch.bool
+ 
+         load_buffer = self.get_load_buffer(indexing)
++        # Read-after-write companion to the #1615 guard in store(). If we read
++        # back a buffer we stored in a reduction loop, coalescing can put the
++        # store and load on different warps, so a warp may read before another
++        # warp's write is visible. Barrier first to make the writes visible.
++        if (
++            name in self.cse.invalidated_stores
++            and V.graph.get_current_device_or_throw().type != "cpu"
++        ):
++            load_buffer.writeline(DeferredLine(name, "tl.debug_barrier()"))
+         self._handle_pdl_before_access(load_buffer, name)
+         result_var = self.cse.generate(
+             load_buffer, make_line(line), dtype=dtype, shape=shape

@@ -1,0 +1,33 @@
+From e4c8096a6e8f291aa83c23dec198a24f90dfa4d2 Mon Sep 17 00:00:00 2001
+From: Andrew Woloszyn <andrew.woloszyn@gmail.com>
+Date: Thu, 21 Aug 2025 20:11:48 -0400
+Subject: [PATCH] Temporarily disable the circular buffer for parameter
+ uploads.
+
+There is an issue with very large models where parameters
+are getting corrupted. This disabled the circular buffer
+https://github.com/iree-org/iree/pull/21758and just does single-buffer uploading of parameters. It
+ends up being fractionally slower (~10%).
+
+Opened #21757 to fix this issue.
+
+Signed-off-by: Andrew Woloszyn <andrew.woloszyn@gmail.com>
+---
+ runtime/src/iree/hal/drivers/hip/hip_device.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/runtime/src/iree/hal/drivers/hip/hip_device.c b/runtime/src/iree/hal/drivers/hip/hip_device.c
+index d7a7dd1e96cc..1ddae807d6be 100644
+--- a/runtime/src/iree/hal/drivers/hip/hip_device.c
++++ b/runtime/src/iree/hal/drivers/hip/hip_device.c
+@@ -1956,8 +1956,8 @@ bool iree_hal_hip_transfer_buffer_size_check_condition(void* user_data) {
+   iree_hal_hip_transfer_buffer_size_check_data_t* data =
+       (iree_hal_hip_transfer_buffer_size_check_data_t*)user_data;
+   return iree_hal_hip_transfer_buffer_size_left(
+-             data->device, &data->device->devices[data->device_ordinal]) >=
+-         data->num_bytes;
++             data->device, &data->device->devices[data->device_ordinal]) ==
++         data->device->params.file_transfer_buffer_size;
+ }
+ 
+ // Returns two chunks that are needed to cover the buffer. Pass in an

@@ -1,0 +1,18 @@
+{
+  "duplicate_pair_jaccard": 1.0,
+  "pairwise_agreement": 1.0,
+  "pairwise_cohens_kappa": 1.0,
+  "report_pair_counts": {
+    "both_different_causes": 13025,
+    "both_same_cause": 16,
+    "reviewer_a_only_same_cause": 0,
+    "reviewer_b_only_same_cause": 0
+  },
+  "report_peer_set_agreement": 1.0,
+  "report_peer_set_agreements": 162,
+  "report_peer_set_disagreements": 0,
+  "reports": 162,
+  "reviewer_a_duplicate_pairs": 16,
+  "reviewer_b_duplicate_pairs": 16,
+  "schema_version": "1.0.0"
+}

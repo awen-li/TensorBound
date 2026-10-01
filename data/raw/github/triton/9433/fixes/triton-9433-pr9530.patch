@@ -1,0 +1,45 @@
+From 7221f70e0c5783a4b9deb143b4559445fde84317 Mon Sep 17 00:00:00 2001
+From: Christian Sigg <csigg@google.com>
+Date: Fri, 20 Feb 2026 14:57:47 +0100
+Subject: [PATCH 1/2] [Hopper] Move dummy moves before wgmma.fence
+
+0a0a57c introduced these moves before `wgmma.mma_async`, but producer and consumer of register inputs need to be separated by a `wgmma.fence`.
+---
+ .../nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/WGMMA.cpp      | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/WGMMA.cpp b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/WGMMA.cpp
+index b1d924899652..5eadfc6ae2a6 100644
+--- a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/WGMMA.cpp
++++ b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/WGMMA.cpp
+@@ -302,6 +302,8 @@ LogicalResult convertDot(const LLVMTypeConverter *typeConverter,
+           // WGMMA, we can safely overlap transformations on the A operand with
+           // the previous-iteration WGMMA still in flight.
+           for (Value &regAVal : regA) {
++            OpBuilder::InsertionGuard guard(rewriter);
++            rewriter.setInsertionPoint(startSequence);
+             Type regTy = regAVal.getType();
+             if (!regTy.isIntOrFloat() || regTy.getIntOrFloatBitWidth() != 32) {
+               return mlir::emitError(loc, "unsupported WGMMA A register type ")
+
+From e6c5c16c4a83d930a3f3eeecd45070e7fd79caea Mon Sep 17 00:00:00 2001
+From: Christian Sigg <csigg@google.com>
+Date: Fri, 20 Feb 2026 16:20:20 +0100
+Subject: [PATCH 2/2] Add to test.
+
+---
+ test/Conversion/tritongpu_to_llvm_hopper.mlir | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/test/Conversion/tritongpu_to_llvm_hopper.mlir b/test/Conversion/tritongpu_to_llvm_hopper.mlir
+index 8f4ed652a53f..c99b6ef222a9 100644
+--- a/test/Conversion/tritongpu_to_llvm_hopper.mlir
++++ b/test/Conversion/tritongpu_to_llvm_hopper.mlir
+@@ -140,6 +140,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+   // CHECK: %[[A_MOV1:.*]] = llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "mov.b32 $0, $1;", "=r,r" %{{.*}} : (i32) -> i32
+   // CHECK: %[[A_MOV2:.*]] = llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "mov.b32 $0, $1;", "=r,r" %{{.*}} : (i32) -> i32
+   // CHECK: %[[A_MOV3:.*]] = llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "mov.b32 $0, $1;", "=r,r" %{{.*}} : (i32) -> i32
++  // CHECK: nvvm.wgmma.fence.aligned
+   // CHECK: %[[A_PACK0:.*]] = llvm.insertvalue %[[A_MOV0]], %{{.*}}[0] : !llvm.struct<(i32, i32, i32, i32)>
+   // CHECK: %[[A_PACK1:.*]] = llvm.insertvalue %[[A_MOV1]], %[[A_PACK0]][1] : !llvm.struct<(i32, i32, i32, i32)>
+   // CHECK: %[[A_PACK2:.*]] = llvm.insertvalue %[[A_MOV2]], %[[A_PACK1]][2] : !llvm.struct<(i32, i32, i32, i32)>

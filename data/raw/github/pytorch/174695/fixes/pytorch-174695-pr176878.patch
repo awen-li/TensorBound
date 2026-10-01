@@ -1,0 +1,185 @@
+From f6a007ffac01bf314ab22671bdf62e5b1015f12a Mon Sep 17 00:00:00 2001
+From: Kushagra Rastogi <krastogi@redhat.com>
+Date: Mon, 9 Mar 2026 16:05:18 +0530
+Subject: [PATCH] Add Synch event in effectful ops and control reorder when src
+ and dst devices are different
+
+---
+ test/inductor/test_control_deps.py     | 48 ++++++++++++++++++++++++++
+ torch/_dynamo/variables/streams.py     | 25 +++++++++++++-
+ torch/_inductor/fx_passes/post_grad.py | 25 ++++++++++++++
+ torch/_inductor/lowering.py            |  1 +
+ 4 files changed, 98 insertions(+), 1 deletion(-)
+
+diff --git a/test/inductor/test_control_deps.py b/test/inductor/test_control_deps.py
+index 36b365e4f7d82..c7c12fbab2b81 100644
+--- a/test/inductor/test_control_deps.py
++++ b/test/inductor/test_control_deps.py
+@@ -1,7 +1,10 @@
+ # Owner(s): ["module: inductor"]
+ 
++from types import SimpleNamespace
++
+ import torch
+ from torch._inductor import config
++from torch._inductor.fx_passes.post_grad import reorder_for_locality
+ from torch._inductor.test_case import run_tests, TestCase as InductorTestCase
+ from torch._inductor.utils import run_and_get_code
+ from torch.testing import FileCheck
+@@ -258,6 +261,51 @@ def add_control_deps(graph):
+             torch.testing.assert_close(result, expected)
+ 
+ 
++class TestReorderForLocality(InductorTestCase):
++    def _build_graph_with_device_put(
++        self, src_device: torch.device, dst_device: torch.device
++    ) -> tuple[torch.fx.Graph, dict[str, str]]:
++        g = torch.fx.Graph()
++        x = g.placeholder("x")
++        # reorder_for_locality reads `node.meta["val"].device`.
++        x.meta["val"] = SimpleNamespace(device=src_device)
++        put = g.call_function(torch.ops.prims.device_put.default, (x, dst_device, True))
++        token = g.call_function(torch.ops.prims._make_token.default, ())
++        cat = g.call_function(torch.ops.aten.cat.default, ([put],))
++        g.output(cat)
++        return g, {"put": put.name, "token": token.name}
++
++    @staticmethod
++    def _node_names(g: torch.fx.Graph) -> list[str]:
++        return [n.name for n in g.nodes]
++
++    def test_keeps_cuda_to_cpu_non_blocking_put_order(self):
++        g, names = self._build_graph_with_device_put(
++            torch.device("cuda"), torch.device("cpu")
++        )
++        before = self._node_names(g)
++        self.assertLess(before.index(names["put"]), before.index(names["token"]))
++
++        reorder_for_locality(g)
++
++        after = self._node_names(g)
++        # CUDA->CPU non_blocking device_put should not be moved by locality reordering.
++        self.assertLess(after.index(names["put"]), after.index(names["token"]))
++
++    def test_still_reorders_same_device_put(self):
++        g, names = self._build_graph_with_device_put(
++            torch.device("cpu"), torch.device("cpu")
++        )
++        before = self._node_names(g)
++        self.assertLess(before.index(names["put"]), before.index(names["token"]))
++
++        reorder_for_locality(g)
++
++        after = self._node_names(g)
++        # Same-device device_put remains eligible for locality reordering.
++        self.assertGreater(after.index(names["put"]), after.index(names["token"]))
++
++
+ if __name__ == "__main__":
+     if IS_LINUX and HAS_CUDA_AND_TRITON:
+         run_tests(needs="filelock")
+diff --git a/torch/_dynamo/variables/streams.py b/torch/_dynamo/variables/streams.py
+index 7a861d3d7caf9..816a23c338b20 100644
+--- a/torch/_dynamo/variables/streams.py
++++ b/torch/_dynamo/variables/streams.py
+@@ -5,6 +5,7 @@
+ import torch
+ from torch._dynamo.variables.dicts import ConstDictVariable
+ from torch._dynamo.variables.lists import TupleVariable
++from torch._library.effects import EffectType
+ from torch.fx import has_side_effect, Proxy
+ 
+ from .. import graph_break_hints
+@@ -157,6 +158,25 @@ def _(
+ has_side_effect(torch.ops.streams.wait_event.default)
+ 
+ 
++@custom_op("streams::synchronize_event", mutates_args=())
++def synchronize_event(event_index: int) -> None:
++    event = _get_event_by_index(event_index)
++    event.synchronize()
++
++
++@synchronize_event.register_fake
++def _(
++    event_index: int,
++) -> None:
++    pass
++
++
++torch.library._register_effectful_op(
++    torch.ops.streams.synchronize_event.default,
++    EffectType.ORDERED,
++)
++
++
+ @custom_op("streams::wait_stream", mutates_args=())
+ def wait_stream(waiting_stream_index: int, waited_on_stream_index: int) -> None:
+     waiting = _get_stream_by_index(waiting_stream_index)
+@@ -515,7 +535,10 @@ def call_method(
+             return CONSTANT_VARIABLE_NONE
+         elif name == "synchronize":
+             tx.output.create_proxy(
+-                "call_method", name, *proxy_args_kwargs([self] + args, kwargs)
++                "call_function",
++                torch.ops.streams.synchronize_event,
++                (self.user_object_index,),
++                {},
+             )
+             return CONSTANT_VARIABLE_NONE
+         elif name == "query":
+diff --git a/torch/_inductor/fx_passes/post_grad.py b/torch/_inductor/fx_passes/post_grad.py
+index 7b947937646e6..49f5df52d2c6c 100644
+--- a/torch/_inductor/fx_passes/post_grad.py
++++ b/torch/_inductor/fx_passes/post_grad.py
+@@ -777,6 +777,26 @@ def check():
+         def check():
+             return True
+ 
++    def _is_non_blocking_src_device_to_dst_device_put(n: torch.fx.Node) -> bool:
++        if not (
++            n.op == "call_function" and n.target == torch.ops.prims.device_put.default
++        ):
++            return False
++        if len(n.args) < 3:
++            return False
++        dst_device = n.args[1]
++        non_blocking = n.args[2]
++        if not isinstance(dst_device, torch.device) or non_blocking is not True:
++            return False
++        src = n.args[0]
++        if not isinstance(src, torch.fx.Node):
++            return False
++        src_val = src.meta.get("val")
++        src_device = getattr(src_val, "device", None)
++        if not isinstance(src_device, torch.device):
++            return False
++        return src_device.type != dst_device.type
++
+     def visit(other_node):
+         if (
+             other_node.op == "call_function"
+@@ -786,6 +806,11 @@ def visit(other_node):
+             == get_mutation_region_id(graph, other_node)
+             and check()
+         ):
++            # Preserve eager-style ordering around async cross-device device_put
++            # (e.g. CUDA->CPU with non_blocking=True). Reordering these closer to
++            # consumers can float them across synchronization ops.
++            if _is_non_blocking_src_device_to_dst_device_put(other_node):
++                return
+             # move node's producers right before it
+             node.prepend(other_node)
+ 
+diff --git a/torch/_inductor/lowering.py b/torch/_inductor/lowering.py
+index 4d8ae1ff494b6..15c548607c30a 100644
+--- a/torch/_inductor/lowering.py
++++ b/torch/_inductor/lowering.py
+@@ -2593,6 +2593,7 @@ def warn_triton_random():
+ # TODO: mlazos reevaluate if we want to codegen something different
+ make_fallback(torch.ops.streams.record_event.default)
+ make_fallback(torch.ops.streams.wait_event.default)
++make_fallback(torch.ops.streams.synchronize_event.default)
+ 
+ 
+ @register_lowering(aten.rand)

@@ -1,0 +1,21 @@
+{
+  "unit": "retained public report",
+  "reports": 264,
+  "primary_observed_consequence": {
+    "incorrect result or state": 168,
+    "runtime rejection or crash": 41,
+    "memory-access violation": 23,
+    "data race": 5,
+    "hang or deadlock": 12,
+    "resource leak or exhaustion": 12,
+    "other observable failure": 3
+  },
+  "nonexclusive_security_relevant_signals": {
+    "memory_access_signal": 23,
+    "concurrency_signal": 14,
+    "availability_signal": 24,
+    "demonstrated_security_impact": 0
+  },
+  "reports_with_any_security_relevant_signal": 60,
+  "interpretation": "A sanitizer, memory-access, race, or availability signal is an observed technical effect. Demonstrated security impact additionally requires a protected asset, attacker capability, deployment assumptions, and a supporting public artifact."
+}

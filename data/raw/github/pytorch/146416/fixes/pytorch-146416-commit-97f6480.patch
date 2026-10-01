@@ -1,0 +1,362 @@
+From 97f6480cf55e72965269437df708fc4a1ca1e387 Mon Sep 17 00:00:00 2001
+From: Yifu Wang <yifu@fb.com>
+Date: Fri, 7 Feb 2025 20:24:28 -0800
+Subject: [PATCH] Fix an issue where functional collectives don't force fx
+ stride on inputs when compiled (#146467)
+
+Fixes https://github.com/pytorch/pytorch/issues/146416
+
+Also added contiguity checks in the C++ functional collective ops to prevent striding issues introduced during compilation manifest as silent correctness issues.
+
+Pull Request resolved: https://github.com/pytorch/pytorch/pull/146467
+Approved by: https://github.com/Chillee, https://github.com/lw, https://github.com/shunting314
+---
+ .../test_c10d_functional_native.py            | 71 +++++++++++++++++--
+ test/distributed/test_inductor_collectives.py | 13 ++--
+ torch/_inductor/comm_lowering.py              | 40 +++++++----
+ torch/csrc/distributed/c10d/Functional.cpp    |  8 +++
+ 4 files changed, 105 insertions(+), 27 deletions(-)
+
+diff --git a/test/distributed/test_c10d_functional_native.py b/test/distributed/test_c10d_functional_native.py
+index 380937ab3b561..442c6bdd5309f 100644
+--- a/test/distributed/test_c10d_functional_native.py
++++ b/test/distributed/test_c10d_functional_native.py
+@@ -20,6 +20,7 @@
+     reduce_scatter_tensor,
+     reduce_scatter_tensor_coalesced,
+ )
++from torch.testing._internal.common_cuda import SM90OrLater
+ from torch.testing._internal.common_distributed import (
+     MultiProcessTestCase,
+     requires_nccl,
+@@ -27,6 +28,7 @@
+ )
+ from torch.testing._internal.common_utils import (  # type: ignore[attr-defined]
+     run_tests,
++    skipIfRocm,
+     TestCase,
+ )
+ from torch.testing._internal.distributed.fake_pg import FakeStore
+@@ -480,6 +482,62 @@ def join(self):
+         t.start()
+         t.join()
+ 
++    @skipIfRocm
++    @unittest.skipIf(
++        not SM90OrLater,
++        "_scaled_mm currently only supports sm>=90",
++    )
++    @skip_if_lt_x_gpu(2)
++    @fresh_inductor_cache()
++    def test_fixed_striding(self):
++        self._init_process_group()
++
++        def scale(t):
++            scale = (
++                torch.finfo(torch.float8_e4m3fn).max
++                / t.abs().amax(dim=-1, keepdim=True).float()
++            )
++            t = t.mul(scale).to(torch.float8_e4m3fn)
++            return t, scale
++
++        def fp8_rowwise_backward(in_, w, out_grad):
++            out_grad_fp8, scale_out_grad = scale(out_grad)
++            w_fp8, scale_w = scale(w.t().contiguous())
++            out_grad_fp8 = funcol.all_gather_tensor(
++                out_grad_fp8, gather_dim=0, group=torch.distributed.group.WORLD
++            )
++            scale_out_grad = funcol.all_gather_tensor(
++                scale_out_grad, gather_dim=0, group=torch.distributed.group.WORLD
++            )
++            in_grad = torch._scaled_mm(
++                out_grad_fp8,
++                w_fp8.t(),
++                scale_a=scale_out_grad,
++                scale_b=scale_w.t(),
++                out_dtype=torch.bfloat16,
++            )
++
++            out_grad = funcol.all_gather_tensor(
++                out_grad.t().contiguous(),
++                gather_dim=0,
++                group=torch.distributed.group.WORLD,
++            )
++            w_grad = out_grad @ in_
++
++            return in_grad, w_grad
++
++        m, n, k = 128, 256, 64
++        in_ = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
++        w = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
++        out_grad = torch.randn((m, n), device="cuda", dtype=torch.bfloat16)
++
++        eager_in_grad, eager_w_grad = fp8_rowwise_backward(in_, w, out_grad)
++        compile_in_grad, compile_w_grad = torch.compile(fp8_rowwise_backward)(
++            in_, w, out_grad
++        )
++
++        self.assertTrue(torch.allclose(compile_w_grad, eager_w_grad))
++
+ 
+ def dummy_init_pg() -> None:
+     if not dist.is_initialized():
+@@ -1035,15 +1093,16 @@ def func(arg: torch.Tensor) -> torch.Tensor:
+         (
+             FileCheck()
+             .check("buf0 = empty")
+-            .check("buf7 = empty")
++            .check("buf1 = buf0")
++            .check("buf8 = empty")
+             # Expect in-place with inductor allocated buf
+-            .check("torch.ops._c10d_functional.broadcast_.default(buf0")
+-            .check("torch.ops._c10d_functional.wait_tensor.default(buf0")
++            .check("torch.ops._c10d_functional.broadcast_.default(buf1")
++            .check("torch.ops._c10d_functional.wait_tensor.default(buf1")
+             # Expect no in-place with graph input (buf5 is a clone)
+-            .check("torch.ops._c10d_functional.broadcast_.default(buf7")
+-            .check("torch.ops._c10d_functional.wait_tensor.default(buf7")
++            .check("torch.ops._c10d_functional.broadcast_.default(buf8")
++            .check("torch.ops._c10d_functional.wait_tensor.default(buf8")
+             # Expect no extra copy on return
+-            .check("return (buf0, buf7, )")
++            .check("return (buf1, buf8, )")
+             .run(code)
+         )
+ 
+diff --git a/test/distributed/test_inductor_collectives.py b/test/distributed/test_inductor_collectives.py
+index 31d65b1c59283..61b940429dad9 100644
+--- a/test/distributed/test_inductor_collectives.py
++++ b/test/distributed/test_inductor_collectives.py
+@@ -695,13 +695,14 @@ def func(inp, *, tag, ranks, group_size):
+         (
+             FileCheck()
+             .check("buf0 = empty_strided")
+-            .check("buf5 = empty_strided")
+-            .check(".run(arg0_1, buf0, buf5, 16")
+-            .check("torch.ops._c10d_functional.all_reduce_.default(buf0")
+-            .check("torch.ops._c10d_functional.wait_tensor.default(buf0")
++            .check("buf1 = buf0")
+             .check("buf6 = empty_strided")
+-            .check(".run(buf6, 16")
+-            .check("return (buf0, buf5, buf6")
++            .check(".run(buf1, arg0_1, buf6, 16")
++            .check("torch.ops._c10d_functional.all_reduce_.default(buf1")
++            .check("torch.ops._c10d_functional.wait_tensor.default(buf1")
++            .check("buf7 = empty_strided")
++            .check(".run(buf7, 16")
++            .check("return (buf1, buf6, buf7")
+             .run(code)
+         )
+         out = compiled(inputs, **self.get_world_trs())
+diff --git a/torch/_inductor/comm_lowering.py b/torch/_inductor/comm_lowering.py
+index 1c06dbbb21558..408c211b8af60 100644
+--- a/torch/_inductor/comm_lowering.py
++++ b/torch/_inductor/comm_lowering.py
+@@ -178,11 +178,21 @@ def register_comm_lowerings():
+         )
+         return
+ 
+-    from .lowering import clone, copy_, register_lowering
++    from .lowering import (
++        add_layout_constraint,
++        clone,
++        constrain_to_fx_strides,
++        copy_,
++        register_lowering,
++    )
++
++    def register_comm_lowering(fn):
++        add_layout_constraint(fn, constrain_to_fx_strides)
++        return register_lowering(fn)
+ 
+     c10d = torch.ops._c10d_functional
+ 
+-    @register_lowering(c10d.all_reduce)  # type: ignore[misc]
++    @register_comm_lowering(c10d.all_reduce)  # type: ignore[misc]
+     def _all_reduce(inp: ir.TensorBox, reduce_op: str, group_name: str) -> ir.TensorBox:
+         if _should_lower_as_one_shot_all_reduce(inp, reduce_op, group_name):
+             return _one_shot_all_reduce(inp, reduce_op, group_name)
+@@ -203,7 +213,7 @@ def _all_reduce(inp: ir.TensorBox, reduce_op: str, group_name: str) -> ir.Tensor
+         )
+         return inp
+ 
+-    @register_lowering(c10d.all_reduce_)  # type: ignore[misc]
++    @register_comm_lowering(c10d.all_reduce_)  # type: ignore[misc]
+     def _all_reduce_(
+         inp: ir.TensorBox, reduce_op: str, group_name: str
+     ) -> ir.TensorBox:
+@@ -222,7 +232,7 @@ def _all_reduce_(
+         )
+         return inp
+ 
+-    @register_lowering(c10d.all_reduce_coalesced)
++    @register_comm_lowering(c10d.all_reduce_coalesced)
+     def _all_reduce_coalesced(inputs, reduce_op, group_name):
+         inputs = [clone(inp) for inp in inputs]
+         ir._CollectiveKernel.create_inplace(
+@@ -233,7 +243,7 @@ def _all_reduce_coalesced(inputs, reduce_op, group_name):
+         )
+         return inputs
+ 
+-    @register_lowering(c10d.all_reduce_coalesced_)
++    @register_comm_lowering(c10d.all_reduce_coalesced_)
+     def _all_reduce_coalesced_(inputs, reduce_op, group_name):
+         ir._CollectiveKernel.create_inplace(
+             c10d.all_reduce_coalesced_.default,
+@@ -243,7 +253,7 @@ def _all_reduce_coalesced_(inputs, reduce_op, group_name):
+         )
+         return inputs
+ 
+-    @register_lowering(c10d.all_gather_into_tensor)
++    @register_comm_lowering(c10d.all_gather_into_tensor)
+     def _all_gather_into_tensor(inp, group_size, group_name):
+         return ir.TensorBox.create(
+             ir._CollectiveKernel.create_out_of_place(
+@@ -254,7 +264,7 @@ def _all_gather_into_tensor(inp, group_size, group_name):
+             )
+         )
+ 
+-    @register_lowering(c10d.all_gather_into_tensor_coalesced)
++    @register_comm_lowering(c10d.all_gather_into_tensor_coalesced)
+     def _all_gather_into_tensor_coalesced(inputs, group_size, group_name):
+         return pytree.tree_map(
+             ir.TensorBox.create,
+@@ -266,7 +276,7 @@ def _all_gather_into_tensor_coalesced(inputs, group_size, group_name):
+             ),
+         )
+ 
+-    @register_lowering(c10d.all_gather_into_tensor_out)
++    @register_comm_lowering(c10d.all_gather_into_tensor_out)
+     def _all_gather_into_tensor_out(inp, group_size, group_name, *, out):
+         ir._CollectiveKernel.create_inplace(
+             c10d.all_gather_into_tensor_out.default,
+@@ -277,7 +287,7 @@ def _all_gather_into_tensor_out(inp, group_size, group_name, *, out):
+         )
+         return out
+ 
+-    @register_lowering(c10d.reduce_scatter_tensor)
++    @register_comm_lowering(c10d.reduce_scatter_tensor)
+     def _reduce_scatter_tensor(inp, reduce_op, group_size, group_name):
+         return ir.TensorBox.create(
+             ir._CollectiveKernel.create_out_of_place(
+@@ -289,7 +299,7 @@ def _reduce_scatter_tensor(inp, reduce_op, group_size, group_name):
+             )
+         )
+ 
+-    @register_lowering(c10d.reduce_scatter_tensor_coalesced)
++    @register_comm_lowering(c10d.reduce_scatter_tensor_coalesced)
+     def _reduce_scatter_tensor_coalesced(inputs, reduce_op, group_size, group_name):
+         return pytree.tree_map(
+             ir.TensorBox.create,
+@@ -302,7 +312,7 @@ def _reduce_scatter_tensor_coalesced(inputs, reduce_op, group_size, group_name):
+             ),
+         )
+ 
+-    @register_lowering(c10d.all_to_all_single)
++    @register_comm_lowering(c10d.all_to_all_single)
+     def _all_to_all_single(inp, output_split_sizes, input_split_sizes, group_name):
+         return ir.TensorBox.create(
+             ir._CollectiveKernel.create_out_of_place(
+@@ -314,7 +324,7 @@ def _all_to_all_single(inp, output_split_sizes, input_split_sizes, group_name):
+             )
+         )
+ 
+-    @register_lowering(c10d.broadcast)
++    @register_comm_lowering(c10d.broadcast)
+     def _broadcast(inp, src, group_name):
+         inp = clone(inp)
+         ir._CollectiveKernel.create_inplace(
+@@ -322,14 +332,14 @@ def _broadcast(inp, src, group_name):
+         )
+         return inp
+ 
+-    @register_lowering(c10d.broadcast_)
++    @register_comm_lowering(c10d.broadcast_)
+     def _broadcast_(inp, src, group_name):
+         ir._CollectiveKernel.create_inplace(
+             c10d.broadcast_.default, inp, src, group_name
+         )
+         return inp
+ 
+-    @register_lowering(torch.ops._dtensor.shard_dim_alltoall)
++    @register_comm_lowering(torch.ops._dtensor.shard_dim_alltoall)
+     def _shard_dim_alltoall(inp, gather_dim, shard_dim, group_name):
+         return ir.TensorBox.create(
+             ir._CollectiveKernel.create_out_of_place(
+@@ -341,7 +351,7 @@ def _shard_dim_alltoall(inp, gather_dim, shard_dim, group_name):
+             )
+         )
+ 
+-    @register_lowering(c10d.wait_tensor)
++    @register_comm_lowering(c10d.wait_tensor)
+     def _wait_tensor(inp):
+         if should_skip_wait(inp):
+             return inp
+diff --git a/torch/csrc/distributed/c10d/Functional.cpp b/torch/csrc/distributed/c10d/Functional.cpp
+index 30088a29c82f0..7a82a51abd77f 100644
+--- a/torch/csrc/distributed/c10d/Functional.cpp
++++ b/torch/csrc/distributed/c10d/Functional.cpp
+@@ -88,6 +88,7 @@ std::vector<at::Tensor> all_reduce_coalesced(
+ at::Tensor allocate_all_gather_output(
+     const at::Tensor& input,
+     int64_t group_size) {
++  TORCH_CHECK(input.is_contiguous());
+   auto output_size = input.sizes().vec();
+   output_size[0] *= group_size;
+   return at::empty(
+@@ -103,6 +104,7 @@ std::vector<at::Tensor> all_gather_into_tensor_coalesced(
+   std::vector<at::Tensor> outputs;
+   outputs.reserve(inputs.size());
+   for (const auto& tensor : inputs) {
++    TORCH_CHECK(tensor.is_contiguous());
+     outputs.push_back(allocate_all_gather_output(tensor, group_size));
+   }
+ 
+@@ -118,6 +120,7 @@ at::Tensor all_gather_into_tensor(
+     const at::Tensor& input,
+     int64_t group_size,
+     std::string group_name) {
++  TORCH_CHECK(input.is_contiguous());
+   std::vector<at::Tensor> inputs{input};
+   return all_gather_into_tensor_coalesced(
+       inputs, group_size, std::move(group_name))[0];
+@@ -128,6 +131,7 @@ at::Tensor& all_gather_into_tensor_out(
+     int64_t group_size,
+     const std::string& group_name,
+     at::Tensor& output) {
++  TORCH_CHECK(input.is_contiguous());
+   c10d::AllgatherOptions opts;
+ 
+   auto group = c10d::resolve_process_group(group_name);
+@@ -139,6 +143,7 @@ at::Tensor& all_gather_into_tensor_out(
+ at::Tensor allocate_reduce_scatter_output(
+     const at::Tensor& input,
+     const int64_t group_size) {
++  TORCH_CHECK(input.is_contiguous());
+   auto output_size = input.sizes().vec();
+   if (output_size[0] % group_size != 0) {
+     LOG(WARNING) << "The first dimension of the reduce_scatter input ("
+@@ -163,6 +168,7 @@ std::vector<at::Tensor> reduce_scatter_tensor_coalesced(
+   std::vector<at::Tensor> outputs;
+   outputs.reserve(inputs.size());
+   for (const auto& tensor : inputs) {
++    TORCH_CHECK(tensor.is_contiguous());
+     outputs.push_back(allocate_reduce_scatter_output(tensor, group_size));
+   }
+ 
+@@ -179,6 +185,7 @@ at::Tensor reduce_scatter_tensor(
+     std::string reduce_op,
+     int64_t group_size,
+     std::string group_name) {
++  TORCH_CHECK(input.is_contiguous());
+   std::vector<at::Tensor> inputs{input};
+   return reduce_scatter_tensor_coalesced(
+       inputs, std::move(reduce_op), group_size, std::move(group_name))[0];
+@@ -190,6 +197,7 @@ at::Tensor all_to_all_single(
+     std::vector<int64_t> input_split_sizes,
+     // NOLINTNEXTLINE(performance-unnecessary-value-param)
+     std::string group_name) {
++  TORCH_CHECK(input.is_contiguous());
+   std::vector<int64_t> output_sizes = input.sizes().vec();
+   output_sizes[0] = std::accumulate(
+       output_split_sizes.begin(), output_split_sizes.end(), int64_t(0));

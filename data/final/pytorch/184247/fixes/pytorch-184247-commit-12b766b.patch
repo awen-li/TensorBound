@@ -1,0 +1,102 @@
+From 12b766bf533ff188b4d861184c54b7278ceaca9a Mon Sep 17 00:00:00 2001
+From: Joshua James Venter <venter.joshua@gmail.com>
+Date: Tue, 23 Jun 2026 13:50:40 +0000
+Subject: [PATCH] [Inductor] Enforce `write == read` indices of epilogue for
+ user triton kernel fusion (#184248)
+
+During codegen for a fused custom op, we rewrite the `tl.store` to use a new `value` operand that references the variable from the last computation in the epilogue. See: https://github.com/pytorch/pytorch/blob/9a8a62cf0b558e80e46565025a31ebdb5f8ec243/torch/_inductor/codegen/triton.py#L6573-L6582
+
+This assumes the write index of the epilogue equals that of the read. This PR enforces this condition.
+
+Fixes: #184247
+
+Pull Request resolved: https://github.com/pytorch/pytorch/pull/184248
+Approved by: https://github.com/jansel
+---
+ test/inductor/test_triton_kernels.py | 23 +++++++++++++++++++++++
+ torch/_inductor/codegen/triton.py    |  5 ++++-
+ torch/_inductor/scheduler.py         | 20 +++++++++++++++++---
+ 3 files changed, 44 insertions(+), 4 deletions(-)
+
+diff --git a/test/inductor/test_triton_kernels.py b/test/inductor/test_triton_kernels.py
+index 3bc983d510cbf..11d9c30cfff86 100644
+--- a/test/inductor/test_triton_kernels.py
++++ b/test/inductor/test_triton_kernels.py
+@@ -5997,6 +5997,29 @@ def fn(a, b):
+         self.assertEqual(out, fn(a, b))
+         self.check_code(code[0], num_kernels=1, num_allocs=1, num_deallocs=2)
+ 
++    @requires_cuda_and_triton
++    def test_no_fusion_for_out_of_place_epilogue(self):
++        @triton.jit
++        def add_kernel(in_ptr0, in_ptr1, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
++            pid = tl.program_id(0)
++            offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
++            mask = offs < n_elements
++            x = tl.load(in_ptr0 + offs, mask=mask)
++            y = tl.load(in_ptr1 + offs, mask=mask)
++            tl.store(out_ptr + offs, x + y, mask=mask)
++
++        def fn(a, b):
++            out = torch.empty_like(a)
++            grid = (triton.cdiv(a.numel(), 1024),)
++            add_kernel[grid](a, b, out, a.numel(), BLOCK_SIZE=1024)
++            return out.T.contiguous().relu()
++
++        a = torch.randn(32, 32, device="cuda")
++        b = torch.randn(32, 32, device="cuda")
++        out, code = run_and_get_code(torch.compile(fn), a, b)
++        self.assertEqual(out, fn(a, b))
++        self.check_code(code[0], num_kernels=2, num_allocs=2, num_deallocs=3)
++
+ 
+ if HAS_CUDA_AND_TRITON:
+ 
+diff --git a/torch/_inductor/codegen/triton.py b/torch/_inductor/codegen/triton.py
+index 98374bd0a74b1..789f270b22269 100644
+--- a/torch/_inductor/codegen/triton.py
++++ b/torch/_inductor/codegen/triton.py
+@@ -7228,7 +7228,10 @@ def store(
+                 shape=value.shape,
+             )
+         else:
+-            super().store(name, index, value, mode)
++            raise AssertionError(
++                f"Epilogue attempted to store to '{name}'. "
++                "Inductor indexing variables are not defined in user kernel scope. "
++            )
+ 
+     # returns a str which is the src code of a modified version of the user kernel that includes the epilogues
+     def codegen(self) -> str:
+diff --git a/torch/_inductor/scheduler.py b/torch/_inductor/scheduler.py
+index cae8f3a6af6a7..badfdf1380658 100644
+--- a/torch/_inductor/scheduler.py
++++ b/torch/_inductor/scheduler.py
+@@ -7683,10 +7683,24 @@ def _can_fuse(
+                 )
+             written_buffer_name = node1.node.mutation_outputs[0].name
+ 
+-            # The epilogue can only read from the output buffer.
++            # The epilogue must be an in-place, unary pointwise operation.
+             # Any other tensor/s would require additional load expressions.
+-            if any(dep.name != written_buffer_name for dep in node2.read_writes.reads):
+-                why("epilogue reads from buffers other than the mutated output")
++            epilogue_reads = list(node2.read_writes.reads)
++            epilogue_writes = list(node2.read_writes.writes)
++            if (
++                len(epilogue_reads) != 1
++                or len(epilogue_writes) != 1
++                or epilogue_reads[0].name != written_buffer_name
++            ):
++                why("epilogue is not a unary read of the output buffer")
++                return False
++
++            write_dep = epilogue_writes[0]
++            read_dep = epilogue_reads[0]
++            assert isinstance(read_dep, MemoryDep)  # noqa: S101
++            assert isinstance(write_dep, MemoryDep)  # noqa: S101
++            if read_dep.index != write_dep.index or read_dep.size != write_dep.size:
++                why("epilogue's read and write indices differ")
+                 return False
+ 
+             # the epilogue depends on expressions which may not available in the user triton kernel

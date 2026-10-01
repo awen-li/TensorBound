@@ -1,0 +1,160 @@
+From 1687bbf6293f6886af4b0916dfaaa98d74272840 Mon Sep 17 00:00:00 2001
+From: Abhishek <abhi.dtu11@gmail.com>
+Date: Wed, 11 Feb 2026 18:26:49 +0000
+Subject: [PATCH] =?UTF-8?q?[Inductor]=20Prevent=20fusing=20atomic=20scatte?=
+ =?UTF-8?q?r=20ops=20with=20dependent=20reads=E2=80=A6=20(#172301)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+…Scatter operations (index_add_, scatter_add_) with scatter_mode=atomic_addrequire all threads to complete writes before any reads. Fusing them withsubsequent reads caused read-after-write hazards. Added check in fusable_read_and_write() to prevent this unsafe fusion. For arbitrary large inputs barriers cant be useful and hence atomic adds should not be fused.
+
+Fixes #171493
+
+Pull Request resolved: https://github.com/pytorch/pytorch/pull/172301
+Approved by: https://github.com/jansel, https://github.com/tianrengao
+---
+ test/inductor/test_inductor_scheduler.py | 71 ++++++++++++++++++++++++
+ torch/_inductor/ops_handler.py           | 12 +++-
+ torch/_inductor/scheduler.py             |  9 +++
+ 3 files changed, 91 insertions(+), 1 deletion(-)
+
+diff --git a/test/inductor/test_inductor_scheduler.py b/test/inductor/test_inductor_scheduler.py
+index d22f4ad5f193a..73bca22a48541 100644
+--- a/test/inductor/test_inductor_scheduler.py
++++ b/test/inductor/test_inductor_scheduler.py
+@@ -14,6 +14,7 @@
+ from torch.testing._internal.common_device_type import (
+     dtypes,
+     instantiate_device_type_tests,
++    onlyCUDA,
+     skipCUDAIf,
+ )
+ from torch.testing._internal.common_utils import (
+@@ -218,6 +219,76 @@ def _create_mock_node(self, name: str, reads: list[str], writes: list[str]) -> M
+         node.read_writes = read_writes
+         return node
+ 
++    @onlyCUDA
++    def test_index_add_fusion_prevented(self):
++        """
++        Test that index_add_ (scatter with atomic_add mode) is not fused with
++        subsequent reads from the same buffer, preventing read-after-write hazards.
++
++        Regression test for: index_add_ followed by indexing was incorrectly fused,
++        causing reads to occur before atomic writes completed.
++        """
++
++        def fn(f, batch):
++            # Scatter: atomic writes to shared location
++            f_u = f**2 + 0.00987654321
++            n_batch = batch.max() + 1
++            F_u_mol = torch.zeros((n_batch, f.shape[1]), device=f.device, dtype=f.dtype)
++            F_u_mol.index_add_(0, batch, f_u)
++
++            # Gather: reads from same buffer (requires synchronization)
++            F_u_at_atom = F_u_mol[batch] + 1e-6
++            return f_u / F_u_at_atom
++
++        device = "cuda"
++        f = torch.ones(1024, 1, device=device)
++        batch = torch.zeros(1024, dtype=torch.long, device=device)
++
++        # Eager execution (ground truth)
++        eager_result = fn(f, batch)
++
++        # Compiled execution (should match eager)
++        compiled_fn = torch.compile(fn)
++        compiled_result = compiled_fn(f, batch)
++
++        # Verify results match (no fusion bug)
++        self.assertTrue(
++            torch.allclose(eager_result, compiled_result, rtol=1e-4, atol=1e-4),
++            msg=f"index_add_ fusion bug detected: "
++            f"eager={eager_result.mean().item():.6f}, "
++            f"compiled={compiled_result.mean().item():.6f}",
++        )
++
++    @onlyCUDA
++    def test_atomic_add_no_fusion_correctness(self):
++        """
++        Test that atomic_add operations produce correct results.
++        """
++
++        def fn(x, idx):
++            out = torch.zeros(10, device=x.device)
++            out.index_add_(0, idx, x)  # atomic_add: scatter to shared locations
++            return out[idx] + 1.0  # read from same buffer: requires sync
++
++        device = "cuda"
++        x = torch.ones(5, device=device)
++        idx = torch.tensor([0, 1, 0, 1, 0], device=device, dtype=torch.long)
++
++        # Eager (correct) result
++        expected = fn(x, idx)
++
++        # Compiled result: will be wrong if fusion bug exists
++        compiled_fn = torch.compile(fn)
++        torch._dynamo.reset()
++        with fresh_inductor_cache():
++            result = compiled_fn(x, idx)
++
++        # This test will FAIL without the fusion prevention fix
++        self.assertTrue(
++            torch.allclose(expected, result),
++            msg=f"Fusion bug detected! Expected {expected}, got {result}",
++        )
++
+ 
+ instantiate_device_type_tests(TestScheduler, globals(), allow_xpu=True)
+ 
+diff --git a/torch/_inductor/ops_handler.py b/torch/_inductor/ops_handler.py
+index 2dcca53562d63..290ac983e0b4a 100644
+--- a/torch/_inductor/ops_handler.py
++++ b/torch/_inductor/ops_handler.py
+@@ -32,7 +32,17 @@
+ 
+ 
+ T = TypeVar("T")
+-StoreMode = Optional[Literal["atomic_add", "tma"]]
++AtomicMode = Literal[
++    "atomic_add",
++    "atomic_max",
++    "atomic_min",
++    "atomic_and",
++    "atomic_or",
++    "atomic_xor",
++    "atomic_cas",
++    "atomic_xchg",
++]
++StoreMode = Optional[Union[AtomicMode, Literal["tma"]]]
+ ReductionType = Literal[
+     "argmax",
+     "argmin",
+diff --git a/torch/_inductor/scheduler.py b/torch/_inductor/scheduler.py
+index f9f8afe12de26..1e00873f47909 100644
+--- a/torch/_inductor/scheduler.py
++++ b/torch/_inductor/scheduler.py
+@@ -3560,6 +3560,10 @@ def can_eliminate_user(user: NodeUser) -> bool:
+         for node in self.nodes:
+             node.prune_weak_deps()
+ 
++    def mode_requires_synchronization(self, mode: Optional[str]) -> bool:
++        """Check if store mode requires cross-thread synchronization."""
++        return mode is not None  # Currently all non-None modes need sync
++
+     def topological_sort_schedule(
+         self, nodes: list[BaseSchedulerNode]
+     ) -> list[BaseSchedulerNode]:
+@@ -5635,6 +5639,11 @@ def fusable_read_and_write(self, read: Dep, write: MemoryDep) -> bool:
+                 # nodes.
+                 read = read.normalize()
+                 write = write.normalize()
++            # Operations like index_add_, scatter_add_, etc. require global
++            # synchronization - all threads must complete writes before any reads.
++            # These cannot be safely fused into the same kernel. Atomic modes and TMA stores require synchronization barriers
++            if self.mode_requires_synchronization(write.mode):
++                return False
+ 
+             return (
+                 read.index == write.index

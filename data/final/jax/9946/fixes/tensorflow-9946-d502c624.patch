@@ -1,0 +1,45 @@
+From d502c62416293ff8a09b9f5bce4f5527fa9568eb Mon Sep 17 00:00:00 2001
+From: Peter Hawkins <phawkins@google.com>
+Date: Mon, 4 Apr 2022 14:34:00 -0700
+Subject: [PATCH] [GPU] Force an input buffer copy for double precision
+ complex-to-real IRFFTs.
+
+Fixes https://github.com/google/jax/issues/9946
+
+PiperOrigin-RevId: 439414091
+---
+ tensorflow/compiler/xla/python/xla_client.py | 2 +-
+ tensorflow/stream_executor/cuda/cuda_fft.cc  | 7 +++++--
+ 2 files changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/tensorflow/compiler/xla/python/xla_client.py b/tensorflow/compiler/xla/python/xla_client.py
+index 7b8c23209c3f4d..9322c8dcba134f 100644
+--- a/tensorflow/compiler/xla/python/xla_client.py
++++ b/tensorflow/compiler/xla/python/xla_client.py
+@@ -43,7 +43,7 @@
+ 
+ # Just an internal arbitrary increasing number to help with backward-compatible
+ # changes.
+-_version = 62
++_version = 63
+ 
+ # Version number for MLIR:Python components.
+ mlir_api_version = 5
+diff --git a/tensorflow/stream_executor/cuda/cuda_fft.cc b/tensorflow/stream_executor/cuda/cuda_fft.cc
+index d1dd16cceb0030..8cfa43f0df9c79 100644
+--- a/tensorflow/stream_executor/cuda/cuda_fft.cc
++++ b/tensorflow/stream_executor/cuda/cuda_fft.cc
+@@ -476,8 +476,11 @@ bool CUDAFft::DoFftInternal(Stream *stream, fft::Plan *plan, FuncT cufftExec,
+   // See b/155276727 and go/nvbugs/2959622.
+   // TODO(b/155276727): refine the bounding condition.
+   if (input.opaque() != output->opaque() &&
+-      std::is_same<InputT, std::complex<float>>::value &&
+-      std::is_same<OutputT, float>::value && input.size() > 0) {
++      (std::is_same<InputT, std::complex<float>>::value ||
++       std::is_same<InputT, std::complex<double>>::value) &&
++      (std::is_same<OutputT, float>::value ||
++       std::is_same<OutputT, double>::value) &&
++      input.size() > 0) {
+     auto *allocator = cuda_fft_plan->GetScratchAllocator();
+     if (allocator) {
+       auto allocated = allocator->AllocateBytes(input.size());

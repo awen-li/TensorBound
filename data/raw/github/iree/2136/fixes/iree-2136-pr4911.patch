@@ -1,0 +1,225 @@
+From 6f02947797f4a924673adb4d55c1b88cc28fad5b Mon Sep 17 00:00:00 2001
+From: Hanhan Wang <hanchung@google.com>
+Date: Mon, 22 Feb 2021 04:04:07 -0800
+Subject: [PATCH 1/3] Fix initialization issue in pooling ops.
+
+They were initialized to zero buffers. Fixes them to be the initial
+value.
+
+Fixes https://github.com/google/iree/issues/2136
+---
+ .../HLOToLinalg/HLOToLinalgOnBuffers.cpp      | 21 +++++++++++++++++--
+ iree/test/e2e/xla_ops/reduce_window.mlir      | 12 +++++------
+ 2 files changed, 25 insertions(+), 8 deletions(-)
+
+diff --git a/iree/compiler/Conversion/HLOToLinalg/HLOToLinalgOnBuffers.cpp b/iree/compiler/Conversion/HLOToLinalg/HLOToLinalgOnBuffers.cpp
+index 8818b389e616..6b8d2e4720fb 100644
+--- a/iree/compiler/Conversion/HLOToLinalg/HLOToLinalgOnBuffers.cpp
++++ b/iree/compiler/Conversion/HLOToLinalg/HLOToLinalgOnBuffers.cpp
+@@ -659,6 +659,16 @@ struct SubTensorOpConversion
+ 
+ namespace {
+ 
++/// Returns the constant value associated with the init value if the defining
++/// operation is a constant.
++static Attribute GetInitValueAsConst(Value init) {
++  DenseElementsAttr attr;
++  if (!matchPattern(init, m_Constant(&attr))) return {};
++  auto type = attr.getType().dyn_cast<ShapedType>();
++  if (!type || type.getRank() != 0) return {};
++  return attr.getValue({});
++}
++
+ /// mhlo.reduce_window is mapped to a linalg.pooling operation. The type of
+ /// the pooling is determined based on the body of the reduce window
+ /// operation. This class enumerates the different variants.
+@@ -730,9 +740,16 @@ LogicalResult ReduceWindowOpConversion::apply(
+   linalg::LinalgOp poolingOp;
+   PoolingType poolingType = getPoolingType(op.body());
+ 
+-  if (failed(zeroFillBuffer(loc, resultBuffers[0], rewriter))) {
+-    return rewriter.notifyMatchFailure(op, "failed to zero fill result buffer");
++  Value initValue = inputBuffers[1];
++  Attribute initConstVal = GetInitValueAsConst(initValue);
++  if (initConstVal) {
++    initValue = rewriter.create<ConstantOp>(initValue.getDefiningOp()->getLoc(),
++                                            initConstVal);
++  } else {
++    initValue = rewriter.create<LoadOp>(loc, initValue);
+   }
++  rewriter.create<linalg::FillOp>(loc, resultBuffers[0], initValue);
++
+   switch (poolingType) {
+     case PoolingType::kMin: {
+       poolingOp = createOp(static_cast<linalg::PoolingMinOp *>(nullptr));
+diff --git a/iree/test/e2e/xla_ops/reduce_window.mlir b/iree/test/e2e/xla_ops/reduce_window.mlir
+index 99ae9c9a7f2d..52eda956e465 100644
+--- a/iree/test/e2e/xla_ops/reduce_window.mlir
++++ b/iree/test/e2e/xla_ops/reduce_window.mlir
+@@ -50,17 +50,17 @@ func @reduce_window_max_4x6xf32() attributes { iree.module.export } {
+ }
+ 
+ func @reduce_window_min_4x6xf32() attributes { iree.module.export } {
+-  %0 = iree.unfoldable_constant dense<[[ -1.0,  -2.0,  -3.0,  -4.0,  -5.0,  -6.0],
+-                                       [ -7.0,  -8.0,  -9.0, -10.0, -11.0, -12.0],
+-                                       [-13.0, -14.0, -15.0, -16.0, -17.0, -18.0],
+-                                       [-19.0, -20.0, -21.0, -22.0, -23.0, -24.0]]> : tensor<4x6xf32>
+-  %1 = iree.unfoldable_constant dense<0.0> : tensor<f32>
++  %0 = iree.unfoldable_constant dense<[[ 1.0,  2.0,  3.0,  4.0,  5.0,  6.0],
++                                       [ 7.0,  8.0,  9.0, 10.0, 11.0, 12.0],
++                                       [13.0, 14.0, 15.0, 16.0, 17.0, 18.0],
++                                       [19.0, 20.0, 21.0, 22.0, 23.0, 24.0]]> : tensor<4x6xf32>
++  %1 = iree.unfoldable_constant dense<14.0> : tensor<f32>
+   %res = "mhlo.reduce_window"(%0, %1) ( {
+   ^bb0(%arg0: tensor<f32>, %arg1: tensor<f32>):   // no predecessors
+     %3 = "mhlo.minimum"(%arg0, %arg1) : (tensor<f32>, tensor<f32>) -> tensor<f32>
+     "mhlo.return"(%3) : (tensor<f32>) -> ()
+   }) {window_dimensions = dense<[2, 3]> : tensor<2xi64>,
+       window_strides = dense<[2, 3]> : tensor<2xi64>} : (tensor<4x6xf32>, tensor<f32>) -> tensor<2x2xf32>
+-  check.expect_almost_eq_const(%res, dense<[[-9.0, -12.0], [-21.0, -24.0]]> : tensor<2x2xf32>) : tensor<2x2xf32>
++  check.expect_almost_eq_const(%res, dense<[[1.0, 4.0], [13.0, 14.0]]> : tensor<2x2xf32>) : tensor<2x2xf32>
+   return
+ }
+
+From 6a71a03e0f1a5a1ad67599fc3c23d00b4ba8eb76 Mon Sep 17 00:00:00 2001
+From: Hanhan Wang <hanchung@google.com>
+Date: Mon, 22 Feb 2021 07:11:35 -0800
+Subject: [PATCH 2/3] Add more checks and tests.
+
+---
+ .../HLOToLinalg/test/reduce_window.mlir       | 65 +++++++++++++++++--
+ 1 file changed, 59 insertions(+), 6 deletions(-)
+
+diff --git a/iree/compiler/Conversion/HLOToLinalg/test/reduce_window.mlir b/iree/compiler/Conversion/HLOToLinalg/test/reduce_window.mlir
+index ab080e0e5cb7..a00d0b194918 100644
+--- a/iree/compiler/Conversion/HLOToLinalg/test/reduce_window.mlir
++++ b/iree/compiler/Conversion/HLOToLinalg/test/reduce_window.mlir
+@@ -1,11 +1,10 @@
+ // RUN: iree-opt -split-input-file -iree-codegen-hlo-to-linalg-on-buffers %s | IreeFileCheck %s
+ 
+ module {
+-  func @reduce_window_min() {
++  func @reduce_window_min_nhwc() {
+     %c0 = constant 0 : index
+     %0 = hal.interface.load.tensor @legacy_io::@arg0, offset = %c0 : tensor<1x18x18x64xf32>
+     %1 = hal.interface.load.tensor @legacy_io::@arg1, offset = %c0 : tensor<f32>
+-    // CHECK: linalg.pooling_min
+     %2 = "mhlo.reduce_window"(%0, %1) ( {
+     ^bb0(%arg3: tensor<f32>, %arg4 : tensor<f32>):
+       %3 = mhlo.minimum %arg3, %arg4 : tensor<f32>
+@@ -21,15 +20,23 @@ module {
+     hal.interface.binding @ret0, set=0, binding=2, type="StorageBuffer", access="Write"
+   }
+ }
++// CHECK-LABEL: func @reduce_window_min_nhwc
++// CHECK-DAG:     %[[ARG0:.+]] = iree.placeholder for "interface buffer" {binding = @legacy_io::@arg0} : memref<1x18x18x64xf32>
++// CHECK-DAG:     %[[ARG1:.+]] = iree.placeholder for "interface buffer" {binding = @legacy_io::@arg1} : memref<f32>
++// CHECK-DAG:     %[[RES:.+]] = iree.placeholder for "interface buffer" {binding = @legacy_io::@ret0} : memref<1x8x8x64xf32>
++// CHECK:         %[[WINDOW:.+]] = alloc() : memref<1x3x3x1xi32>
++// CHECK:         %[[INIT:.+]] = load %[[ARG1]][] : memref<f32>
++// CHECK:         linalg.fill(%[[RES]], %[[INIT]]) : memref<1x8x8x64xf32>, f32
++// CHECK:         linalg.pooling_min(%[[ARG0]], %[[WINDOW]], %[[RES]])
++// CHECK-SAME:      strides = [1, 2, 2, 1]
+ 
+ // -----
+ 
+ module {
+-  func @reduce_window_max() {
++  func @reduce_window_max_nhwc() {
+     %c0 = constant 0 : index
+     %0 = hal.interface.load.tensor @legacy_io::@arg0, offset = %c0 : tensor<1x18x18x64xf32>
+     %1 = hal.interface.load.tensor @legacy_io::@arg1, offset = %c0 : tensor<f32>
+-    // CHECK: linalg.pooling_max
+     %2 = "mhlo.reduce_window"(%0, %1) ( {
+     ^bb0(%arg3: tensor<f32>, %arg4 : tensor<f32>):
+       %3 = mhlo.maximum %arg3, %arg4 : tensor<f32>
+@@ -45,15 +52,23 @@ module {
+     hal.interface.binding @ret0, set=0, binding=2, type="StorageBuffer", access="Write"
+   }
+ }
++// CHECK-LABEL: func @reduce_window_max_nhwc
++// CHECK-DAG:     %[[ARG0:.+]] = iree.placeholder for "interface buffer" {binding = @legacy_io::@arg0} : memref<1x18x18x64xf32>
++// CHECK-DAG:     %[[ARG1:.+]] = iree.placeholder for "interface buffer" {binding = @legacy_io::@arg1} : memref<f32>
++// CHECK-DAG:     %[[RES:.+]] = iree.placeholder for "interface buffer" {binding = @legacy_io::@ret0} : memref<1x8x8x64xf32>
++// CHECK:         %[[WINDOW:.+]] = alloc() : memref<1x3x3x1xi32>
++// CHECK:         %[[INIT:.+]] = load %[[ARG1]][] : memref<f32>
++// CHECK:         linalg.fill(%[[RES]], %[[INIT]]) : memref<1x8x8x64xf32>, f32
++// CHECK:         linalg.pooling_max(%[[ARG0]], %[[WINDOW]], %[[RES]])
++// CHECK-SAME:      strides = [1, 2, 2, 1]
+ 
+ // -----
+ 
+ module {
+-  func @reduce_window_add() {
++  func @reduce_window_add_nhwc() {
+     %c0 = constant 0 : index
+     %0 = hal.interface.load.tensor @legacy_io::@arg0, offset = %c0 : tensor<1x18x18x64xf32>
+     %1 = hal.interface.load.tensor @legacy_io::@arg1, offset = %c0 : tensor<f32>
+-    // CHECK: linalg.pooling_sum
+     %2 = "mhlo.reduce_window"(%0, %1) ( {
+     ^bb0(%arg3: tensor<f32>, %arg4 : tensor<f32>):
+       %3 = mhlo.add %arg3, %arg4 : tensor<f32>
+@@ -69,3 +84,41 @@ module {
+     hal.interface.binding @ret0, set=0, binding=2, type="StorageBuffer", access="Write"
+   }
+ }
++// CHECK-LABEL: func @reduce_window_add_nhwc
++// CHECK-DAG:     %[[ARG0:.+]] = iree.placeholder for "interface buffer" {binding = @legacy_io::@arg0} : memref<1x18x18x64xf32>
++// CHECK-DAG:     %[[ARG1:.+]] = iree.placeholder for "interface buffer" {binding = @legacy_io::@arg1} : memref<f32>
++// CHECK-DAG:     %[[RES:.+]] = iree.placeholder for "interface buffer" {binding = @legacy_io::@ret0} : memref<1x8x8x64xf32>
++// CHECK:         %[[WINDOW:.+]] = alloc() : memref<1x3x3x1xi32>
++// CHECK:         %[[INIT:.+]] = load %[[ARG1]][] : memref<f32>
++// CHECK:         linalg.fill(%[[RES]], %[[INIT]]) : memref<1x8x8x64xf32>, f32
++// CHECK:         linalg.pooling_sum(%[[ARG0]], %[[WINDOW]], %[[RES]])
++// CHECK-SAME:      strides = [1, 2, 2, 1]
++
++// -----
++module {
++  func @reduce_window_max_nhwc_with_cst() {
++    %c0 = constant 0 : index
++    %0 = hal.interface.load.tensor @legacy_io::@arg0, offset = %c0 : tensor<1x18x18x64xf32>
++    %1 = constant dense<0xFF800000> : tensor<f32>
++    %2 = "mhlo.reduce_window"(%0, %1) ( {
++    ^bb0(%arg3: tensor<f32>, %arg4 : tensor<f32>):
++      %3 = mhlo.maximum %arg3, %arg4 : tensor<f32>
++      "mhlo.return"(%3) : (tensor<f32>) -> ()
++    }) {window_dimensions = dense<[1, 3, 3, 1]> : tensor<4xi64>,
++        window_strides = dense<[1, 2, 2, 1]> : tensor<4xi64>} : (tensor<1x18x18x64xf32>, tensor<f32>) -> tensor<1x8x8x64xf32>
++    hal.interface.store.tensor %2, @legacy_io::@ret0, offset = %c0 : tensor<1x8x8x64xf32>
++    return
++  }
++  hal.interface @legacy_io attributes {sym_visibility = "private"} {
++    hal.interface.binding @arg0, set=0, binding=0, type="StorageBuffer", access="Read"
++    hal.interface.binding @ret0, set=0, binding=2, type="StorageBuffer", access="Write"
++  }
++}
++// CHECK-LABEL: func @reduce_window_max_nhwc
++// CHECK-DAG:     %[[INIT:.+]] = constant 0xFF800000 : f32
++// CHECK-DAG:     %[[ARG0:.+]] = iree.placeholder for "interface buffer" {binding = @legacy_io::@arg0} : memref<1x18x18x64xf32>
++// CHECK-DAG:     %[[RES:.+]] = iree.placeholder for "interface buffer" {binding = @legacy_io::@ret0} : memref<1x8x8x64xf32>
++// CHECK:         %[[WINDOW:.+]] = alloc() : memref<1x3x3x1xi32>
++// CHECK:         linalg.fill(%[[RES]], %[[INIT]]) : memref<1x8x8x64xf32>, f32
++// CHECK:         linalg.pooling_max(%[[ARG0]], %[[WINDOW]], %[[RES]])
++// CHECK-SAME:      strides = [1, 2, 2, 1]
+
+From 5525eb118f0e10fd283595f5fd1d93d1128d7b69 Mon Sep 17 00:00:00 2001
+From: Hanhan Wang <hanchung@google.com>
+Date: Mon, 22 Feb 2021 07:14:29 -0800
+Subject: [PATCH 3/3] fix fmt
+
+---
+ iree/compiler/Conversion/HLOToLinalg/test/reduce_window.mlir | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/iree/compiler/Conversion/HLOToLinalg/test/reduce_window.mlir b/iree/compiler/Conversion/HLOToLinalg/test/reduce_window.mlir
+index a00d0b194918..7c0d80be0b4b 100644
+--- a/iree/compiler/Conversion/HLOToLinalg/test/reduce_window.mlir
++++ b/iree/compiler/Conversion/HLOToLinalg/test/reduce_window.mlir
+@@ -95,6 +95,7 @@ module {
+ // CHECK-SAME:      strides = [1, 2, 2, 1]
+ 
+ // -----
++
+ module {
+   func @reduce_window_max_nhwc_with_cst() {
+     %c0 = constant 0 : index

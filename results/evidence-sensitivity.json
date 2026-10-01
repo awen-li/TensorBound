@@ -1,0 +1,447 @@
+{
+  "codebook_family_counts": {
+    "failure_mode": 8,
+    "obligation_family": 15,
+    "relation_family": 8,
+    "repair_strategy": 7,
+    "transition_family": 7
+  },
+  "consequence_sensitivity": [
+    {
+      "consequence": "data race",
+      "observed_addition": 5,
+      "primary": 5,
+      "weighted": 5
+    },
+    {
+      "consequence": "hang or deadlock",
+      "observed_addition": 13,
+      "primary": 12,
+      "weighted": 13
+    },
+    {
+      "consequence": "incorrect result or state",
+      "observed_addition": 176,
+      "primary": 168,
+      "weighted": 178.36418511066398
+    },
+    {
+      "consequence": "memory-access violation",
+      "observed_addition": 24,
+      "primary": 23,
+      "weighted": 26.364185110663982
+    },
+    {
+      "consequence": "other observable failure",
+      "observed_addition": 3,
+      "primary": 3,
+      "weighted": 3
+    },
+    {
+      "consequence": "resource leak or exhaustion",
+      "observed_addition": 14,
+      "primary": 12,
+      "weighted": 14
+    },
+    {
+      "consequence": "runtime rejection or crash",
+      "observed_addition": 48,
+      "primary": 41,
+      "weighted": 50.36418511066398
+    }
+  ],
+  "estimated_in_scope_records": 290.09255533199195,
+  "observed_in_scope_records": 283,
+  "repair_evidence": {
+    "archived_patches": 167,
+    "causes": 149,
+    "multifile_causes": 136
+  },
+  "stronger_evidence_distributions": {
+    "failure_mode": {
+      "families": [
+        {
+          "change_percentage_points": -1.4311093564942756,
+          "family": "incorrect mapping or translation",
+          "full_count": 35,
+          "full_percent": 23.48993288590604,
+          "stronger_count": 30,
+          "stronger_percent": 22.058823529411764
+        },
+        {
+          "change_percentage_points": 0.5823134622976706,
+          "family": "lost or omitted relation",
+          "full_count": 32,
+          "full_percent": 21.476510067114095,
+          "stronger_count": 30,
+          "stronger_percent": 22.058823529411764
+        },
+        {
+          "change_percentage_points": 2.3736675878405027,
+          "family": "missing eligibility check",
+          "full_count": 37,
+          "full_percent": 24.83221476510067,
+          "stronger_count": 37,
+          "stronger_percent": 27.205882352941178
+        },
+        {
+          "change_percentage_points": -0.22206869324911185,
+          "family": "missing ordering or enforcement",
+          "full_count": 8,
+          "full_percent": 5.369127516778524,
+          "stronger_count": 7,
+          "stronger_percent": 5.147058823529412
+        },
+        {
+          "change_percentage_points": -1.1498223450454006,
+          "family": "omitted operation",
+          "full_count": 5,
+          "full_percent": 3.3557046979865772,
+          "stronger_count": 3,
+          "stronger_percent": 2.2058823529411766
+        },
+        {
+          "change_percentage_points": -0.5428345834978285,
+          "family": "premature invalidation or stale state",
+          "full_count": 3,
+          "full_percent": 2.0134228187919465,
+          "stronger_count": 2,
+          "stronger_percent": 1.4705882352941178
+        },
+        {
+          "change_percentage_points": -0.8290564547966839,
+          "family": "premature or unordered transition",
+          "full_count": 10,
+          "full_percent": 6.7114093959731544,
+          "stronger_count": 8,
+          "stronger_percent": 5.882352941176471
+        },
+        {
+          "change_percentage_points": 1.2189103829451238,
+          "family": "unsound assumption or inference",
+          "full_count": 19,
+          "full_percent": 12.751677852348994,
+          "stronger_count": 19,
+          "stronger_percent": 13.970588235294118
+        }
+      ],
+      "max_absolute_change_percentage_points": 2.3736675878405027
+    },
+    "obligation_family": {
+      "families": [
+        {
+          "change_percentage_points": 0.7056849585471772,
+          "family": "alias independence",
+          "full_count": 11,
+          "full_percent": 7.382550335570469,
+          "stronger_count": 11,
+          "stronger_percent": 8.088235294117647
+        },
+        {
+          "change_percentage_points": 0.2566127121989736,
+          "family": "completion and progress",
+          "full_count": 4,
+          "full_percent": 2.684563758389262,
+          "stronger_count": 4,
+          "stronger_percent": 2.9411764705882355
+        },
+        {
+          "change_percentage_points": -0.1875246742992498,
+          "family": "happens-before ordering",
+          "full_count": 20,
+          "full_percent": 13.422818791946309,
+          "stronger_count": 18,
+          "stronger_percent": 13.235294117647058
+        },
+        {
+          "change_percentage_points": -0.4441373864982237,
+          "family": "identity correspondence",
+          "full_count": 16,
+          "full_percent": 10.738255033557047,
+          "stronger_count": 14,
+          "stronger_percent": 10.294117647058824
+        },
+        {
+          "change_percentage_points": 0.41946308724832154,
+          "family": "index and offset preservation",
+          "full_count": 18,
+          "full_percent": 12.080536912751677,
+          "stronger_count": 17,
+          "stronger_percent": 12.5
+        },
+        {
+          "change_percentage_points": -0.4786814054480851,
+          "family": "initialization before publication",
+          "full_count": 4,
+          "full_percent": 2.684563758389262,
+          "stronger_count": 3,
+          "stronger_percent": 2.2058823529411766
+        },
+        {
+          "change_percentage_points": 0.7056849585471772,
+          "family": "layout compatibility",
+          "full_count": 11,
+          "full_percent": 7.382550335570469,
+          "stronger_count": 11,
+          "stronger_percent": 8.088235294117647
+        },
+        {
+          "change_percentage_points": 0.09869719699960589,
+          "family": "ownership and lifetime",
+          "full_count": 13,
+          "full_percent": 8.724832214765101,
+          "stronger_count": 12,
+          "stronger_percent": 8.823529411764707
+        },
+        {
+          "change_percentage_points": -0.6365969206474531,
+          "family": "placement and context consistency",
+          "full_count": 13,
+          "full_percent": 8.724832214765101,
+          "stronger_count": 11,
+          "stronger_percent": 8.088235294117647
+        },
+        {
+          "change_percentage_points": -0.286221871298855,
+          "family": "policy and configuration propagation",
+          "full_count": 7,
+          "full_percent": 4.697986577181208,
+          "stronger_count": 6,
+          "stronger_percent": 4.411764705882353
+        },
+        {
+          "change_percentage_points": -0.8290564547966839,
+          "family": "range and alignment safety",
+          "full_count": 10,
+          "full_percent": 6.7114093959731544,
+          "stronger_count": 8,
+          "stronger_percent": 5.882352941176471
+        },
+        {
+          "change_percentage_points": 0.7056849585471772,
+          "family": "representation fidelity",
+          "full_count": 11,
+          "full_percent": 7.382550335570469,
+          "stronger_count": 11,
+          "stronger_percent": 8.088235294117647
+        },
+        {
+          "change_percentage_points": 0.19245953414923045,
+          "family": "resource and capability agreement",
+          "full_count": 3,
+          "full_percent": 2.0134228187919465,
+          "stronger_count": 3,
+          "stronger_percent": 2.2058823529411766
+        },
+        {
+          "change_percentage_points": -0.286221871298855,
+          "family": "transformation equivalence",
+          "full_count": 7,
+          "full_percent": 4.697986577181208,
+          "stronger_count": 6,
+          "stronger_percent": 4.411764705882353
+        },
+        {
+          "change_percentage_points": 0.0641531780497434,
+          "family": "value semantics preservation",
+          "full_count": 1,
+          "full_percent": 0.6711409395973155,
+          "stronger_count": 1,
+          "stronger_percent": 0.7352941176470589
+        }
+      ],
+      "max_absolute_change_percentage_points": 0.8290564547966839
+    },
+    "relation_family": {
+      "families": [
+        {
+          "change_percentage_points": 0.19245953414923045,
+          "family": "logical value--storage content",
+          "full_count": 3,
+          "full_percent": 2.0134228187919465,
+          "stronger_count": 3,
+          "stronger_percent": 2.2058823529411766
+        },
+        {
+          "change_percentage_points": -0.12337149624950527,
+          "family": "operation--completion",
+          "full_count": 21,
+          "full_percent": 14.093959731543624,
+          "stronger_count": 19,
+          "stronger_percent": 13.970588235294118
+        },
+        {
+          "change_percentage_points": -1.5298065534938816,
+          "family": "operation--execution context",
+          "full_count": 22,
+          "full_percent": 14.765100671140939,
+          "stronger_count": 18,
+          "stronger_percent": 13.235294117647058
+        },
+        {
+          "change_percentage_points": 0.2911567311488353,
+          "family": "storage--ownership/lifetime",
+          "full_count": 16,
+          "full_percent": 10.738255033557047,
+          "stronger_count": 15,
+          "stronger_percent": 11.029411764705882
+        },
+        {
+          "change_percentage_points": -1.465653375444137,
+          "family": "value--operation/identity",
+          "full_count": 23,
+          "full_percent": 15.436241610738255,
+          "stronger_count": 19,
+          "stronger_percent": 13.970588235294118
+        },
+        {
+          "change_percentage_points": 0.8339913146466635,
+          "family": "value--representation",
+          "full_count": 13,
+          "full_percent": 8.724832214765101,
+          "stronger_count": 13,
+          "stronger_percent": 9.558823529411764
+        },
+        {
+          "change_percentage_points": 0.8981444926964066,
+          "family": "value--shared storage",
+          "full_count": 14,
+          "full_percent": 9.395973154362416,
+          "stronger_count": 14,
+          "stronger_percent": 10.294117647058824
+        },
+        {
+          "change_percentage_points": 0.9030793525463848,
+          "family": "value--storage/layout",
+          "full_count": 37,
+          "full_percent": 24.83221476510067,
+          "stronger_count": 35,
+          "stronger_percent": 25.735294117647058
+        }
+      ],
+      "max_absolute_change_percentage_points": 1.5298065534938816
+    },
+    "repair_strategy": {
+      "families": [
+        {
+          "change_percentage_points": -0.22206869324911185,
+          "family": "constrain unsafe transformation",
+          "full_count": 8,
+          "full_percent": 5.369127516778524,
+          "stronger_count": 7,
+          "stronger_percent": 5.147058823529412
+        },
+        {
+          "change_percentage_points": -0.9820371101460723,
+          "family": "correct mapping or representation",
+          "full_count": 42,
+          "full_percent": 28.187919463087248,
+          "stronger_count": 37,
+          "stronger_percent": 27.205882352941178
+        },
+        {
+          "change_percentage_points": 0.034544018949862754,
+          "family": "correct ownership or lifetime",
+          "full_count": 12,
+          "full_percent": 8.053691275167786,
+          "stronger_count": 11,
+          "stronger_percent": 8.088235294117647
+        },
+        {
+          "change_percentage_points": -1.085669166995657,
+          "family": "perform omitted operation",
+          "full_count": 6,
+          "full_percent": 4.026845637583893,
+          "stronger_count": 4,
+          "stronger_percent": 2.9411764705882355
+        },
+        {
+          "change_percentage_points": 0.5823134622976706,
+          "family": "preserve or propagate relation",
+          "full_count": 32,
+          "full_percent": 21.476510067114095,
+          "stronger_count": 30,
+          "stronger_percent": 22.058823529411764
+        },
+        {
+          "change_percentage_points": -0.7649032767469408,
+          "family": "restore ordering or synchronization",
+          "full_count": 11,
+          "full_percent": 7.382550335570469,
+          "stronger_count": 9,
+          "stronger_percent": 6.617647058823529
+        },
+        {
+          "change_percentage_points": 2.4378207658902475,
+          "family": "strengthen eligibility check",
+          "full_count": 38,
+          "full_percent": 25.503355704697988,
+          "stronger_count": 38,
+          "stronger_percent": 27.941176470588236
+        }
+      ],
+      "max_absolute_change_percentage_points": 2.4378207658902475
+    },
+    "transition_family": {
+      "families": [
+        {
+          "change_percentage_points": -0.9524279510461919,
+          "family": "identity or index remapping",
+          "full_count": 31,
+          "full_percent": 20.80536912751678,
+          "stronger_count": 27,
+          "stronger_percent": 19.852941176470587
+        },
+        {
+          "change_percentage_points": 0.2566127121989736,
+          "family": "initialization or content update",
+          "full_count": 4,
+          "full_percent": 2.684563758389262,
+          "stronger_count": 4,
+          "stronger_percent": 2.9411764705882355
+        },
+        {
+          "change_percentage_points": 0.004934859849980988,
+          "family": "ordering or completion handoff",
+          "full_count": 23,
+          "full_percent": 15.436241610738255,
+          "stronger_count": 21,
+          "stronger_percent": 15.441176470588236
+        },
+        {
+          "change_percentage_points": -0.4441373864982237,
+          "family": "ownership or lifetime change",
+          "full_count": 16,
+          "full_percent": 10.738255033557047,
+          "stronger_count": 14,
+          "stronger_percent": 10.294117647058824
+        },
+        {
+          "change_percentage_points": -1.465653375444137,
+          "family": "placement or context change",
+          "full_count": 23,
+          "full_percent": 15.436241610738255,
+          "stronger_count": 19,
+          "stronger_percent": 13.970588235294118
+        },
+        {
+          "change_percentage_points": 1.6383734701934465,
+          "family": "representation or layout change",
+          "full_count": 37,
+          "full_percent": 24.83221476510067,
+          "stronger_count": 36,
+          "stronger_percent": 26.470588235294116
+        },
+        {
+          "change_percentage_points": 0.9622976707461511,
+          "family": "storage, alias, or mutation change",
+          "full_count": 15,
+          "full_percent": 10.06711409395973,
+          "stronger_count": 15,
+          "stronger_percent": 11.029411764705882
+        }
+      ],
+      "max_absolute_change_percentage_points": 1.6383734701934465
+    }
+  }
+}

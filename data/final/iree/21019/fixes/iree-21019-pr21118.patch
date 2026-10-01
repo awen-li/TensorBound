@@ -1,0 +1,80 @@
+From 0864232a2cd94ed88a5b24ed09067c6aab448853 Mon Sep 17 00:00:00 2001
+From: Quinn Dawkins <quinn@nod-labs.com>
+Date: Tue, 17 Jun 2025 13:57:11 -0400
+Subject: [PATCH 1/2] [HIP] Emit error for non-zero dynamic shared memory
+
+Leaving the field deprecated allowed for older vmfbs to silently load
++ execute incorrectly. This un-deprecates the field and emits an error
+if present and non-zero. After the next release we plan to formally
+drop it.
+---
+ .../src/iree/hal/drivers/hip/native_executable.c    | 13 +++++++++++++
+ runtime/src/iree/schemas/hip_executable_def.fbs     |  2 +-
+ 2 files changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/runtime/src/iree/hal/drivers/hip/native_executable.c b/runtime/src/iree/hal/drivers/hip/native_executable.c
+index 790e4ee4d293..ba5084c4b0af 100644
+--- a/runtime/src/iree/hal/drivers/hip/native_executable.c
++++ b/runtime/src/iree/hal/drivers/hip/native_executable.c
+@@ -10,6 +10,7 @@
+ 
+ #include "iree/base/api.h"
+ #include "iree/base/internal/math.h"
++#include "iree/base/status.h"
+ #include "iree/hal/drivers/hip/context_util.h"
+ #include "iree/hal/drivers/hip/dynamic_symbols.h"
+ #include "iree/hal/drivers/hip/status_util.h"
+@@ -431,6 +432,18 @@ iree_status_t iree_hal_hip_native_executable_create(
+         kernel_info->binding_count =
+             iree_hal_hip_BindingBits_vec_len(binding_flags_vec);
+ 
++        if (iree_hal_hip_ExportDef_block_shared_memory_size_get(export_def) !=
++            0) {
++          status = iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
++                                    "exports[%" PRIhsz
++                                    "] for kernel `%s` specified non-zero "
++                                    "deprecated field block_shared_memory_size "
++                                    "in modules[%u]. Verify matching compiler "
++                                    "and runtime versions.",
++                                    i, kernel_name, module_ordinal);
++          break;
++        }
++
+         IREE_TRACE({
+           iree_hal_debug_export_info_t* export_info =
+               (iree_hal_debug_export_info_t*)export_info_ptr;
+diff --git a/runtime/src/iree/schemas/hip_executable_def.fbs b/runtime/src/iree/schemas/hip_executable_def.fbs
+index 4a02ef7ee1ea..79a86424364f 100644
+--- a/runtime/src/iree/schemas/hip_executable_def.fbs
++++ b/runtime/src/iree/schemas/hip_executable_def.fbs
+@@ -38,7 +38,7 @@ table ExportDef {
+   block_dims:BlockDims;
+ 
+   // Size of dynamic shared memory per block.
+-  block_shared_memory_size:uint32 (deprecated);
++  block_shared_memory_size:uint32;
+ 
+   // Total number of 32-bit push constants used by the export.
+   constant_count:uint32;
+
+From cee7c726463e2da772de9057189126785e090901 Mon Sep 17 00:00:00 2001
+From: Quinn Dawkins <quinn@nod-labs.com>
+Date: Tue, 17 Jun 2025 14:05:01 -0400
+Subject: [PATCH 2/2] drop unnecessary include
+
+---
+ runtime/src/iree/hal/drivers/hip/native_executable.c | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/runtime/src/iree/hal/drivers/hip/native_executable.c b/runtime/src/iree/hal/drivers/hip/native_executable.c
+index ba5084c4b0af..ed33383ae2ed 100644
+--- a/runtime/src/iree/hal/drivers/hip/native_executable.c
++++ b/runtime/src/iree/hal/drivers/hip/native_executable.c
+@@ -10,7 +10,6 @@
+ 
+ #include "iree/base/api.h"
+ #include "iree/base/internal/math.h"
+-#include "iree/base/status.h"
+ #include "iree/hal/drivers/hip/context_util.h"
+ #include "iree/hal/drivers/hip/dynamic_symbols.h"
+ #include "iree/hal/drivers/hip/status_util.h"

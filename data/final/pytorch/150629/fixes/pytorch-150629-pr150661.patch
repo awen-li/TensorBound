@@ -1,0 +1,148 @@
+From 51c8cee9661df92d3d8fa02681846fc03b19acae Mon Sep 17 00:00:00 2001
+From: Nikita Shulga <nikita.shulga@gmail.com>
+Date: Thu, 3 Apr 2025 17:57:41 -0700
+Subject: [PATCH 1/2] [MPS] Make fused rmsnorm traceable
+
+By declaring it as an ATen op
+
+Fixes https://github.com/pytorch/pytorch/issues/150629
+
+[ghstack-poisoned]
+---
+ aten/src/ATen/native/layer_norm.cpp            |  4 ++--
+ aten/src/ATen/native/mps/operations/RMSNorm.h  | 14 --------------
+ aten/src/ATen/native/mps/operations/RMSNorm.mm | 13 +++++--------
+ aten/src/ATen/native/native_functions.yaml     |  4 ++++
+ 4 files changed, 11 insertions(+), 24 deletions(-)
+ delete mode 100644 aten/src/ATen/native/mps/operations/RMSNorm.h
+
+diff --git a/aten/src/ATen/native/layer_norm.cpp b/aten/src/ATen/native/layer_norm.cpp
+index 0972978a14200..2886a992735c6 100644
+--- a/aten/src/ATen/native/layer_norm.cpp
++++ b/aten/src/ATen/native/layer_norm.cpp
+@@ -16,6 +16,7 @@
+ #include <ATen/ops/empty_like.h>
+ #include <ATen/ops/empty_like_native.h>
+ #include <ATen/ops/layer_norm_native.h>
++#include <ATen/ops/_rms_norm_fused.h>
+ #include <ATen/ops/native_batch_norm.h>
+ #include <ATen/ops/native_layer_norm.h>
+ #include <ATen/ops/native_layer_norm_backward_native.h>
+@@ -27,7 +28,6 @@
+ #endif
+ 
+ #ifdef USE_MPS
+-#include <ATen/native/mps/operations/RMSNorm.h>
+ #include <c10/core/GradMode.h>
+ #endif
+ 
+@@ -281,7 +281,7 @@ Tensor rms_norm_symint(
+ 
+     if (!(GradMode::is_enabled() && any_inputs_require_grad) && !any_nested && is_input_fp && is_weight_fp) {
+       auto eps_val = eps.value_or(std::numeric_limits<double>::epsilon());
+-      return mps::rms_norm_mps_kernel(input.contiguous(), normalized_shape, weight.contiguous(), eps_val);
++      return at::_rms_norm_fused(input.contiguous(), normalized_shape.size(), weight.contiguous(), eps_val);
+     }
+   }
+ #endif
+diff --git a/aten/src/ATen/native/mps/operations/RMSNorm.h b/aten/src/ATen/native/mps/operations/RMSNorm.h
+deleted file mode 100644
+index 874a73d996613..0000000000000
+--- a/aten/src/ATen/native/mps/operations/RMSNorm.h
++++ /dev/null
+@@ -1,14 +0,0 @@
+-#pragma once
+-
+-#include <ATen/core/Tensor.h>
+-#include <c10/core/SymIntArrayRef.h>
+-
+-namespace at::native::mps {
+-
+-Tensor rms_norm_mps_kernel(
+-    const Tensor& input,
+-    c10::SymIntArrayRef normalized_shape,
+-    const Tensor& weight,
+-    const double eps);
+-
+-} // namespace at::native::mps
+diff --git a/aten/src/ATen/native/mps/operations/RMSNorm.mm b/aten/src/ATen/native/mps/operations/RMSNorm.mm
+index 1260cdd6383aa..71456533447e6 100644
+--- a/aten/src/ATen/native/mps/operations/RMSNorm.mm
++++ b/aten/src/ATen/native/mps/operations/RMSNorm.mm
+@@ -4,13 +4,14 @@
+ #include <ATen/Functions.h>
+ #include <ATen/NativeFunctions.h>
+ #else
++#include <ATen/ops/_rms_norm_fused_native.h>
+ #include <ATen/ops/empty_like.h>
+ #endif
+ #include <ATen/native/mps/OperationUtils.h>
+-#include <ATen/native/mps/operations/RMSNorm.h>
+ #include <fmt/format.h>
+ 
+-namespace at::native::mps {
++namespace at::native {
++using namespace mps;
+ 
+ #ifndef PYTORCH_JIT_COMPILE_SHADERS
+ static auto& lib = MetalShaderLibrary::getBundledLibrary();
+@@ -18,13 +19,9 @@
+ #include <ATen/native/mps/RMSNorm_metallib.h>
+ #endif
+ 
+-Tensor rms_norm_mps_kernel(const Tensor& input,
+-                           c10::SymIntArrayRef normalized_shape,
+-                           const Tensor& weight,
+-                           const double eps) {
++Tensor _rms_norm_fused_mps(const Tensor& input, const int64_t normalized_ndim, const Tensor& weight, const double eps) {
+   TORCH_CHECK(input.is_contiguous() && weight.is_contiguous(), "Expected contiguous input and weight tensors");
+   auto output = at::empty_like(input);
+-  const int normalized_ndim = normalized_shape.size();
+   const auto input_shape = input.sizes();
+   const auto input_ndim = input.dim();
+   const int axis = input_ndim - normalized_ndim;
+@@ -64,4 +61,4 @@ Tensor rms_norm_mps_kernel(const Tensor& input,
+   return output;
+ }
+ 
+-} // namespace at::native::mps
++} // namespace at::native
+diff --git a/aten/src/ATen/native/native_functions.yaml b/aten/src/ATen/native/native_functions.yaml
+index 1336122e2fd6e..1f29855dc74cb 100644
+--- a/aten/src/ATen/native/native_functions.yaml
++++ b/aten/src/ATen/native/native_functions.yaml
+@@ -3302,6 +3302,10 @@
+   dispatch:
+     CompositeImplicitAutograd: rms_norm_symint
+ 
++- func: _rms_norm_fused(Tensor input, int normalized_shape_ndim, Tensor weight, float eps) -> Tensor
++  dispatch:
++    MPS: _rms_norm_fused_mps
++
+ - func: nan_to_num(Tensor self, float? nan=None, float? posinf=None, float? neginf=None) -> Tensor
+   variants: function, method
+   dispatch:
+
+From 7593c08b5b53f1aec4474ac9fba1bc41785a67bf Mon Sep 17 00:00:00 2001
+From: Nikita Shulga <nshulga@meta.com>
+Date: Wed, 16 Apr 2025 12:28:07 -0700
+Subject: [PATCH 2/2] Update
+
+[ghstack-poisoned]
+---
+ torch/_inductor/lowering.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/torch/_inductor/lowering.py b/torch/_inductor/lowering.py
+index 34f90fc814e1c..cc899baa77093 100644
+--- a/torch/_inductor/lowering.py
++++ b/torch/_inductor/lowering.py
+@@ -2625,7 +2625,7 @@ def is_aligned(x):
+ make_fallback(aten.exponential.default, warn=False)  # (fails accuracy on test_torch.py)
+ make_fallback(aten._pdist_forward)  # Has decomp. Needs benchmarks
+ make_fallback(aten.soft_margin_loss_backward, warn=False)  # py_impl?
+-make_fallback(aten_rms_norm_fused, warn=False)  # (MPS-only and faster than decomp)
++make_fallback(aten._rms_norm_fused, warn=False)  # (MPS-only and faster than decomp)
+ 
+ 
+ # 1.5) Easy or Impossible

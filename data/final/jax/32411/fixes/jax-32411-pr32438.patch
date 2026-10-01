@@ -1,0 +1,61 @@
+From 7ebb414b73e71bc5eec96bf40c8e732797aac7b1 Mon Sep 17 00:00:00 2001
+From: Matthew Johnson <mattjj@google.com>
+Date: Wed, 8 Oct 2025 01:14:48 +0000
+Subject: [PATCH] [mutable-arrays] handle `reverse` in scan discharge rule
+
+---
+ jax/_src/lax/control_flow/loops.py |  5 +++--
+ tests/mutable_array_test.py        | 16 ++++++++++++++++
+ 2 files changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/jax/_src/lax/control_flow/loops.py b/jax/_src/lax/control_flow/loops.py
+index e719f7c671a5..14057764f204 100644
+--- a/jax/_src/lax/control_flow/loops.py
++++ b/jax/_src/lax/control_flow/loops.py
+@@ -1505,8 +1505,9 @@ def _scan_state_partial_discharge_rule(
+   dus = partial(slicing.dynamic_update_index_in_dim, axis=0, allow_negative_indices=False)
+ 
+   def body(*consts_carry_xs):
+-    pure_consts, [i], const_refvals, carry, xs_refvals_, pure_xs = split_list(
++    pure_consts, [i_], const_refvals, carry, xs_refvals_, pure_xs = split_list(
+         consts_carry_xs, [num_pure_consts, 1, num_const_refs, num_carry, num_xs_refs])
++    i = length - i_ - 1 if reverse else i_
+     xs_refvals = [ds(x, i) for x in xs_refvals_]
+     consts = merge_lists(is_ref_const, pure_consts, const_refvals)
+     xs = merge_lists(is_ref_xs, pure_xs, xs_refvals)
+@@ -1514,7 +1515,7 @@ def body(*consts_carry_xs):
+     carry, ys, const_refvals, xs_updates = split_list_checked(
+         outs, [num_carry, num_ys, num_const_refs, num_xs_refs])
+     xs_refvals = [dus(x, u, i) for x, u in zip(xs_refvals_, xs_updates)]
+-    return [i + 1, *const_refvals, *carry, *xs_refvals, *ys]
++    return [i_ + 1, *const_refvals, *carry, *xs_refvals, *ys]
+ 
+   def rearrange(lst):
+     consts, carry, xs = split_list_checked(lst, [num_consts, num_carry, num_xs])
+diff --git a/tests/mutable_array_test.py b/tests/mutable_array_test.py
+index 017c6d2d2683..0d027c0e413d 100644
+--- a/tests/mutable_array_test.py
++++ b/tests/mutable_array_test.py
+@@ -901,6 +901,22 @@ def f(x_ref):
+     arr = jnp.ones(3)
+     self.assertNotIsInstance(arr, jax.Ref)
+ 
++  def test_scan_vjp3_reverse(self):
++    # https://github.com/jax-ml/jax/issues/32411
++    def f(xs):
++      ys = jnp.arange(5.)
++
++      def body(_, xy):
++        x, y = xy
++        return (), x * y
++      (), z = jax.lax.scan(body, (), (xs, ys))
++      return z.sum()
++
++    grad_accum = jax.new_ref(jnp.zeros(5))
++    _, f_vjp = vjp3(f, jnp.ones(5))
++    _, = f_vjp.with_refs(grad_accum)(1.)
++    self.assertAllClose(grad_accum[...], jnp.arange(5.))
++
+ 
+ @jtu.with_config(jax_mutable_array_checks=True)
+ class MutableArrayErrorsTest(jtu.JaxTestCase):

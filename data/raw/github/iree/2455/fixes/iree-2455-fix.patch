@@ -1,0 +1,55 @@
+From 15e51a85dcc580168e8455b04b4dd9b9b76976f2 Mon Sep 17 00:00:00 2001
+From: Ben Vanik <benvanik@google.com>
+Date: Thu, 9 Jul 2020 17:13:21 -0700
+Subject: [PATCH] Fixing #2455 and #2252 (leak on particular ABI patterns +
+ unused registers) (#2459)
+
+---
+ iree/test/e2e/regression/unused_args.mlir | 9 +++++++++
+ iree/vm/module_abi_packing.h              | 3 ---
+ 2 files changed, 9 insertions(+), 3 deletions(-)
+ create mode 100644 iree/test/e2e/regression/unused_args.mlir
+
+diff --git a/iree/test/e2e/regression/unused_args.mlir b/iree/test/e2e/regression/unused_args.mlir
+new file mode 100644
+index 000000000000..eeccd04b9a08
+--- /dev/null
++++ b/iree/test/e2e/regression/unused_args.mlir
+@@ -0,0 +1,9 @@
++// RUN: iree-run-mlir -iree-hal-target-backends=vmla -input-value=4xf32=0,0,0,0 -input-value=4xf32=1,1,1,1 %s | IreeFileCheck %s
++// RUN: [[ $IREE_LLVMJIT_DISABLE == 1 ]] || (iree-run-mlir -iree-hal-target-backends=llvm-ir -input-value=4xf32=0,0,0,0 -input-value=4xf32=1,1,1,1 %s | IreeFileCheck %s)
++// RUN: [[ $IREE_VULKAN_DISABLE == 1 ]] || (iree-run-mlir -iree-hal-target-backends=vulkan-spirv -input-value=4xf32=0,0,0,0 -input-value=4xf32=1,1,1,1 %s | IreeFileCheck %s)
++
++// CHECK-LABEL: EXEC @arg0_unused
++func @arg0_unused(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>) -> tensor<4xf32> attributes {iree.module.export} {
++  return %arg1 : tensor<4xf32>
++}
++// CHECK: 4xf32=1 1 1 1
+diff --git a/iree/vm/module_abi_packing.h b/iree/vm/module_abi_packing.h
+index 9fa51f67fee4..e430023262ce 100644
+--- a/iree/vm/module_abi_packing.h
++++ b/iree/vm/module_abi_packing.h
+@@ -405,7 +405,6 @@ struct ResultPack<opaque_ref> {
+     }
+     uint16_t reg = packer->result_list->registers[packer->result_ordinal++];
+     auto* reg_ptr = &packer->registers->ref[reg & packer->registers->ref_mask];
+-    std::memset(reg_ptr, 0, sizeof(*reg_ptr));
+     iree_vm_ref_move(value.get(), reg_ptr);
+   }
+ };
+@@ -421,7 +420,6 @@ struct ResultPack<ref<T>> {
+     }
+     uint16_t reg = packer->result_list->registers[packer->result_ordinal++];
+     auto* reg_ptr = &packer->registers->ref[reg & packer->registers->ref_mask];
+-    std::memset(reg_ptr, 0, sizeof(*reg_ptr));
+     iree_vm_ref_wrap_assign(value.release(), value.type(), reg_ptr);
+   }
+ };
+@@ -436,7 +434,6 @@ struct ResultPack<absl::optional<ref<T>>> {
+   static void Store(Packer* packer, absl::optional<ref<T>> value) {
+     uint16_t reg = packer->result_list->registers[packer->result_ordinal++];
+     auto* reg_ptr = &packer->registers->ref[reg & packer->registers->ref_mask];
+-    std::memset(reg_ptr, 0, sizeof(*reg_ptr));
+     if (value.has_value()) {
+       iree_vm_ref_wrap_assign(value.release(), value.type(), reg_ptr);
+     }

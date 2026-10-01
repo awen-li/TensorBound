@@ -1,0 +1,65 @@
+From 3b6fd04e06789bd53b9b04d2721487f54fa8b1e6 Mon Sep 17 00:00:00 2001
+From: Yash Katariya <yashkatariya@google.com>
+Date: Fri, 20 Feb 2026 16:02:01 -0800
+Subject: [PATCH] Propagate input sharding to output in full_like if it's fully
+ replicated. Then even if input/output shapes don't match, it should be fine.
+ Fixes https://github.com/jax-ml/jax/issues/35273
+
+PiperOrigin-RevId: 873111177
+---
+ jax/_src/lax/lax.py        |  2 +-
+ jax/_src/numpy/indexing.py |  3 ++-
+ tests/multi_device_test.py | 12 ++++++------
+ 3 files changed, 9 insertions(+), 8 deletions(-)
+
+diff --git a/jax/_src/lax/lax.py b/jax/_src/lax/lax.py
+index e080c732bd8f..d6a1731fd5b8 100644
+--- a/jax/_src/lax/lax.py
++++ b/jax/_src/lax/lax.py
+@@ -3598,7 +3598,7 @@ def full_like(x: ArrayLike | DuckTypedArray,
+         and (x.sharding._is_concrete or not get_concrete_mesh().empty)
+         and getattr(x, '_committed', True)
+         and not weak_type
+-        and fill_shape == np.shape(x)  # type: ignore[arg-type]
++        and (fill_shape == np.shape(x) or x.sharding.is_fully_replicated)  # type: ignore[arg-type]
+     )
+     if use_x_sharding:
+       sharding = x.sharding  # type: ignore
+diff --git a/jax/_src/numpy/indexing.py b/jax/_src/numpy/indexing.py
+index 41508f55dc08..c8d393c611fa 100644
+--- a/jax/_src/numpy/indexing.py
++++ b/jax/_src/numpy/indexing.py
+@@ -1205,7 +1205,8 @@ def _gather(arr, dynamic_idx, *, treedef, indices_are_sorted,
+   # Avoid calling gather if the slice shape is empty, both as a fast path and to
+   # handle cases like zeros(0)[array([], int32)].
+   if core.is_empty_shape(indexer.slice_shape):
+-    return lax.full_like(y, 0, shape=indexer.slice_shape)
++    return lax.full_like(y, 0, shape=indexer.slice_shape,
++                         sharding=indexer.slice_sharding)
+ 
+   # We avoid generating a gather when indexer.gather_indices.size is empty.
+   if not core.is_empty_shape(indexer.gather_indices.shape):
+diff --git a/tests/multi_device_test.py b/tests/multi_device_test.py
+index 011b1588ce46..5b04fa3b2749 100644
+--- a/tests/multi_device_test.py
++++ b/tests/multi_device_test.py
+@@ -335,13 +335,13 @@ def test_lax_full_like_single_device(self):
+     x = jax.device_put(jnp.ones((100, 100)), devices[1])
+     y = lax.full_like(x, fill_value=1.0, shape=())
+     self.assertEqual(y.shape, ())
+-    # Currently if shape is provided the sharding will revert
+-    # to default. This might change in the future and this test might
+-    # need to be updated.
+-    self.assertEqual(
+-        y.sharding,
+-        jax.sharding.SingleDeviceSharding(jax.devices()[0]))
++    self.assertEqual(y.sharding, jax.sharding.SingleDeviceSharding(devices[1]))
+ 
++  def test_full_like_replicated_sharding_different_shape(self):
++    devices = self.get_devices()
++    x = jax.numpy.arange(10, device=devices[1])
++    y = jax.lax.full_like(x, 1, shape=(5,))
++    self.assertEqual(x.sharding, y.sharding)
+ 
+   def test_lax_full_like_efficient(self):
+     devices = self.get_devices()

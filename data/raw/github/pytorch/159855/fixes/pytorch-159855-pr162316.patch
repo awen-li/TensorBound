@@ -1,0 +1,458 @@
+From 5fa1f524015e25495ea46d3184516b30ca1a25a0 Mon Sep 17 00:00:00 2001
+From: Markus Hoehnerbach <mhoehnerbach@fb.com>
+Date: Fri, 5 Sep 2025 17:29:35 -0700
+Subject: [PATCH 01/10] [inductor] bugfix: consider WAR dependency from
+ MutatingLayoutSHOULDREMOVE during fusion
+
+[ghstack-poisoned]
+---
+ torch/_inductor/scheduler.py | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/torch/_inductor/scheduler.py b/torch/_inductor/scheduler.py
+index f782d8315d84d..fa1d61686110b 100644
+--- a/torch/_inductor/scheduler.py
++++ b/torch/_inductor/scheduler.py
+@@ -4039,6 +4039,9 @@ def can_fuse_vertical(
+         We can fuse them if all the reads of node2 either match
+         corresponding writes in node1, or are written by nodes that can
+         be scheduled before the fusion of node1 and node2.
++
++        Additionally, we must make sure that if node1 reads a buffer and
++        node2 writes it, that they have identical memory access patterns
+         """
+         node1_buf_names = node1.get_buffer_names()
+         why = WhyNoFuse(node1, node2)
+@@ -4081,6 +4084,26 @@ def can_fuse_vertical(
+                 why("intermediate nodes between node1 & node2")
+                 return False
+ 
++        # handle write after read dependency
++        for wd in node2.read_writes.writes:
++            if not isinstance(wd, MemoryDep):
++                continue
++            wds = [wd]
++            for o in node2.get_outputs():
++                if o.node.name != wd.name:
++                    continue
++                for m in o.get_mutations():
++                    from dataclasses import replace
++                    wds.append(replace(wd, name=m))
++            for wd_m in wds:
++                for rd in node1.read_writes.reads:
++                    if not isinstance(rd, MemoryDep):
++                        continue
++                    if not self.fusable_read_and_write(rd, wd_m):
++                        why("write after read cannot be satisfied")
++                        return False
++        # for out in node2.outputs:
++        #     if out.get_mutations() in node1.read_w
+         return True
+ 
+     def fusable_weak_dep(
+
+From 3199b471701c59147ff127859a86a6b469bbd6ed Mon Sep 17 00:00:00 2001
+From: Markus Hoehnerbach <mhoehnerbach@fb.com>
+Date: Mon, 8 Sep 2025 13:29:23 -0700
+Subject: [PATCH 02/10] Update on "[inductor] bugfix: consider WAR dependency
+ from MutatingLayoutSHOULDREMOVE during fusion"
+
+cc voznesenskym penguinwu EikanWang jgong5 Guobing-Chen XiaobingSuper zhuhaozhe blzheng wenzhe-nrv jiayisunx ipiszy chenyang78 kadeng muchulee8 amjames chauhang aakhundov coconutruben
+
+[ghstack-poisoned]
+---
+ torch/_inductor/scheduler.py | 28 ++++++----------------------
+ 1 file changed, 6 insertions(+), 22 deletions(-)
+
+diff --git a/torch/_inductor/scheduler.py b/torch/_inductor/scheduler.py
+index fa1d61686110b..c784fe2e910e7 100644
+--- a/torch/_inductor/scheduler.py
++++ b/torch/_inductor/scheduler.py
+@@ -969,7 +969,11 @@ def _prune_redundant_deps(
+     def should_prune(dep: Dep) -> bool:
+         if isinstance(dep, WeakDep):
+             op_name = name_to_buf[dep.name].defining_op_name()
+-            is_redundant = name_to_dep_count[name_to_fused_node[op_name].get_name()] > 0
++            is_redundant = name_to_dep_count[
++                name_to_fused_node[op_name].get_name()
++            ] > 0 and node.scheduler.fusable_weak_dep(
++                dep, name_to_fused_node[op_name], node
++            )
+             # These can occur because fused nodes always gather deps from their snodes
+             # If B has a weakdep on A
+             # B gets fused with C, then any time BC is fused, the weakdep will reappear
+@@ -3339,6 +3343,7 @@ def fuse_nodes_once(
+             - self.can_fuse(): checks if a fusion is legal
+             - self.score_fusion(): assigns priority to a given fusion
+         """
++        self.prune_redundant_deps(nodes)
+         fused_nodes = OrderedSet(nodes)
+         if fusion_log.isEnabledFor(logging.DEBUG):
+             fusion_log.debug("fuse_nodes_once, candidates:")
+@@ -3481,7 +3486,6 @@ def create_combo_kernel_nodes(self, num_ck_nodes: Optional[int] = None) -> None:
+             num_nodes_orig,
+             len(self.nodes),
+         )
+-        self.prune_redundant_deps(self.nodes)
+ 
+     def prune_redundant_deps(self, nodes: list[BaseSchedulerNode]) -> None:
+         for node in nodes:
+@@ -4084,26 +4088,6 @@ def can_fuse_vertical(
+                 why("intermediate nodes between node1 & node2")
+                 return False
+ 
+-        # handle write after read dependency
+-        for wd in node2.read_writes.writes:
+-            if not isinstance(wd, MemoryDep):
+-                continue
+-            wds = [wd]
+-            for o in node2.get_outputs():
+-                if o.node.name != wd.name:
+-                    continue
+-                for m in o.get_mutations():
+-                    from dataclasses import replace
+-                    wds.append(replace(wd, name=m))
+-            for wd_m in wds:
+-                for rd in node1.read_writes.reads:
+-                    if not isinstance(rd, MemoryDep):
+-                        continue
+-                    if not self.fusable_read_and_write(rd, wd_m):
+-                        why("write after read cannot be satisfied")
+-                        return False
+-        # for out in node2.outputs:
+-        #     if out.get_mutations() in node1.read_w
+         return True
+ 
+     def fusable_weak_dep(
+
+From 449490dbb3da2bc441d61da6cd47ece7249b2708 Mon Sep 17 00:00:00 2001
+From: Markus Hoehnerbach <mhoehnerbach@fb.com>
+Date: Mon, 8 Sep 2025 13:30:15 -0700
+Subject: [PATCH 03/10] Update on "[inductor] bugfix: consider WAR dependency
+ from MutatingLayoutSHOULDREMOVE during fusion"
+
+cc voznesenskym penguinwu EikanWang jgong5 Guobing-Chen XiaobingSuper zhuhaozhe blzheng wenzhe-nrv jiayisunx ipiszy chenyang78 kadeng muchulee8 amjames chauhang aakhundov coconutruben
+
+[ghstack-poisoned]
+---
+ torch/_inductor/scheduler.py | 3 ---
+ 1 file changed, 3 deletions(-)
+
+diff --git a/torch/_inductor/scheduler.py b/torch/_inductor/scheduler.py
+index c784fe2e910e7..eda1716f54cf9 100644
+--- a/torch/_inductor/scheduler.py
++++ b/torch/_inductor/scheduler.py
+@@ -4043,9 +4043,6 @@ def can_fuse_vertical(
+         We can fuse them if all the reads of node2 either match
+         corresponding writes in node1, or are written by nodes that can
+         be scheduled before the fusion of node1 and node2.
+-
+-        Additionally, we must make sure that if node1 reads a buffer and
+-        node2 writes it, that they have identical memory access patterns
+         """
+         node1_buf_names = node1.get_buffer_names()
+         why = WhyNoFuse(node1, node2)
+
+From 71451a817e017566da2222703d39b06aeb1cfe3b Mon Sep 17 00:00:00 2001
+From: Markus Hoehnerbach <mhoehnerbach@fb.com>
+Date: Mon, 8 Sep 2025 14:29:37 -0700
+Subject: [PATCH 04/10] Update on "[inductor] bugfix: consider WAR dependency
+ from MutatingLayoutSHOULDREMOVE during fusion"
+
+cc voznesenskym penguinwu EikanWang jgong5 Guobing-Chen XiaobingSuper zhuhaozhe blzheng wenzhe-nrv jiayisunx ipiszy chenyang78 kadeng muchulee8 amjames chauhang aakhundov coconutruben
+
+[ghstack-poisoned]
+---
+ torch/_inductor/scheduler.py | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/torch/_inductor/scheduler.py b/torch/_inductor/scheduler.py
+index eda1716f54cf9..0c2d1f1e3dfc5 100644
+--- a/torch/_inductor/scheduler.py
++++ b/torch/_inductor/scheduler.py
+@@ -4103,6 +4103,8 @@ def fusable_weak_dep(
+         if len(mutating_writes) != 1:
+             return False
+         write = mutating_writes[0]
++        if isinstance(write, StarDep):
++            return False
+         assert isinstance(write, MemoryDep)
+ 
+         if free_symbol_is_type(write.index, SymT.TMP):
+
+From 2736b72cdcbb0e0243e99dbd62397656d484c27b Mon Sep 17 00:00:00 2001
+From: Markus Hoehnerbach <mhoehnerbach@fb.com>
+Date: Mon, 8 Sep 2025 16:03:02 -0700
+Subject: [PATCH 05/10] Update on "[inductor] bugfix: keep WeakDeps (WAR deps)
+ during fusion"
+
+fixes #159855, was not triggered in other tests since it took
+more than one round of fusion to get to the problematic code
+which prunes WeakDeps. The WeakDeps are important to inhibit
+fusion of kernels that read/write data into mutated buffers
+with different indexing.
+
+We modify the code to a) always prune before fusion, rather
+than after, which improves its coverage and makes our basic
+vertical fusion tests surface this issue as well and b)
+check whether the weak dep is fusable before eliminating it
+(which basically means checking that the producing code and
+the consuming code are sufficiently compatible).
+
+The tests that trigger this with change (a) is:
+test_fusing_write_into_disjoint_read introduced in #118210.
+
+[ghstack-poisoned]
+
+From 8d42f7dd7524659a1e3e3648d1f12d7ca7ede7d5 Mon Sep 17 00:00:00 2001
+From: Markus Hoehnerbach <mhoehnerbach@fb.com>
+Date: Tue, 9 Sep 2025 09:31:15 -0700
+Subject: [PATCH 06/10] Update on "[inductor] bugfix: keep WeakDeps (WAR deps)
+ during fusion"
+
+fixes #159855, was not triggered in other tests since it took
+more than one round of fusion to get to the problematic code
+which prunes WeakDeps. The WeakDeps are important to inhibit
+fusion of kernels that read/write data into mutated buffers
+with different indexing.
+
+We modify the code to a) always prune before fusion, rather
+than after, which improves its coverage and makes our basic
+vertical fusion tests surface this issue as well and b)
+check whether the weak dep is fusable before eliminating it
+(which basically means checking that the producing code and
+the consuming code are sufficiently compatible).
+
+The tests that trigger this with change (a) is:
+test_fusing_write_into_disjoint_read introduced in #118210.
+
+[ghstack-poisoned]
+---
+ test/inductor/test_torchinductor.py | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/test/inductor/test_torchinductor.py b/test/inductor/test_torchinductor.py
+index ed8c0129dd438..acd76916edee0 100644
+--- a/test/inductor/test_torchinductor.py
++++ b/test/inductor/test_torchinductor.py
+@@ -5857,6 +5857,16 @@ def f(a):
+             a = torch.rand((1, 1000000), device=self.device)
+             self.common(f, (a,))
+ 
++    def test_inplace_flip(self):
++        def f(x, y):
++            x.copy_(x.flip(1))
++            y = y.sum(dim=1, keepdim=True) + y
++            return x + y
++
++        x = torch.randn(20, 1024 * 1024)
++        y = torch.randn(20, 1024 * 1024)
++        self.common(f, (x, y), atol=1e-3, rtol=1e-3)
++
+     def test_gather_scatter(self):
+         def fn(node_feat, edge_index):
+             src_node_feat = node_feat[edge_index[0]]
+
+From 3b718bbe729acaa93d23a557857fca9110dca4e6 Mon Sep 17 00:00:00 2001
+From: Markus Hoehnerbach <mhoehnerbach@fb.com>
+Date: Tue, 9 Sep 2025 13:29:23 -0700
+Subject: [PATCH 07/10] Update on "[inductor] bugfix: keep WeakDeps (WAR deps)
+ during fusion"
+
+fixes #159855, was not triggered in other tests since it took
+more than one round of fusion to get to the problematic code
+which prunes WeakDeps. The WeakDeps are important to inhibit
+fusion of kernels that read/write data into mutated buffers
+with different indexing.
+
+We modify the code to a) always prune before fusion, rather
+than after, which improves its coverage and makes our basic
+vertical fusion tests surface this issue as well and b)
+check whether the weak dep is fusable before eliminating it
+(which basically means checking that the producing code and
+the consuming code are sufficiently compatible).
+
+The tests that trigger this with change (a) is:
+test_fusing_write_into_disjoint_read introduced in #118210.
+
+cc voznesenskym penguinwu EikanWang jgong5 Guobing-Chen XiaobingSuper zhuhaozhe blzheng wenzhe-nrv jiayisunx ipiszy chenyang78 kadeng muchulee8 amjames chauhang aakhundov coconutruben
+
+[ghstack-poisoned]
+---
+ torch/_inductor/scheduler.py | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/torch/_inductor/scheduler.py b/torch/_inductor/scheduler.py
+index 0c2d1f1e3dfc5..4128d621c2652 100644
+--- a/torch/_inductor/scheduler.py
++++ b/torch/_inductor/scheduler.py
+@@ -4092,6 +4092,8 @@ def fusable_weak_dep(
+     ) -> bool:
+         if weak_dep.name not in node1.get_buffer_names():
+             return False
++        if isinstance(node1, ForeachKernelSchedulerNode):
++            return False
+ 
+         # A weak dep can be fused if and only if the fused operation acts inplace
+         # on the buffer being mutated. i.e. the same index is being read then mutated
+
+From a6ec82b36347f705dbbea0c7251b9b6a1ce431f6 Mon Sep 17 00:00:00 2001
+From: Markus Hoehnerbach <mhoehnerbach@fb.com>
+Date: Fri, 12 Sep 2025 07:20:16 -0700
+Subject: [PATCH 08/10] Update on "[inductor] bugfix: keep WeakDeps (WAR deps)
+ during fusion"
+
+fixes #159855, was not triggered in other tests since it took
+more than one round of fusion to get to the problematic code
+which prunes WeakDeps. The WeakDeps are important to inhibit
+fusion of kernels that read/write data into mutated buffers
+with different indexing.
+
+We modify the code to a) always prune before fusion, rather
+than after, which improves its coverage and makes our basic
+vertical fusion tests surface this issue as well and b)
+check whether the weak dep is fusable before eliminating it
+(which basically means checking that the producing code and
+the consuming code are sufficiently compatible).
+
+The tests that trigger this with change (a) is:
+test_fusing_write_into_disjoint_read introduced in #118210.
+
+cc voznesenskym penguinwu EikanWang jgong5 Guobing-Chen XiaobingSuper zhuhaozhe blzheng wenzhe-nrv jiayisunx ipiszy chenyang78 kadeng muchulee8 amjames chauhang aakhundov coconutruben
+
+[ghstack-poisoned]
+---
+ torch/_inductor/scheduler.py | 31 +++++++++++++++++++------------
+ 1 file changed, 19 insertions(+), 12 deletions(-)
+
+diff --git a/torch/_inductor/scheduler.py b/torch/_inductor/scheduler.py
+index 4128d621c2652..6a2a8a2b3bfa5 100644
+--- a/torch/_inductor/scheduler.py
++++ b/torch/_inductor/scheduler.py
+@@ -4092,8 +4092,6 @@ def fusable_weak_dep(
+     ) -> bool:
+         if weak_dep.name not in node1.get_buffer_names():
+             return False
+-        if isinstance(node1, ForeachKernelSchedulerNode):
+-            return False
+ 
+         # A weak dep can be fused if and only if the fused operation acts inplace
+         # on the buffer being mutated. i.e. the same index is being read then mutated
+@@ -4113,16 +4111,25 @@ def fusable_weak_dep(
+             return False
+ 
+         real_name = self.mutation_real_name[weak_dep.mutating_buf]
+-        relevant_reads = [
+-            read for read in node1.read_writes.reads if read.name == real_name
+-        ]
+-        return all(
+-            isinstance(read, MemoryDep)
+-            and not free_symbol_is_type(read.index, SymT.TMP)
+-            and read.index == write.index
+-            and read.size == write.size
+-            for read in relevant_reads
+-        )
++        relevant_reading_nodes = [node1]
++        if isinstance(node1, ForeachKernelSchedulerNode):
++            relevant_reading_nodes = node1.snodes
++        num_concurrent_reads = 0
++        for reading_node in relevant_reading_nodes:
++            relevant_reads = [
++                read for read in reading_node.read_writes.reads if read.name == real_name
++            ]
++            if not relevant_reads: continue
++            num_concurrent_reads += 1
++            if not all(
++                isinstance(read, MemoryDep)
++                and not free_symbol_is_type(read.index, SymT.TMP)
++                and read.index == write.index
++                and read.size == write.size
++                for read in relevant_reads
++                ):
++                return False
++        return num_concurrent_reads <= 1
+ 
+     # StarDep doesn't match MemoryDep, different indices don't match
+     # However, broadcasting sometimes strips dimensions, and if that's the case
+
+From 09cd1bd24c08e388427857e271fcd004990c7a4c Mon Sep 17 00:00:00 2001
+From: Markus Hoehnerbach <mhoehnerbach@fb.com>
+Date: Fri, 12 Sep 2025 07:32:52 -0700
+Subject: [PATCH 09/10] Update on "[inductor] bugfix: keep WeakDeps (WAR deps)
+ during fusion"
+
+fixes #159855, was not triggered in other tests since it took
+more than one round of fusion to get to the problematic code
+which prunes WeakDeps. The WeakDeps are important to inhibit
+fusion of kernels that read/write data into mutated buffers
+with different indexing.
+
+We modify the code to a) always prune before fusion, rather
+than after, which improves its coverage and makes our basic
+vertical fusion tests surface this issue as well and b)
+check whether the weak dep is fusable before eliminating it
+(which basically means checking that the producing code and
+the consuming code are sufficiently compatible).
+
+The tests that trigger this with change (a) is:
+test_fusing_write_into_disjoint_read introduced in #118210.
+
+cc voznesenskym penguinwu EikanWang jgong5 Guobing-Chen XiaobingSuper zhuhaozhe blzheng wenzhe-nrv jiayisunx ipiszy chenyang78 kadeng muchulee8 amjames chauhang aakhundov coconutruben
+
+[ghstack-poisoned]
+---
+ torch/_inductor/scheduler.py | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/torch/_inductor/scheduler.py b/torch/_inductor/scheduler.py
+index 6a2a8a2b3bfa5..ba92ddb96b603 100644
+--- a/torch/_inductor/scheduler.py
++++ b/torch/_inductor/scheduler.py
+@@ -4117,9 +4117,12 @@ def fusable_weak_dep(
+         num_concurrent_reads = 0
+         for reading_node in relevant_reading_nodes:
+             relevant_reads = [
+-                read for read in reading_node.read_writes.reads if read.name == real_name
++                read
++                for read in reading_node.read_writes.reads
++                if read.name == real_name
+             ]
+-            if not relevant_reads: continue
++            if not relevant_reads:
++                continue
+             num_concurrent_reads += 1
+             if not all(
+                 isinstance(read, MemoryDep)
+@@ -4127,7 +4130,7 @@ def fusable_weak_dep(
+                 and read.index == write.index
+                 and read.size == write.size
+                 for read in relevant_reads
+-                ):
++            ):
+                 return False
+         return num_concurrent_reads <= 1
+ 
+
+From 9da88e372224bd9ab468d2b7fa216b1781762af3 Mon Sep 17 00:00:00 2001
+From: Markus Hoehnerbach <mhoehnerbach@fb.com>
+Date: Fri, 19 Sep 2025 10:52:19 -0700
+Subject: [PATCH 10/10] Update
+
+[ghstack-poisoned]
+---
+ torch/_inductor/scheduler.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/torch/_inductor/scheduler.py b/torch/_inductor/scheduler.py
+index 37d6e3122ddc2..86a8aedf5f08a 100644
+--- a/torch/_inductor/scheduler.py
++++ b/torch/_inductor/scheduler.py
+@@ -3652,7 +3652,7 @@ def create_combo_kernel_nodes(self, num_ck_nodes: Optional[int] = None) -> None:
+             num_nodes_orig,
+             len(self.nodes),
+         )
+-        self.prune_redundant_deps(nodes)
++        self.prune_redundant_deps(self.nodes)
+ 
+     def prune_redundant_deps(self, nodes: list[BaseSchedulerNode]) -> None:
+         for node in nodes:

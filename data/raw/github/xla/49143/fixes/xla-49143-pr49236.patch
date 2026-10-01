@@ -1,0 +1,199 @@
+From 57fa553b93d62914795868507eef92232c606766 Mon Sep 17 00:00:00 2001
+From: Shin <shin@yixiaoer.sg>
+Date: Tue, 22 Sep 2026 04:41:31 -0700
+Subject: [PATCH] PR #49182: Check scatter carry predicate replication before
+ all-reduce motion
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Imported from GitHub PR https://github.com/openxla/xla/pull/49182
+
+📝 Summary of Changes
+Fixes #49143.
+
+Reuse the existing generic buffer-use checker `existing is_buffer_used` and remove the weaker scatter-only helper `IsScatterBufferUsed`. Unsafe scatter patterns keep their all-reduce inside the loop.
+
+Added eight parameterized minimal-HLO regression cases that check whether the pass hoists the all-reduce or retains it inside the loop. And the tests ran on CPU host.
+
+🎯 Justification
+The scatter-specific path in `while-loop-all-reduce-code-motion` accepts a select between carry and zero without checking whether its predicate is replicated within the all-reduce group. Hoisting the collective while retaining a select such as `partition_id == 0 ? carry : 0` discards earlier contributions on nonzero partitions.
+
+🚀 Kind of Contribution
+🐛 Bug Fix, 🧪 Tests
+
+🧪 Unit Tests
+```bash
+bazel test \
+  //xla/hlo/transforms/collectives:while_loop_all_reduce_code_motion_test \
+  //xla/hlo/transforms/collectives:while_loop_all_reduce_code_motion_setup_test
+```
+
+| Tests | Before fix | After fix |
+|---|---|---|
+| Eight new regression cases | 4 passed, 4 failed | 8 passed |
+
+The four failing cases previously hoisted the collective despite a device-dependent predicate. After the fix, it remains inside the loop; the four positive controls still pass.
+
+Copybara import of the project:
+
+--
+ec48eb853b9f8d9d2f4593674bdaebaf755c6be6 by yixiaoer <shin@yixiaoer.sg>:
+
+Check scatter carry predicate replication before all-reduce motion
+
+--
+1ca2d1850777b2c63641ffa1eed5c766e069d7a6 by yixiaoer <shin@yixiaoer.sg>:
+
+Simplify scatter context condition
+
+Merging this change closes #49182
+
+COPYBARA_INTEGRATE_REVIEW=https://github.com/openxla/xla/pull/49182 from yixiaoer:fix/scatter-carry-all-reduce-motion 1ca2d1850777b2c63641ffa1eed5c766e069d7a6
+PiperOrigin-RevId: 985910358
+---
+ .../while_loop_all_reduce_code_motion.cc      | 24 +----
+ .../while_loop_all_reduce_code_motion_test.cc | 87 +++++++++++++++++++
+ 2 files changed, 91 insertions(+), 20 deletions(-)
+
+diff --git a/xla/hlo/transforms/collectives/while_loop_all_reduce_code_motion.cc b/xla/hlo/transforms/collectives/while_loop_all_reduce_code_motion.cc
+index d3c2428e7bda2..2d822b011e4ba 100644
+--- a/xla/hlo/transforms/collectives/while_loop_all_reduce_code_motion.cc
++++ b/xla/hlo/transforms/collectives/while_loop_all_reduce_code_motion.cc
+@@ -154,24 +154,6 @@ std::optional<AccumulationContext> FindScatterPattern(
+                              origin.dynamic_slice, std::nullopt};
+ }
+ 
+-bool IsScatterBufferUsed(const AccumulationContext& accumulation) {
+-  HloInstruction* buffer = accumulation.accumulation_buffer;
+-  HloInstruction* accumulation_instruction =
+-      accumulation.accumulation_instruction;
+-  for (HloInstruction* user : buffer->users()) {
+-    if (user->opcode() == HloOpcode::kGetTupleElement) continue;
+-    if (user->opcode() == HloOpcode::kSelect &&
+-        ((user->operand_index(buffer) == 1 && IsZero(user->operand(2))) ||
+-         (user->operand_index(buffer) == 2 && IsZero(user->operand(1)))))
+-      continue;
+-    if (user->opcode() == HloOpcode::kScatter &&
+-        user == accumulation_instruction)
+-      continue;
+-    return true;
+-  }
+-  return false;
+-}
+-
+ bool IsValueReplicatedWithinEachAllReduceGroup(
+     const HloInstruction& instruction, const ShapeIndex& index,
+     CollectiveOpGroupMode all_reduce_group_mode,
+@@ -795,9 +777,11 @@ MovableAllReduceContext IsAllReduceMovable(
+ 
+   if (auto scatter_context =
+           FindScatterPattern(all_reduce, while_body, get_origin_tuple_index,
+-                             get_output_tuple_index);
+-      scatter_context && !IsScatterBufferUsed(*scatter_context)) {
++                             get_output_tuple_index)) {
+     accumulation_contexts.push_back(*scatter_context);
++    if (is_buffer_used(accumulation_contexts, while_body)) {
++      return MovableAllReduceContext{};
++    }
+     return MovableAllReduceContext{true, accumulation_contexts};
+   }
+ 
+diff --git a/xla/hlo/transforms/collectives/while_loop_all_reduce_code_motion_test.cc b/xla/hlo/transforms/collectives/while_loop_all_reduce_code_motion_test.cc
+index 08eed8c5b4a76..fde57f33566e5 100644
+--- a/xla/hlo/transforms/collectives/while_loop_all_reduce_code_motion_test.cc
++++ b/xla/hlo/transforms/collectives/while_loop_all_reduce_code_motion_test.cc
+@@ -2896,6 +2896,93 @@ TEST_F(WhileLoopAllReduceCodeMotionTest, ScatterAllReduceAccumulate) {
+   VLOG(1) << transformed_while->while_body()->ToString();
+ }
+ 
++class ScatterSelectReplicationTest
++    : public WhileLoopAllReduceCodeMotionTest,
++      public ::testing::WithParamInterface<std::tuple<bool, bool, bool>> {};
++
++TEST_P(ScatterSelectReplicationTest, ChecksCarryPredicateReplication) {
++  const auto [cross_partition, replicated_predicate, swap_select_operands] =
++      GetParam();
++  constexpr absl::string_view kHloModule = R"(
++    HloModule scatter_select_replication
++
++    sum {
++      x = f32[] parameter(0)
++      y = f32[] parameter(1)
++      ROOT result = f32[] add(x, y)
++    }
++
++    condition {
++      state = (s32[], f32[4]) parameter(0)
++      iteration = s32[] get-tuple-element(state), index=0
++      limit = s32[] constant(2)
++      ROOT result = pred[] compare(iteration, limit), direction=LT
++    }
++
++    body {
++      state = (s32[], f32[4]) parameter(0)
++      iteration = s32[] get-tuple-element(state), index=0
++      carry = f32[4] get-tuple-element(state), index=1
++      id = u32[] $0()
++      zero_id = u32[] constant(0)
++      $1
++      predicate = pred[4] broadcast(predicate_scalar), dimensions={}
++      zero_scalar = f32[] constant(0)
++      zero = f32[4] broadcast(zero_scalar), dimensions={}
++      base = f32[4] select(predicate, $2, $3)
++      indices = s32[1] constant({0})
++      updates = f32[1] constant({1})
++      scatter = f32[4] scatter(base, indices, updates),
++          update_window_dims={}, inserted_window_dims={0},
++          scatter_dims_to_operand_dims={0}, index_vector_dim=1, to_apply=sum
++      reduced = f32[4] all-reduce(scatter), $4
++          replica_groups={{0,1,2,3}}, to_apply=sum
++      one = s32[] constant(1)
++      next_iteration = s32[] add(iteration, one)
++      ROOT result = (s32[], f32[4]) tuple(next_iteration, reduced)
++    }
++
++    ENTRY main {
++      iteration = s32[] constant(0)
++      zero_scalar = f32[] constant(0)
++      carry = f32[4] broadcast(zero_scalar), dimensions={}
++      initial = (s32[], f32[4]) tuple(iteration, carry)
++      ROOT loop = (s32[], f32[4]) while(initial), condition=condition, body=body
++    }
++  )";
++  std::string hlo = absl::Substitute(
++      kHloModule, cross_partition ? "partition-id" : "replica-id",
++      replicated_predicate
++          ? (swap_select_operands ? "predicate_scalar = pred[] constant(true)"
++                                  : "predicate_scalar = pred[] constant(false)")
++          : "predicate_scalar = pred[] compare(id, zero_id), direction=EQ",
++      swap_select_operands ? "zero" : "carry",
++      swap_select_operands ? "carry" : "zero",
++      cross_partition ? "channel_id=1, use_global_device_ids=true," : "");
++  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
++                       ParseAndReturnVerifiedModule(
++                           hlo, /*replica_count=*/cross_partition ? 1 : 4,
++                           /*num_partitions=*/cross_partition ? 4 : 1));
++  module->mutable_config().set_use_spmd_partitioning(cross_partition);
++  // A device-dependent select cannot be retained when the all-reduce moves
++  // outside the loop: it would discard earlier local contributions. The
++  // replicated cases reset all devices together and remain eligible.
++  ASSERT_OK_AND_ASSIGN(bool changed,
++                       WhileLoopAllReduceCodeMotion{}.Run(module.get()));
++  EXPECT_EQ(changed, replicated_predicate);
++  ASSERT_OK(HloVerifier(false, true).Run(module.get()).status());
++  HloInstruction* loop =
++      find_op<HloOpcode::kWhile>(module->entry_computation());
++  EXPECT_EQ(absl::c_count_if(loop->while_body()->instructions(),
++                             HloPredicateIsOp<HloOpcode::kAllReduce>),
++            replicated_predicate ? 0 : 1);
++}
++
++INSTANTIATE_TEST_SUITE_P(All, ScatterSelectReplicationTest,
++                         ::testing::Combine(::testing::Bool(),
++                                            ::testing::Bool(),
++                                            ::testing::Bool()));
++
+ TEST_F(WhileLoopAllReduceCodeMotionTest, ScatterAllReduceWithSelectAndConvert) {
+   constexpr absl::string_view kHloModule = R"(
+     HloModule scatter_select_all_reduce

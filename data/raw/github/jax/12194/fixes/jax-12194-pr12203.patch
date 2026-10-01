@@ -1,0 +1,76 @@
+From e1410bd16bc6e9d31900c0a588e7b9d4454beb05 Mon Sep 17 00:00:00 2001
+From: Sharad Vikram <sharad.vikram@gmail.com>
+Date: Thu, 1 Sep 2022 15:27:27 -0700
+Subject: [PATCH] Use lowering as impl rule for `pure_callback`
+
+---
+ jax/_src/callback.py          |  8 ++++++--
+ tests/python_callback_test.py | 11 +++++++++++
+ 2 files changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/jax/_src/callback.py b/jax/_src/callback.py
+index 955ad776bde2..ced20d119da5 100644
+--- a/jax/_src/callback.py
++++ b/jax/_src/callback.py
+@@ -14,6 +14,8 @@
+ """Module for JAX callbacks."""
+ from __future__ import annotations
+ 
++import functools
++
+ from typing import Any, Callable, Sequence
+ 
+ from jax import core
+@@ -21,6 +23,7 @@
+ from jax._src import dtypes
+ from jax._src import lib as jaxlib
+ from jax._src import util
++from jax._src import dispatch
+ from jax.interpreters import ad
+ from jax.interpreters import batching
+ from jax.interpreters import mlir
+@@ -33,11 +36,12 @@
+ map, unsafe_map = util.safe_map, map
+ 
+ 
+-@pure_callback_p.def_impl
+ def pure_callback_impl(*args, result_avals, callback: Callable[..., Any],
+                        vectorized: bool):
+   del vectorized, result_avals
+   return callback(*args)
++pure_callback_p.def_impl(functools.partial(dispatch.apply_primitive,
++                                           pure_callback_p))
+ 
+ 
+ @pure_callback_p.def_abstract_eval
+@@ -102,7 +106,7 @@ def pure_callback_lowering(ctx, *args, callback, **params):
+                               "Please upgrade to a jaxlib >= 0.3.15.")
+ 
+   def _callback(*flat_args):
+-    return tuple(pure_callback_p.impl(*flat_args, callback=callback, **params))
++    return tuple(pure_callback_impl(*flat_args, callback=callback, **params))
+ 
+   result, _, keepalive = mlir.emit_python_callback(
+       ctx, _callback, None, list(args), ctx.avals_in, ctx.avals_out, False,
+diff --git a/tests/python_callback_test.py b/tests/python_callback_test.py
+index 2afad9058940..7f88d8912182 100644
+--- a/tests/python_callback_test.py
++++ b/tests/python_callback_test.py
+@@ -469,6 +469,17 @@ def tearDown(self):
+     super().tearDown()
+     dispatch.runtime_tokens.clear()
+ 
++  @jtu.skip_on_devices(*disabled_backends)
++  def test_pure_callback_passes_ndarrays_without_jit(self):
++
++    def cb(x):
++      self.assertIs(type(x), np.ndarray)
++      return x
++
++    def f(x):
++      return jax.pure_callback(cb, x, x)
++    f(jnp.array(2.))
++
+   @jtu.skip_on_devices(*disabled_backends)
+   def test_simple_pure_callback(self):
+ 

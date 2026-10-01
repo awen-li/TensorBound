@@ -1,0 +1,184 @@
+From 5e6deb1bc8fcee34f5427b0c01d56f6502cd8eb3 Mon Sep 17 00:00:00 2001
+From: Eugene Zhulenev <ezhulenev@google.com>
+Date: Mon, 26 Jun 2023 18:01:21 -0700
+Subject: [PATCH 1/4] [HAL] Fix a bug in buffer_view.buffer folder
+
+---
+ .../iree/compiler/Dialect/HAL/IR/HALOpFolders.cpp   | 13 ++++++++++---
+ 1 file changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/Dialect/HAL/IR/HALOpFolders.cpp b/compiler/src/iree/compiler/Dialect/HAL/IR/HALOpFolders.cpp
+index 0ae6e5806761..a55eef63f433 100644
+--- a/compiler/src/iree/compiler/Dialect/HAL/IR/HALOpFolders.cpp
++++ b/compiler/src/iree/compiler/Dialect/HAL/IR/HALOpFolders.cpp
+@@ -165,17 +165,24 @@ void BufferViewCreateOp::getCanonicalizationPatterns(RewritePatternSet &results,
+ namespace {
+ 
+ /// Skips a hal.buffer_view.buffer accessor when the buffer view was created in
+-/// the same scope and we know the origin buffer.
++/// the same scope at zero offset and we know the origin buffer.
+ struct SkipBufferViewBufferOp : public OpRewritePattern<BufferViewBufferOp> {
+   using OpRewritePattern<BufferViewBufferOp>::OpRewritePattern;
+ 
+   LogicalResult matchAndRewrite(BufferViewBufferOp op,
+                                 PatternRewriter &rewriter) const override {
+-    if (auto createOp = dyn_cast_or_null<BufferViewCreateOp>(
+-            op.getBufferView().getDefiningOp())) {
++    auto createOp = dyn_cast_or_null<BufferViewCreateOp>(
++        op.getBufferView().getDefiningOp());
++    if (!createOp)
++      return failure();
++
++    APInt offset;
++    if (matchPattern(createOp.getSourceOffset(), m_ConstantInt(&offset)) &&
++        offset.isZero()) {
+       rewriter.replaceOp(op, createOp.getSourceBuffer());
+       return success();
+     }
++
+     return failure();
+   }
+ };
+
+From 1570c5456f4634aff3163b9a8fd0eaf3ac81bd71 Mon Sep 17 00:00:00 2001
+From: Eugene Zhulenev <ezhulenev@google.com>
+Date: Tue, 27 Jun 2023 12:15:34 -0700
+Subject: [PATCH 2/4] Use m_Zero matcher and add a test
+
+---
+ .../compiler/Dialect/HAL/IR/HALOpFolders.cpp   |  4 +---
+ .../HAL/IR/test/buffer_view_folding.mlir       | 18 ++++++++++++++++++
+ 2 files changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/Dialect/HAL/IR/HALOpFolders.cpp b/compiler/src/iree/compiler/Dialect/HAL/IR/HALOpFolders.cpp
+index a55eef63f433..cdb9ce32f841 100644
+--- a/compiler/src/iree/compiler/Dialect/HAL/IR/HALOpFolders.cpp
++++ b/compiler/src/iree/compiler/Dialect/HAL/IR/HALOpFolders.cpp
+@@ -176,9 +176,7 @@ struct SkipBufferViewBufferOp : public OpRewritePattern<BufferViewBufferOp> {
+     if (!createOp)
+       return failure();
+ 
+-    APInt offset;
+-    if (matchPattern(createOp.getSourceOffset(), m_ConstantInt(&offset)) &&
+-        offset.isZero()) {
++    if (matchPattern(createOp.getSourceOffset(), m_Zero())) {
+       rewriter.replaceOp(op, createOp.getSourceBuffer());
+       return success();
+     }
+diff --git a/compiler/src/iree/compiler/Dialect/HAL/IR/test/buffer_view_folding.mlir b/compiler/src/iree/compiler/Dialect/HAL/IR/test/buffer_view_folding.mlir
+index 106ede5f82e5..266b0ecececa 100644
+--- a/compiler/src/iree/compiler/Dialect/HAL/IR/test/buffer_view_folding.mlir
++++ b/compiler/src/iree/compiler/Dialect/HAL/IR/test/buffer_view_folding.mlir
+@@ -39,3 +39,21 @@ func.func @SkipBufferViewBufferOp(%buffer : !hal.buffer) -> !hal.buffer {
+   // CHECK: return %[[BUFFER]]
+   return %view_buffer : !hal.buffer
+ }
++
++// -----
++
++// CHECK-LABEL: func.func @DoNotSkipBufferViewBufferOp
++func.func @DoNotSkipBufferViewBufferOp(%buffer : !hal.buffer) -> !hal.buffer {
++  %c1 = arith.constant 1 : i32
++  %c10 = arith.constant 10 : index
++  %c11 = arith.constant 11 : index
++  %c32 = arith.constant 32 : i32
++  %view = hal.buffer_view.create buffer(%buffer : !hal.buffer)[%c1, %c10]
++                                 shape([%c10, %c11])
++                                 type(%c32)
++                                 encoding(%c1) : !hal.buffer_view
++  // CHECK: %[[BUFFER:.+]] = hal.buffer_view.buffer
++  %view_buffer = hal.buffer_view.buffer<%view : !hal.buffer_view> : !hal.buffer
++  // CHECK: return %[[BUFFER]]
++  return %view_buffer : !hal.buffer
++}
+
+From ce677c97d38c33f1e077871d817b3e20dda72f3d Mon Sep 17 00:00:00 2001
+From: Eugene Zhulenev <ezhulenev@google.com>
+Date: Tue, 27 Jun 2023 12:24:20 -0700
+Subject: [PATCH 3/4] Fix test
+
+---
+ .../Dialect/HAL/IR/test/buffer_view_folding.mlir      | 11 ++++++-----
+ 1 file changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/Dialect/HAL/IR/test/buffer_view_folding.mlir b/compiler/src/iree/compiler/Dialect/HAL/IR/test/buffer_view_folding.mlir
+index 266b0ecececa..ddf872600965 100644
+--- a/compiler/src/iree/compiler/Dialect/HAL/IR/test/buffer_view_folding.mlir
++++ b/compiler/src/iree/compiler/Dialect/HAL/IR/test/buffer_view_folding.mlir
+@@ -26,15 +26,15 @@ func.func @FoldBufferViewCreateSubspan(%base_buffer: !hal.buffer, %subspan_offse
+ // CHECK-LABEL: func.func @SkipBufferViewBufferOp
+ // CHECK-SAME: %[[BUFFER:.+]]: !hal.buffer
+ func.func @SkipBufferViewBufferOp(%buffer : !hal.buffer) -> !hal.buffer {
++  %encoding = arith.constant 1 : i32
+   %c0 = arith.constant 0 : index
+-  %c1 = arith.constant 1 : i32
+   %c10 = arith.constant 10 : index
+   %c11 = arith.constant 11 : index
+   %c32 = arith.constant 32 : i32
+   %view = hal.buffer_view.create buffer(%buffer : !hal.buffer)[%c0, %c10]
+                                  shape([%c10, %c11])
+                                  type(%c32)
+-                                 encoding(%c1) : !hal.buffer_view
++                                 encoding(%encoding) : !hal.buffer_view
+   %view_buffer = hal.buffer_view.buffer<%view : !hal.buffer_view> : !hal.buffer
+   // CHECK: return %[[BUFFER]]
+   return %view_buffer : !hal.buffer
+@@ -44,14 +44,15 @@ func.func @SkipBufferViewBufferOp(%buffer : !hal.buffer) -> !hal.buffer {
+ 
+ // CHECK-LABEL: func.func @DoNotSkipBufferViewBufferOp
+ func.func @DoNotSkipBufferViewBufferOp(%buffer : !hal.buffer) -> !hal.buffer {
+-  %c1 = arith.constant 1 : i32
++  %encoding = arith.constant 1 : i32
++  %c5 = arith.constant 5 : index
+   %c10 = arith.constant 10 : index
+   %c11 = arith.constant 11 : index
+   %c32 = arith.constant 32 : i32
+-  %view = hal.buffer_view.create buffer(%buffer : !hal.buffer)[%c1, %c10]
++  %view = hal.buffer_view.create buffer(%buffer : !hal.buffer)[%c5, %c10]
+                                  shape([%c10, %c11])
+                                  type(%c32)
+-                                 encoding(%c1) : !hal.buffer_view
++                                 encoding(%encoding) : !hal.buffer_view
+   // CHECK: %[[BUFFER:.+]] = hal.buffer_view.buffer
+   %view_buffer = hal.buffer_view.buffer<%view : !hal.buffer_view> : !hal.buffer
+   // CHECK: return %[[BUFFER]]
+
+From 143ac5841f990348c6200a63e825b7cfd41a6718 Mon Sep 17 00:00:00 2001
+From: Eugene Zhulenev <ezhulenev@google.com>
+Date: Tue, 27 Jun 2023 12:24:49 -0700
+Subject: [PATCH 4/4] Fix test
+
+---
+ .../compiler/Dialect/HAL/IR/test/buffer_view_folding.mlir     | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/Dialect/HAL/IR/test/buffer_view_folding.mlir b/compiler/src/iree/compiler/Dialect/HAL/IR/test/buffer_view_folding.mlir
+index ddf872600965..4052725c82d9 100644
+--- a/compiler/src/iree/compiler/Dialect/HAL/IR/test/buffer_view_folding.mlir
++++ b/compiler/src/iree/compiler/Dialect/HAL/IR/test/buffer_view_folding.mlir
+@@ -26,11 +26,11 @@ func.func @FoldBufferViewCreateSubspan(%base_buffer: !hal.buffer, %subspan_offse
+ // CHECK-LABEL: func.func @SkipBufferViewBufferOp
+ // CHECK-SAME: %[[BUFFER:.+]]: !hal.buffer
+ func.func @SkipBufferViewBufferOp(%buffer : !hal.buffer) -> !hal.buffer {
+-  %encoding = arith.constant 1 : i32
+   %c0 = arith.constant 0 : index
+   %c10 = arith.constant 10 : index
+   %c11 = arith.constant 11 : index
+   %c32 = arith.constant 32 : i32
++  %encoding = arith.constant 1 : i32
+   %view = hal.buffer_view.create buffer(%buffer : !hal.buffer)[%c0, %c10]
+                                  shape([%c10, %c11])
+                                  type(%c32)
+@@ -44,11 +44,11 @@ func.func @SkipBufferViewBufferOp(%buffer : !hal.buffer) -> !hal.buffer {
+ 
+ // CHECK-LABEL: func.func @DoNotSkipBufferViewBufferOp
+ func.func @DoNotSkipBufferViewBufferOp(%buffer : !hal.buffer) -> !hal.buffer {
+-  %encoding = arith.constant 1 : i32
+   %c5 = arith.constant 5 : index
+   %c10 = arith.constant 10 : index
+   %c11 = arith.constant 11 : index
+   %c32 = arith.constant 32 : i32
++  %encoding = arith.constant 1 : i32
+   %view = hal.buffer_view.create buffer(%buffer : !hal.buffer)[%c5, %c10]
+                                  shape([%c10, %c11])
+                                  type(%c32)

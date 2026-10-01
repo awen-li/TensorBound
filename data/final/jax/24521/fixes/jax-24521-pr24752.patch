@@ -1,0 +1,458 @@
+From 0bb30f07778923420aaaa470b3094e728adcd693 Mon Sep 17 00:00:00 2001
+From: Yash Katariya <yashkatariya@google.com>
+Date: Thu, 7 Nov 2024 15:50:32 -0800
+Subject: [PATCH] Propagate CopySemantics from python to C++ transfer APIs so
+ that device_put works correctly in presence of copy/donate options that user
+ specified.
+
+This change only supports pinned_host -> pinned_host copies on the same device. HBM -> HBM copies don't work yet and donation also doesn't work in PJRT.
+
+This CL also sets up the plumbing from JAX to PJRT so that in the future support for missing features can be added easily.
+
+Fixes https://github.com/jax-ml/jax/issues/24521
+
+PiperOrigin-RevId: 694274616
+---
+ jax/_src/api.py                    |  2 +-
+ jax/_src/array.py                  | 23 +++++++----
+ jax/_src/dispatch.py               | 19 ++++++---
+ jax/_src/earray.py                 |  4 +-
+ jax/_src/interpreters/pxla.py      | 63 +++++++++++++++++++++---------
+ jax/_src/lax/control_flow/loops.py |  2 +-
+ jax/_src/prng.py                   |  5 ++-
+ tests/lax_test.py                  |  2 +-
+ tests/memories_test.py             | 29 ++++++++++++++
+ tests/pmap_test.py                 |  2 +-
+ 10 files changed, 112 insertions(+), 39 deletions(-)
+
+diff --git a/jax/_src/api.py b/jax/_src/api.py
+index a902c7de4c3e..2ae64b39b44a 100644
+--- a/jax/_src/api.py
++++ b/jax/_src/api.py
+@@ -1599,7 +1599,7 @@ def cache_miss(*args, **kwargs):
+ 
+   cpp_mapped_f = pmap_lib.pmap(
+       fun, cache_miss, static_broadcasted_tuple,
+-      lambda x, s: pxla.shard_args([s], [None], [x])[0],
++      lambda x, s: pxla.shard_args([s], [None], [None], [x])[0],
+       pytree_registry=tree_util.default_registry)
+   _pmap_cache_clears.add(cpp_mapped_f)
+ 
+diff --git a/jax/_src/array.py b/jax/_src/array.py
+index 30fedf4cff50..515fc2c7c7e6 100644
+--- a/jax/_src/array.py
++++ b/jax/_src/array.py
+@@ -40,6 +40,7 @@
+ from jax._src.layout import AutoLayout, DeviceLocalLayout, Layout
+ from jax._src.lib import xla_client as xc
+ from jax._src.lib import xla_extension as xe
++from jax._src.lib import xla_extension_version
+ from jax._src.sharding import Sharding
+ from jax._src.sharding_impls import (
+     PmapSharding, SingleDeviceSharding, NamedSharding,
+@@ -1110,7 +1111,7 @@ def shard_sharded_device_array_slow_path(x, devices, indices, sharding):
+     # Look up all buffers that contain the correct slice of the logical array.
+     candidates_list = candidates[hashed_index(idx)]
+     if not candidates_list:
+-      return pxla.shard_args([sharding], [None], [x._value],
++      return pxla.shard_args([sharding], [None], [None], [x._value],
+                              canonicalize=False)[0]
+     # Try to find a candidate buffer already on the correct device,
+     # otherwise copy one of them.
+@@ -1130,11 +1131,13 @@ def _sharding_indices_and_eq(src_sharding, shape, dst_sharding):
+   return dst_indices, tuple(src_indices) == tuple(dst_indices)
+ 
+ 
+-def _array_shard_arg(xs, shardings, layouts):
++def _array_shard_arg(xs, shardings, layouts, copy_semantics):
+   results = []
+   batch_xs, batch_devs, batch_shardings, batch_indices = [], [], [], []
++  batch_cs = []
+ 
+-  for i, (x, sharding, layout) in enumerate(safe_zip(xs, shardings, layouts)):
++  for i, (x, sharding, layout, cs) in enumerate(
++      safe_zip(xs, shardings, layouts, copy_semantics)):
+     x._check_if_deleted()
+     indices, same_indices = _sharding_indices_and_eq(x.sharding, x.shape, sharding)
+     same_layout = (True if layout is None else
+@@ -1156,6 +1159,7 @@ def _array_shard_arg(xs, shardings, layouts):
+         batch_devs.append(list(devices))
+         batch_shardings.append(sharding)
+         batch_indices.append(i)
++        batch_cs.append(cs)
+       # Resharding starts here:
+       elif not same_layout:
+         results.append(api.device_put(x, Layout(layout, sharding)))
+@@ -1165,8 +1169,12 @@ def _array_shard_arg(xs, shardings, layouts):
+         results.append(
+             shard_sharded_device_array_slow_path(x, devices, indices, sharding))
+ 
+-  copy_outs = xc.batched_copy_array_to_devices_with_sharding(
+-      batch_xs, batch_devs, batch_shardings)
++  if xla_extension_version >= 296:
++    copy_outs = xc.batched_copy_array_to_devices_with_sharding(
++        batch_xs, batch_devs, batch_shardings, batch_cs)
++  else:
++    copy_outs = xc.batched_copy_array_to_devices_with_sharding(  # type: ignore
++        batch_xs, batch_devs, batch_shardings)
+   for i, copy_out in safe_zip(batch_indices, copy_outs):
+     assert results[i] is None
+     results[i] = copy_out
+@@ -1200,8 +1208,9 @@ def _array_local_result_handler(aval, sharding, indices):
+ 
+ # Token handlers
+ 
+-def _token_shard_arg(xs, shardings, layouts):
+-  return _array_shard_arg([x._buf for x in xs], shardings, layouts)
++def _token_shard_arg(xs, shardings, layouts, copy_semantics):
++  return _array_shard_arg([x._buf for x in xs], shardings, layouts,
++                          copy_semantics)
+ pxla.shard_arg_handlers[core.Token] = _token_shard_arg
+ 
+ 
+diff --git a/jax/_src/dispatch.py b/jax/_src/dispatch.py
+index b0b390773512..8d53742bc7cf 100644
+--- a/jax/_src/dispatch.py
++++ b/jax/_src/dispatch.py
+@@ -137,7 +137,7 @@ def get_token_input(
+     # We only use replicated sharding for the first time when the token for the
+     # order effect hasn't been created.
+     s = jax.sharding.GSPMDSharding.get_replicated(devices)
+-    sharded_tok = core.Token(pxla.shard_args([s], [None], [tok])[0])
++    sharded_tok = core.Token(pxla.shard_args([s], [None], [None], [tok])[0])
+     self.current_tokens[eff] = sharded_tok
+     return sharded_tok
+ 
+@@ -391,6 +391,7 @@ class _DeferredShardArg:
+   s: Sharding
+   aval: core.AbstractValue
+   committed: bool
++  copy_semantics: CopySemantics
+ 
+   @property
+   def result_handler(self):
+@@ -435,7 +436,7 @@ def _device_put_sharding_impl(x, aval, device, copy):
+           "device_put's second argument must be a Device or a Sharding which"
+           f" represents addressable devices, but got {s}. Please pass device or"
+           " Sharding which represents addressable devices.")
+-    return _DeferredShardArg(x, s, aval, True)
++    return _DeferredShardArg(x, s, aval, True, copy)
+ 
+   # Only `Device` exists below. `Sharding` instance is handled above.
+   if isinstance(x, array.ArrayImpl):
+@@ -443,8 +444,11 @@ def _device_put_sharding_impl(x, aval, device, copy):
+       raise ValueError(
+           "device_put's first argument must be a fully addressable array, but "
+           f"got value with devices {x.devices()}")
+-    if device is None and copy == CopySemantics.ALIAS:
+-      return x
++    if device is None:
++      if copy == CopySemantics.ALIAS:
++        return x
++      else:
++        return _DeferredShardArg(x, x.sharding, aval, x.committed, copy)
+     elif is_single_device_sharding(x.sharding):
+       device = x.sharding._device_assignment[0] if device is None else device
+       return pxla.batched_device_put(aval, SingleDeviceSharding(device), [x],
+@@ -452,7 +456,7 @@ def _device_put_sharding_impl(x, aval, device, copy):
+ 
+   sh = SingleDeviceSharding(pxla._get_default_device()
+                             if device is None else device)
+-  return _DeferredShardArg(x, sh, aval, device is not None)
++  return _DeferredShardArg(x, sh, aval, device is not None, copy)
+ 
+ 
+ def _device_put_impl(
+@@ -501,12 +505,14 @@ def _batched_device_put_impl(
+     copy_semantics: Sequence[CopySemantics]):
+   ys = []
+   shard_arg_indices, shard_arg_xs, shard_arg_shardings = [], [], []
++  shard_arg_copy_semantics = []
+   for i, (x, device, src, cp) in enumerate(zip(xs, devices, srcs, copy_semantics)):
+     y = _device_put_impl(x, device=device, src=src, copy=cp)
+     if isinstance(y, _DeferredShardArg):
+       shard_arg_indices.append(i)
+       shard_arg_xs.append(y.x)
+       shard_arg_shardings.append(y.s)
++      shard_arg_copy_semantics.append(y.copy_semantics)
+     ys.append(y)
+ 
+   if shard_arg_xs:
+@@ -515,7 +521,8 @@ def _batched_device_put_impl(
+     # device_put handles `Layout` via a different path, so just pass `None` as
+     # the layout here.
+     shard_arg_results = pxla.shard_args(
+-        shard_arg_shardings, [None] * len(shard_arg_xs), shard_arg_xs)
++        shard_arg_shardings, [None] * len(shard_arg_xs),
++        shard_arg_copy_semantics, shard_arg_xs)
+     for i, shard_arg_result in zip(shard_arg_indices, shard_arg_results):
+       assert isinstance(ys[i], _DeferredShardArg)
+       ys[i] = ys[i].result_handler(shard_arg_result)
+diff --git a/jax/_src/earray.py b/jax/_src/earray.py
+index 4be10e733c0d..7bade8171078 100644
+--- a/jax/_src/earray.py
++++ b/jax/_src/earray.py
+@@ -108,12 +108,12 @@ def global_shards(self):
+ 
+ # TODO(mattjj): _set_array_base_attributes
+ 
+-def _earray_shard_arg_handler(xs, shardings, layouts):
++def _earray_shard_arg_handler(xs, shardings, layouts, copy_semantics):
+   arrs = [x._data for x in xs]
+   phys_shardings = [sharding_impls.physical_sharding(x.aval, sharding)
+                     for x, sharding in zip(xs, shardings)]
+   # TODO(yashkatariya): `layouts` should be converted to physical layouts.
+-  return pxla.shard_args(phys_shardings, layouts, arrs)
++  return pxla.shard_args(phys_shardings, layouts, copy_semantics, arrs)
+ pxla.shard_arg_handlers[EArray] = _earray_shard_arg_handler
+ 
+ api_util._shaped_abstractify_handlers[EArray] = lambda self: self.aval
+diff --git a/jax/_src/interpreters/pxla.py b/jax/_src/interpreters/pxla.py
+index 04d479fb757c..c83d3e3a4804 100644
+--- a/jax/_src/interpreters/pxla.py
++++ b/jax/_src/interpreters/pxla.py
+@@ -61,6 +61,7 @@
+ from jax._src.interpreters import xla
+ from jax._src.layout import DeviceLocalLayout, AutoLayout, Layout
+ from jax._src.lib import xla_client as xc
++from jax._src.lib import xla_extension_version
+ from jax._src.lib.mlir import ir
+ from jax._src.lib.mlir.dialects import hlo
+ from jax._src.partition_spec import PartitionSpec
+@@ -105,21 +106,44 @@ class WeakRefList(list):
+ 
+ ### util
+ 
++
++def to_xc_copy_semantics(copy_semantics):
++  if xla_extension_version < 296:
++    return [None] * len(copy_semantics)
++  out = []
++  for cs in copy_semantics:
++    if cs is None or cs == dispatch.CopySemantics.ALIAS:
++      out.append(xc.ArrayCopySemantics.REUSE_INPUT)
++    elif cs == dispatch.CopySemantics.COPY:
++      out.append(xc.ArrayCopySemantics.ALWAYS_COPY)
++    elif cs == dispatch.CopySemantics.DONATE:
++      out.append(xc.ArrayCopySemantics.DONATE_INPUT)
++    else:
++      assert isinstance(cs, xc.ArrayCopySemantics)
++      out.append(cs)
++  return out
++
++
+ def identity(x): return x
+ 
+ @profiler.annotate_function
+-def shard_args(shardings: Sequence[JSharding], layouts, args,
+-               canonicalize=True) -> Sequence[xc.ArrayImpl]:
++def shard_args(shardings: Sequence[JSharding], layouts, copy_semantics,
++               args, canonicalize=True) -> Sequence[xc.ArrayImpl]:
++  xc_copy_semantics = to_xc_copy_semantics(copy_semantics)
++  del copy_semantics
+   # Fast path for one argument.
+   if len(args) == 1:
+     arg = args[0]
+     if canonicalize:
+       arg = xla.canonicalize_dtype(arg)
+-    return shard_arg_handlers[type(arg)]([arg], shardings, layouts)
+-
+-  # type(arg) -> (list[indices], list[args], list[shardings])
+-  batches = collections.defaultdict(lambda: ([], [], [], []))  # type: ignore
+-  for i, (arg, sharding, layout) in enumerate(safe_zip(args, shardings, layouts)):
++    return shard_arg_handlers[type(arg)]([arg], shardings, layouts,
++                                         xc_copy_semantics)
++
++  # type(arg) -> (list[indices], list[args], list[shardings], list[layouts],
++  #               list[copy_semantics])
++  batches = collections.defaultdict(lambda: ([], [], [], [], []))  # type: ignore
++  for i, (arg, sharding, layout, cs) in enumerate(
++      safe_zip(args, shardings, layouts, xc_copy_semantics)):
+     if canonicalize:
+       arg = xla.canonicalize_dtype(arg)
+     batch = batches[type(arg)]
+@@ -127,14 +151,15 @@ def shard_args(shardings: Sequence[JSharding], layouts, args,
+     batch[1].append(arg)
+     batch[2].append(sharding)
+     batch[3].append(layout)
++    batch[4].append(cs)
+ 
+   # Call `shard_arg_handlers` per batch and build a flat list of arrays returned
+   # from each call in the same order as `args`. Since `batches` is grouped by
+   # types, we cannot simply flatten the results and we have to use the original
+   # indices to put each array back to its original position.
+   results: list[jax.Array | None] = [None] * len(args)
+-  for t, (indices, a, s, l) in batches.items():
+-    outs = shard_arg_handlers[t](a, s, l)
++  for t, (indices, a, s, l, cs) in batches.items():
++    outs = shard_arg_handlers[t](a, s, l, cs)
+     for i, out in safe_zip(indices, outs):
+       results[i] = out
+   assert all(result is not None for result in results)
+@@ -142,7 +167,8 @@ def shard_args(shardings: Sequence[JSharding], layouts, args,
+ 
+ 
+ shard_arg_handlers: dict[
+-    Any, Callable[[Sequence[Any], Sequence[Any], Sequence[Any]], Sequence[Any]]
++    Any, Callable[[Sequence[Any], Sequence[Any], Sequence[Any], Sequence[Any]],
++                  Sequence[Any]]
+ ] = {}
+ 
+ 
+@@ -172,12 +198,12 @@ def is_default_layout(curr_layout, sharding, aval):
+       raise
+ 
+ 
+-def _masked_array_error(xs, shardings, layouts):
++def _masked_array_error(xs, shardings, layouts, copy_semantics):
+   raise ValueError("numpy masked arrays are not supported as direct inputs to JAX functions. "
+                    "Use arr.filled() to convert the value to a standard numpy array.")
+ shard_arg_handlers[np.ma.MaskedArray] = _masked_array_error
+ 
+-def _shard_np_array(xs, shardings, layouts):
++def _shard_np_array(xs, shardings, layouts, copy_semantics):
+   results = []
+   for x, sharding, layout in safe_zip(xs, shardings, layouts):
+     devices = sharding._addressable_device_assignment
+@@ -197,12 +223,12 @@ def _shard_np_array(xs, shardings, layouts):
+ for _t in array_types:
+   shard_arg_handlers[_t] = _shard_np_array
+ 
+-def _shard_darray(xs, shardings, layouts):
+-  return shard_args(shardings, layouts, [x._data for x in xs])
++def _shard_darray(xs, shardings, layouts, copy_semantics):
++  return shard_args(shardings, layouts, copy_semantics, [x._data for x in xs])
+ shard_arg_handlers[core.DArray] = _shard_darray
+ 
+-def _shard_mutable_array(xs, shardings, layouts):
+-  return shard_args(shardings, layouts, [x._buf for x in xs])
++def _shard_mutable_array(xs, shardings, layouts, copy_semantics):
++  return shard_args(shardings, layouts, copy_semantics, [x._buf for x in xs])
+ shard_arg_handlers[core.MutableArray] = _shard_mutable_array
+ 
+ def batched_device_put(aval: core.ShapedArray,
+@@ -1135,7 +1161,8 @@ class InputsHandler:
+ 
+   def __init__(self, in_shardings, in_layouts, local_devices=None,
+                input_indices=None):
+-    self.handler = partial(shard_args, in_shardings, in_layouts)
++    self.handler = partial(shard_args, in_shardings, in_layouts,
++                           [None] * len(in_shardings))
+     self.in_shardings = in_shardings
+     self.in_layouts = in_layouts
+     self.local_devices = local_devices
+@@ -3047,7 +3074,7 @@ def aot_cache_miss(*args, **kwargs):
+         JitGlobalCppCacheKeys(), tree_util.dispatch_registry, cc_shard_arg)
+ 
+ def cc_shard_arg(x, sharding, layout):
+-  return shard_args([sharding], [layout], [x])[0]
++  return shard_args([sharding], [layout], [None], [x])[0]
+ 
+ 
+ def check_arg_avals_for_call(ref_avals, arg_avals,
+diff --git a/jax/_src/lax/control_flow/loops.py b/jax/_src/lax/control_flow/loops.py
+index 19d3429d2675..b5bb8658e675 100644
+--- a/jax/_src/lax/control_flow/loops.py
++++ b/jax/_src/lax/control_flow/loops.py
+@@ -704,7 +704,7 @@ def _maybe_put(x):
+     aval = shaped_abstractify(x)
+     s = sharding.SingleDeviceSharding(xb.local_devices(backend='cpu')[0])
+     result_handler = pxla.global_aval_to_result_handler(aval, s, False)
+-    return result_handler(pxla.shard_args([s], [None], [x]))
++    return result_handler(pxla.shard_args([s], [None], [None], [x]))
+   else:
+     return x
+ 
+diff --git a/jax/_src/prng.py b/jax/_src/prng.py
+index 8925a4342b29..1a5ceab5d984 100644
+--- a/jax/_src/prng.py
++++ b/jax/_src/prng.py
+@@ -468,12 +468,13 @@ def __hash__(self) -> int:
+ xla.canonicalize_dtype_handlers[PRNGKeyArray] = lambda x: x
+ 
+ 
+-def key_array_shard_arg_handler(xs: Sequence[PRNGKeyArray], shardings, layouts):
++def key_array_shard_arg_handler(xs: Sequence[PRNGKeyArray], shardings, layouts,
++                                copy_semantics):
+   arrs = [x._base_array for x in xs]
+   phys_shardings = [physical_sharding(x.aval, sharding)
+                     for x, sharding in zip(xs, shardings)]
+   # TODO(yashkatariya): `layouts` should be converted to physical layouts.
+-  return pxla.shard_args(phys_shardings, layouts, arrs)
++  return pxla.shard_args(phys_shardings, layouts, copy_semantics, arrs)
+ 
+ 
+ pxla.shard_arg_handlers[PRNGKeyArray] = key_array_shard_arg_handler
+diff --git a/tests/lax_test.py b/tests/lax_test.py
+index 12149700cb30..ab1557450864 100644
+--- a/tests/lax_test.py
++++ b/tests/lax_test.py
+@@ -3817,7 +3817,7 @@ def __repr__(self) -> str:
+   size = property(lambda self: self.data.size // 2)
+   ndim = property(lambda self: self.data.ndim - 1)
+ 
+-def shard_foo_array_handler(xs, shardings, layouts):
++def shard_foo_array_handler(xs, shardings, layouts, copy_semantics):
+   results = []
+   for x, sharding in safe_zip(xs, shardings):
+     device, = sharding._addressable_device_assignment
+diff --git a/tests/memories_test.py b/tests/memories_test.py
+index 5f0ab04612e2..337b1c24d835 100644
+--- a/tests/memories_test.py
++++ b/tests/memories_test.py
+@@ -25,6 +25,7 @@
+ from jax import lax
+ from jax._src import test_util as jtu
+ from jax._src import xla_bridge as xb
++from jax._src.lib import xla_extension_version
+ from jax._src.layout import DeviceLocalLayout as DLL, Layout
+ from jax._src import config
+ from jax.ad_checkpoint import checkpoint_name, checkpoint as new_checkpoint
+@@ -695,6 +696,34 @@ def foo(x):
+     if compiled_text is not None:
+       self.assertIn('custom_call_target="AllocateBuffer"', compiled_text)
+ 
++  def test_disallow_alias_copies_arrays(self):
++    if xla_extension_version < 296:
++      self.skipTest("Requires xla_extension_version >= 296")
++    _, _, _, inp_host = _create_inputs(
++        (8, 2), P("x", "y"), mem_kind="pinned_host")
++
++    inp_host_copy = jax.device_put(inp_host, may_alias=False)
++
++    for a in jax.tree.leaves(inp_host):
++      a.delete()
++
++    jax.block_until_ready(inp_host_copy)
++
++  def test_disallow_alias_copies_arrays_with_donated_input(self):
++    if xla_extension_version < 296:
++      self.skipTest("Requires xla_extension_version >= 296")
++    _, _, _, inp_host = _create_inputs(
++        (8, 2), P("x", "y"), mem_kind="pinned_host")
++
++    inp_host_donate = jax.jit(lambda x: x, donate_argnums=0)(inp_host)
++
++    inp_host_donate_copy = jax.device_put(inp_host_donate, may_alias=False)
++
++    for a in jax.tree.leaves(inp_host_donate):
++      a.delete()
++
++    jax.block_until_ready(inp_host_donate_copy)
++
+ 
+ class ComputeOffload(jtu.BufferDonationTestCase):
+ 
+diff --git a/tests/pmap_test.py b/tests/pmap_test.py
+index 0df5d99715e6..f611ee981335 100644
+--- a/tests/pmap_test.py
++++ b/tests/pmap_test.py
+@@ -3013,7 +3013,7 @@ def testShardArgs(self, shape, spec, make_arg):
+     x = np.arange(math.prod(shape)).reshape(shape)
+     arg = make_arg(x)
+     sharding = jax.sharding.PmapSharding(jax.devices()[:nshards], spec)
+-    results = pxla.shard_args([sharding], [None], [arg])
++    results = pxla.shard_args([sharding], [None], [None], [arg])
+     self.assertEqual(len(results), 1)
+     if isinstance(results[0], array.ArrayImpl):
+       bufs = results[0]._arrays

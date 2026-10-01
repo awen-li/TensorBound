@@ -1,0 +1,87 @@
+From 08fc082aa9f4b4340a62733571c3e5da4a51f0a5 Mon Sep 17 00:00:00 2001
+From: Parker Schuh <parkers@google.com>
+Date: Mon, 11 Jul 2022 16:47:20 -0700
+Subject: [PATCH] Use weakref to avoid cache leaks in fori_loop.
+
+This is in response to: https://github.com/google/jax/issues/11448.
+---
+ jax/_src/lax/control_flow/common.py |  6 +++---
+ jax/_src/lax/control_flow/loops.py  | 12 ++++++++----
+ 2 files changed, 11 insertions(+), 7 deletions(-)
+
+diff --git a/jax/_src/lax/control_flow/common.py b/jax/_src/lax/control_flow/common.py
+index 1855436abda5..2a482bca94b7 100644
+--- a/jax/_src/lax/control_flow/common.py
++++ b/jax/_src/lax/control_flow/common.py
+@@ -23,7 +23,7 @@
+ from jax.interpreters import partial_eval as pe
+ from jax._src import ad_util
+ from jax._src import util
+-from jax._src.util import cache, safe_map, unzip3
++from jax._src.util import cache, weakref_lru_cache, safe_map, unzip3
+ from jax.tree_util import tree_map, tree_unflatten, tree_structure
+ 
+ map, unsafe_map = safe_map, map
+@@ -43,7 +43,7 @@ def _typecheck_param(prim, param, name, msg_required, pred):
+     msg = sep.join([msg, param_str])
+     raise core.JaxprTypeError(msg)
+ 
+-@cache()
++@weakref_lru_cache
+ def _initial_style_open_jaxpr(fun: Callable, in_tree, in_avals,
+                               primitive_name: Optional[str] = None):
+   wrapped_fun, out_tree = flatten_fun_nokwargs(lu.wrap_init(fun), in_tree)
+@@ -51,7 +51,7 @@ def _initial_style_open_jaxpr(fun: Callable, in_tree, in_avals,
+   jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(wrapped_fun, in_avals, debug)
+   return jaxpr, consts, out_tree()
+ 
+-@cache()
++@weakref_lru_cache
+ def _initial_style_jaxpr(fun: Callable, in_tree, in_avals,
+                          primitive_name: Optional[str] = None):
+   jaxpr, consts, out_tree = _initial_style_open_jaxpr(
+diff --git a/jax/_src/lax/control_flow/loops.py b/jax/_src/lax/control_flow/loops.py
+index 7d893b7e3bd5..c244fd0a7576 100644
+--- a/jax/_src/lax/control_flow/loops.py
++++ b/jax/_src/lax/control_flow/loops.py
+@@ -19,6 +19,7 @@
+ from typing import Any, Callable, List, Optional, Sequence, Tuple, TypeVar
+ 
+ import jax
++import weakref
+ from jax import core
+ from jax import linear_util as lu
+ from jax.config import config
+@@ -51,6 +52,7 @@
+     safe_zip,
+     split_list,
+     unzip2,
++    weakref_lru_cache,
+     )
+ import numpy as np
+ 
+@@ -1497,18 +1499,20 @@ def _fori_cond_fun(loop_carry):
+   i, upper, _ = loop_carry
+   return lax.lt(i, upper)
+ 
+-@cache()
++@weakref_lru_cache
+ def _fori_body_fun(body_fun):
++  body_fun = weakref.ref(body_fun)
+   def while_body_fun(loop_carry):
+     i, upper, x = loop_carry
+-    return lax.add(i, lax._const(i, 1)), upper, body_fun(i, x)
++    return lax.add(i, lax._const(i, 1)), upper, body_fun()(i, x)
+   return while_body_fun
+ 
+-@cache()
++@weakref_lru_cache
+ def _fori_scan_body_fun(body_fun):
++  body_fun = weakref.ref(body_fun)
+   def scanned_fun(loop_carry, _):
+     i, x = loop_carry
+-    return (i + 1, body_fun(i, x)), None
++    return (i + 1, body_fun()(i, x)), None
+   return scanned_fun
+ 
+ @api_boundary

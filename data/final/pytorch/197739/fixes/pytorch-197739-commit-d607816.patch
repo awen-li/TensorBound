@@ -1,0 +1,426 @@
+From d60781628a81a6733e9939ebd70430da049b7746 Mon Sep 17 00:00:00 2001
+From: eellison <elias.ellison@gmail.com>
+Date: Mon, 31 Aug 2026 07:49:42 -0700
+Subject: [PATCH] [inductor] Preserve logical indices for arg reductions
+ (#195178)
+
+We have an optimization that replaces an argmax `(value, index)` pair with the loop index when iterating contiguously. Previously, that optimization ran at lowering time by inspecting input strides. However, this decision must compose with subsequent optimizations such as layout changes and loop reordering.
+
+Instead, always preserve the logical index through lowering, even when inputs are contiguous, and move the optimization immediately before codegen, after loop transformations are complete.
+
+> AI-assisted implementation details:
+>
+> The late optimization removes the explicit logical index only when it proves that the index matches the final native reduction order. Otherwise, codegen retains the explicit index. Triton reduction CSE also includes retained logical indices, so equivalent mappings can merge while distinct mappings remain separate.
+>
+> Fixes #193661. Also covers #193751.
+>
+> The implementation was prepared with an AI assistant and reviewed and validated by the author.
+
+Pull Request resolved: https://github.com/pytorch/pytorch/pull/195178
+Approved by: https://github.com/jananisriram, https://github.com/jansel
+---
+ test/inductor/test_optimize_indexing.py | 101 +++++++++++++++++++++++-
+ test/inductor/test_torchinductor.py     |  86 +++++++++++++++++++-
+ torch/_inductor/codegen/triton.py       |   6 +-
+ torch/_inductor/lowering.py             |  17 +---
+ torch/_inductor/optimize_indexing.py    |  54 ++++++++++++-
+ torch/_inductor/scheduler.py            |  10 +++
+ 6 files changed, 256 insertions(+), 18 deletions(-)
+
+diff --git a/test/inductor/test_optimize_indexing.py b/test/inductor/test_optimize_indexing.py
+index df24ad6b787ba..83e323ce42860 100644
+--- a/test/inductor/test_optimize_indexing.py
++++ b/test/inductor/test_optimize_indexing.py
+@@ -5,13 +5,33 @@
+ import sympy
+ 
+ import torch
++from torch._inductor import config
+ from torch._inductor.codegen.common import deduce_output_dtype_by_name
+-from torch._inductor.optimize_indexing import convert_index_expr_to_value_expr
++from torch._inductor.loop_body import LoopBody
++from torch._inductor.optimize_indexing import (
++    convert_index_expr_to_value_expr,
++    remove_redundant_argreduce_indices,
++)
++from torch._inductor.virtualized import V
+ from torch.fx import Graph
+ from torch.testing._internal.common_utils import run_tests, TestCase
+ from torch.utils._sympy.value_ranges import ValueRanges
+ 
+ 
++class _FakeSizeVars:
++    @staticmethod
++    def simplify_with_ranges(expr, var_ranges):
++        return expr
++
++    @staticmethod
++    def statically_known_equals(left, right):
++        return sympy.expand(left - right) == 0
++
++
++class _FakeGraph:
++    sizevars = _FakeSizeVars()
++
++
+ class TestOptimizeIndexing(TestCase):
+     @staticmethod
+     def _make_loop_body(
+@@ -49,6 +69,85 @@ def bounds(self):
+ 
+         return FakeLoopBody()
+ 
++    def _make_argreduce_loop_body(self, logical_index):
++        r0, r1 = sympy.symbols("r0 r1", integer=True, nonnegative=True)
++
++        def fn(index, reduction_index):
++            value = V.ops.constant(1.0, torch.float32)
++            index = V.ops.index_expr(logical_index(*reduction_index), torch.int64)
++            return V.ops.reduction(torch.int64, torch.float32, "argmax", (value, index))
++
++        with (
++            config.patch(constant_and_index_propagation=False),
++            V.set_graph_handler(_FakeGraph()),
++        ):
++            loop_body = LoopBody(
++                fn,
++                ([], [r0, r1]),
++                {r0: 4, r1: 8},
++                [],
++                [r0, r1],
++            )
++        return loop_body
++
++    @staticmethod
++    def _argreduce_nodes(loop_body):
++        graph = loop_body.root_block.graph
++        reduction = graph.find_nodes(op="call_method", target="reduction")[0]
++        value, index_expr = reduction.args[-1]
++        get_index = index_expr.args[1]
++        return graph, reduction, value, index_expr, get_index
++
++    def test_remove_redundant_argreduce_index(self):
++        loop_body = self._make_argreduce_loop_body(lambda r0, r1: 8 * r0 + r1)
++        graph, reduction, value, index_expr, get_index = self._argreduce_nodes(
++            loop_body
++        )
++        with V.set_graph_handler(_FakeGraph()):
++            remove_redundant_argreduce_indices([loop_body])
++
++        self.assertIs(reduction.args[-1], value)
++        self.assertIn(index_expr, graph.nodes)
++        self.assertIn(get_index, graph.nodes)
++
++    def test_keep_non_native_argreduce_index(self):
++        loop_body = self._make_argreduce_loop_body(lambda r0, r1: 4 * r1 + r0)
++        graph, reduction, _, index_expr, get_index = self._argreduce_nodes(loop_body)
++        with V.set_graph_handler(_FakeGraph()):
++            remove_redundant_argreduce_indices([loop_body])
++
++        self.assertIs(reduction.args[-1][1], index_expr)
++        self.assertIn(index_expr, graph.nodes)
++        self.assertIn(get_index, graph.nodes)
++
++    def test_keep_shared_non_native_argreduce_index(self):
++        original = self._make_argreduce_loop_body(lambda r0, r1: 8 * r0 + r1)
++        r0, r1 = original.reduce_vars
++        with V.set_graph_handler(_FakeGraph()):
++            native = LoopBody(
++                original,
++                ([], [r0, r1]),
++                original.var_ranges,
++                [],
++                [r0, r1],
++                allow_same_symbol_in_index=True,
++            )
++            reordered = LoopBody(
++                original,
++                ([], [r0, r1]),
++                original.var_ranges,
++                [],
++                [r0, r1],
++                allow_same_symbol_in_index=True,
++            )
++            reordered.indexing_exprs["index0"] = 4 * r1 + r0
++            remove_redundant_argreduce_indices([native, reordered])
++
++        self.assertIs(native.root_block.graph, reordered.root_block.graph)
++        self.assertIsInstance(self._argreduce_nodes(native)[1].args[-1], tuple)
++        self.assertIsInstance(self._argreduce_nodes(reordered)[1].args[-1], tuple)
++        self.assertEqual(reordered.indexing_exprs["index0"], 4 * r1 + r0)
++
+     def test_index_expr_mixed_use_converts_in_place(self):
+         # When the same index_expr is used both as an index (load) and as a
+         # value (add), we convert it in-place to value_expr. The load still
+diff --git a/test/inductor/test_torchinductor.py b/test/inductor/test_torchinductor.py
+index 090e3862c4017..6142923469613 100644
+--- a/test/inductor/test_torchinductor.py
++++ b/test/inductor/test_torchinductor.py
+@@ -1267,6 +1267,16 @@ def wrapper(self, *args, **kwargs):
+     return wrapper
+ 
+ 
++def skip_if_mps(fn):
++    @functools.wraps(fn)
++    def wrapper(self, *args, **kwargs):
++        if is_mps_backend(self.device):
++            raise unittest.SkipTest("mps not supported")
++        return fn(self, *args, **kwargs)
++
++    return wrapper
++
++
+ def xfail_if_mps(fn):
+     @functools.wraps(fn)
+     def wrapper(self, *args, **kwargs):
+@@ -16961,15 +16971,21 @@ def f():
+ 
+     # Skipped on MPS because avgpool size is not divisible
+     @xfail_if_mps
+-    @skip_if_gpu_halide
++    @skip_if_halide
+     def test_adaptive_avg_pool1d_argmax(self):
+         # https://github.com/pytorch/pytorch/issues/113013
++        # https://github.com/pytorch/pytorch/issues/193492
+         def fn(x):
+             x = torch.adaptive_avg_pool1d(input=x, output_size=2)
+             x = torch.argmax(input=x)
+             return x
+ 
+-        x = torch.rand([4, 4, 3], dtype=torch.float64)
++        x = torch.zeros(4, 4, 3, device=self.device, dtype=torch.float64).transpose(
++            0, 1
++        )
++        x[1, 3] = x.new_tensor([0.0, 1.0, 2.0])
++        self.assertFalse(x.is_contiguous())
++        self.assertEqual(fn(x), torch.tensor(15, device=self.device))
+         self.common(fn, (x,))
+ 
+     @skipCUDAIf(not SM80OrLater, "uses bfloat16 which requires SM >= 80")
+@@ -19144,6 +19160,57 @@ def f(x):
+         self.assertTrue("ReductionHint.OUTER" in code)
+         self.assertFalse("ReductionHint.INNER" in code)
+ 
++    @parametrize("slice_pointwise", (False, True))
++    @skip_if_halide
++    @skip_if_pallas
++    @skip_if_mps
++    def test_argmin_argmax_fused_reduction_logical_index(self, slice_pointwise):
++        # https://github.com/pytorch/pytorch/issues/193661
++        def fn(x):
++            reduced = torch.mean(x, dim=-1)
++            if slice_pointwise:
++                reduced = reduced[1:]
++            return reduced.argmin(), reduced.argmax()
++
++        x = (
++            torch.zeros(2, 4, 4, 8, device=self.device)
++            .transpose(0, 1)
++            .contiguous()
++            .transpose(0, 1)[..., ::2]
++        )
++        batch = 1 if slice_pointwise else 0
++        x[batch, 1, 1] = -1
++        x[batch, 3, 0] = 1
++        expected = (
++            torch.tensor(5, device=self.device),
++            torch.tensor(12, device=self.device),
++        )
++
++        self.assertEqual(fn(x), expected)
++        self.common(fn, (x,))
++
++    @skip_if_halide
++    @skip_if_pallas
++    @skip_if_mps
++    def test_argreduce_native_index_cse(self):
++        def fn(x):
++            return x.argmax(), x.reshape(-1).argmax()
++
++        x = torch.arange(4 * 6 * 8, device=self.device, dtype=torch.float32).reshape(
++            4, 6, 8
++        )
++        self.common(fn, (x,))
++
++        compiled = torch.compile(fn, fullgraph=True)
++        if is_cpp_backend(self.device):
++            _, code = run_and_get_cpp_code(compiled, x)
++            self.assertIn("tmp_acc0", code)
++            self.assertNotIn("tmp_acc1", code)
++        else:
++            code = run_and_get_triton_code(compiled, x)
++            self.assertEqual(code.count("@triton_heuristics."), 1)
++            self.assertEqual(code.count("triton_helpers.max_with_index"), 1)
++
+     @skip_if_halide
+     @requires_gpu_and_triton
+     def test_triton_argmin_argmax_transpose_logical_index(self):
+@@ -19181,6 +19248,21 @@ def fn(x):
+ 
+         self.common(fn, (torch.randn(6, 4, device=GPU_TYPE).t().contiguous().t(),))
+ 
++        def fn(x):
++            return (
++                x.permute(1, 0, 2).argmax(),
++                x.transpose(0, 1).argmax(),
++                x.permute(2, 1, 0).argmax(),
++            )
++
++        x = torch.zeros(4, 6, 8, device=GPU_TYPE)
++        x[2, 4, 7] = 1
++        self.common(fn, (x,))
++        code = run_and_get_triton_code(torch.compile(fn, fullgraph=True), x)
++        self.assertEqual(code.count("@triton_heuristics."), 1)
++        # Equivalent value/index pairs merge; the distinct mapping does not.
++        self.assertEqual(code.count("triton_helpers.max_with_index"), 2)
++
+     @skip_if_halide
+     @requires_gpu_and_triton
+     def test_unbacked_float_item(self):
+diff --git a/torch/_inductor/codegen/triton.py b/torch/_inductor/codegen/triton.py
+index e398cf318e5e2..6505bdffc5696 100644
+--- a/torch/_inductor/codegen/triton.py
++++ b/torch/_inductor/codegen/triton.py
+@@ -5580,7 +5580,11 @@ def argreduce_result_kind():
+                 return "value"
+             return "index"
+ 
+-        cache_key = (src_dtype, reduction_type, value)
++        cache_key = (
++            src_dtype,
++            reduction_type,
++            value if logical_index is None else (value, logical_index),
++        )
+         if cache_key in self.cse.reduction_cache:
+             return self.cse.reduction_cache[cache_key]
+ 
+diff --git a/torch/_inductor/lowering.py b/torch/_inductor/lowering.py
+index 13e4758c5175d..daba923f330e4 100644
+--- a/torch/_inductor/lowering.py
++++ b/torch/_inductor/lowering.py
+@@ -7280,12 +7280,12 @@ def _make_reduction_inner(
+             kept_idx.append(i)
+             kept_sizes.append(size[i])
+ 
+-    # For argmax/argmin compute logical indices when the tensor has non-contiguous layout.
+-    should_compute_logical_index = False
++    # Loop reordering happens after lowering, so the input IR cannot reliably predict
++    # when the physical reduction order will differ from the logical order.
+     supports_logical_index_argreduce = is_triton(x) or (
+         ir.get_device_type(x) == "cpu" and config.cpu_backend == "cpp"
+     )
+-    if (
++    should_compute_logical_index = (
+         reduction_type
+         in (
+             "argmax",
+@@ -7297,16 +7297,7 @@ def _make_reduction_inner(
+         )
+         and len(reduced_sizes) > 1
+         and supports_logical_index_argreduce
+-    ):
+-        if isinstance(x.data, PermuteView):
+-            should_compute_logical_index = True
+-        elif isinstance(x.data, ir.ReinterpretView) or (
+-            isinstance(x.data, ir.StorageBox) and isinstance(x.data.data, ir.Buffer)
+-        ):
+-            layout = x.get_layout()
+-            should_compute_logical_index = (
+-                layout.is_transposed() or not layout.is_contiguous()
+-            )
++    )
+ 
+     def loader(index, reduction_index):
+         if len(reduction_index) != len(reduced_idx):
+diff --git a/torch/_inductor/optimize_indexing.py b/torch/_inductor/optimize_indexing.py
+index 790c30df2f1d9..fe2a0851018ef 100644
+--- a/torch/_inductor/optimize_indexing.py
++++ b/torch/_inductor/optimize_indexing.py
+@@ -1,4 +1,5 @@
+ import math
++from collections.abc import Sequence
+ from dataclasses import dataclass
+ from typing import Any
+ 
+@@ -10,7 +11,58 @@
+ from torch.utils._sympy.value_ranges import ValueRanges
+ 
+ from .loop_body import LoopBody
+-from .utils import dominated_nodes
++from .utils import dominated_nodes, flatten_index
++from .virtualized import V
++
++
++_ARG_REDUCTION_TYPES = (
++    "argmax",
++    "argmin",
++    "argmax_value",
++    "argmin_value",
++    "argmax_with_value",
++    "argmin_with_value",
++)
++
++
++def remove_redundant_argreduce_indices(
++    loop_bodies: Sequence[LoopBody],
++) -> None:
++    """Drop explicit arg-reduction indices that match the final loop order."""
++    reductions: dict[torch.fx.Node, Any] = {}
++    non_native: OrderedSet[torch.fx.Node] = OrderedSet()
++    for loop_body in loop_bodies:
++        if not loop_body.reduce_vars:
++            continue
++        native_index = flatten_index(loop_body.reduce_vars, loop_body.sizes[1])
++        for block in (loop_body.root_block, *loop_body.subblocks.values()):
++            for node in block.graph.find_nodes(op="call_method", target="reduction"):
++                if node.args[-2] not in _ARG_REDUCTION_TYPES:
++                    continue
++                value = node.args[-1]
++                if not (isinstance(value, tuple) and len(value) == 2):
++                    continue
++                reduction_value, logical_index = value
++                if not (
++                    isinstance(logical_index, torch.fx.Node)
++                    and logical_index.target in ("index_expr", "value_expr")
++                ):
++                    continue
++                index_node = logical_index.args[1]
++                if not isinstance(index_node, torch.fx.Node):
++                    continue
++                index_name = index_node.args[0]
++                if not isinstance(index_name, str):
++                    continue
++                reductions[node] = reduction_value
++                if not V.graph.sizevars.statically_known_equals(
++                    loop_body.indexing_exprs[index_name], native_index
++                ):
++                    non_native.add(node)
++
++    for node, reduction_value in reductions.items():
++        if node not in non_native:
++            node.args = (*node.args[:-1], reduction_value)
+ 
+ 
+ def val_expressable_in_32_bits(val: object) -> bool:
+diff --git a/torch/_inductor/scheduler.py b/torch/_inductor/scheduler.py
+index ce0785fe89464..a5fae341cb0ba 100644
+--- a/torch/_inductor/scheduler.py
++++ b/torch/_inductor/scheduler.py
+@@ -11540,7 +11540,17 @@ def _log_non_cudagraphable_node(self, node: BaseSchedulerNode) -> None:
+                     cudagraphs_log.debug("         %s", line)
+ 
+     def codegen(self) -> None:
++        from .optimize_indexing import remove_redundant_argreduce_indices
++
+         with dynamo_timed("Scheduler.codegen"):
++            loop_bodies = OrderedSet(
++                snode._body
++                for node in self.nodes
++                for snode in node.get_nodes()
++                if isinstance(snode, SchedulerNode)
++                and isinstance(snode._body, LoopBody)
++            )
++            remove_redundant_argreduce_indices(list(loop_bodies))
+             return (
+                 self._codegen_partitions()
+                 if torch._inductor.config.graph_partition

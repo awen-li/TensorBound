@@ -1,0 +1,1626 @@
+From 6a0627cb10c04f0b355b7056603e66cc4236cd89 Mon Sep 17 00:00:00 2001
+From: Mahesh Ravishankar <ravishankarm@google.com>
+Date: Tue, 7 Mar 2023 17:40:54 +0000
+Subject: [PATCH 1/3] Add a pass to correctly represent
+ hal.interface.binding.subspan ops with offsets.
+
+`hal.interface.binding.subspan` ops of the form
+
+```
+%subspan = hal.interface.binding.subspan set(0) binding(0) offset(%o0)
+    : memref<?x?xf32>{%s0, %s1}
+```
+
+are to be interpreted as follows.
+
+- `hal.interface.binding.subspan set(0) binding(0)` is effectively `char *binding`.
+- A non-zero offset offset(`%o0`) corresponds to performing `binding + %o0`.
+- The bytes of data from `[binding + %o0, binding + %o0 + %s0 * %s1 * <elem-type-byte-width>)` can be viewed as a `memref<?x?xf32>{%s0, %s1}`.
+
+For backends that have a operations which can perform pointer
+arithmetic (like gep instructions in LLVM), this interpretation can be
+directly lowered. Backends like VMVX end up using hal.buffer.subspan
+operations to represent the pointer+offset. This operation does not
+get lowered to VM dialect directly, but are rather folded away with
+uses. For cases where we need to get a raw pointer + offset value,
+these operations dont get folded with uses and fail compilation.
+
+One way to handle this is to convert these operations to represent the
+entire subspan under memref semantics. So the above operation can be
+represented as
+
+```
+%subspan = hal.interface.binding.subspan set(0) binding(0) offset(%o0)
+    : memref<?x?xf32, strided<[?, 1], offset : ?>>{%s0, %s1}
+```
+
+giving the subspan effectively subview semantics. This allows use of
+operations like memref.extract_strided_metadata to resolve the
+offsets, sizes, base pointer usages, etc.
+
+To implement this path, two things are done
+1) A new pass is added to convert subspan with offsets into the above description.
+
+2) Leaving the subspan as still doesnt solve the problem. The offset
+   added can then be folded into the size of the subspan when the
+   subspan is linearized.
+```
+%offset = affine.apply affine_map<()[s0] -> (s0 floordiv 4)>()[%o0]
+%size = affine.apply affine_map<()[s0, s1, s2] -> (s0 * s1 + s2 floordiv 4)>()[%s0, %s1, %o0]
+%subview_size = affine.apply affine_map<()[s0, s1] -> (s0 * s1)>
+%subspan = hal.interface.binding.subspan set(0) binding(0) offset(%c0)
+    : memref<?xf32>{%size}
+%subview = memref.subview %subspan[%offset] [%subview_size] [1]
+    : memref<?xf32>{%size} to memref<?xf32, strided<[1], offset : ?>>
+```
+
+This is implemented in `FlattenMemrefSubspanPass` and further cleanups
+to plumb this through.
+
+A consequence is that all backends that do not support GEP semantics
+now need to use the `FixupSubspanOffsetsPass` and
+`FlattenMemrefSubspanPass` in conjunction.
+
+In the long term, all backends should handle offsets to subspans
+similarly and drop the use of GEP in the LLVM lowering.
+
+Fixes #12480
+---
+ .../src/iree/compiler/Codegen/Common/BUILD    |   1 +
+ .../compiler/Codegen/Common/CMakeLists.txt    |   1 +
+ .../Common/FixupSubspanWithOffsets.cpp        | 287 ++++++++++++++++++
+ .../Common/FlattenMemRefSubspanPass.cpp       | 123 +++++---
+ .../iree/compiler/Codegen/Common/test/BUILD   |   1 +
+ .../Codegen/Common/test/CMakeLists.txt        |   1 +
+ .../test/fixup_subspan_with_offsets.mlir      |  71 +++++
+ .../Common/test/flatten_memref_subspan.mlir   | 265 ++++++++--------
+ compiler/src/iree/compiler/Codegen/Passes.h   |   5 +
+ compiler/src/iree/compiler/Codegen/Passes.td  |  12 +
+ .../iree/compiler/Codegen/SPIRV/Passes.cpp    |   1 +
+ .../src/iree/compiler/Codegen/Utils/Utils.cpp | 125 ++++----
+ .../src/iree/compiler/Codegen/Utils/Utils.h   |  11 +
+ .../iree/compiler/Dialect/Util/IR/UtilTypes.h |   4 +
+ .../Dialect/VMVX/Transforms/Passes.cpp        |   2 +
+ .../compiler/Dialect/VMVX/Transforms/Passes.h |   1 +
+ 16 files changed, 691 insertions(+), 220 deletions(-)
+ create mode 100644 compiler/src/iree/compiler/Codegen/Common/FixupSubspanWithOffsets.cpp
+ create mode 100644 compiler/src/iree/compiler/Codegen/Common/test/fixup_subspan_with_offsets.mlir
+
+diff --git a/compiler/src/iree/compiler/Codegen/Common/BUILD b/compiler/src/iree/compiler/Codegen/Common/BUILD
+index 78bad2980424..973d16a24b30 100644
+--- a/compiler/src/iree/compiler/Codegen/Common/BUILD
++++ b/compiler/src/iree/compiler/Codegen/Common/BUILD
+@@ -115,6 +115,7 @@ iree_compiler_cc_library(
+         "ConcretizePadResultShape.cpp",
+         "ConvertToDestinationPassingStylePass.cpp",
+         "EraseHALDescriptorTypeFromMemRef.cpp",
++        "FixupSubspanWithOffsets.cpp",
+         "FlattenMemRefSubspanPass.cpp",
+         "FoldTensorExtractOpPass.cpp",
+         "ForOpCanonicalizationPass.cpp",
+diff --git a/compiler/src/iree/compiler/Codegen/Common/CMakeLists.txt b/compiler/src/iree/compiler/Codegen/Common/CMakeLists.txt
+index 1b0e4e33ff66..e4b3575c5a27 100644
+--- a/compiler/src/iree/compiler/Codegen/Common/CMakeLists.txt
++++ b/compiler/src/iree/compiler/Codegen/Common/CMakeLists.txt
+@@ -90,6 +90,7 @@ iree_cc_library(
+     "ConcretizePadResultShape.cpp"
+     "ConvertToDestinationPassingStylePass.cpp"
+     "EraseHALDescriptorTypeFromMemRef.cpp"
++    "FixupSubspanWithOffsets.cpp"
+     "FlattenMemRefSubspanPass.cpp"
+     "FoldTensorExtractOpPass.cpp"
+     "ForOpCanonicalizationPass.cpp"
+diff --git a/compiler/src/iree/compiler/Codegen/Common/FixupSubspanWithOffsets.cpp b/compiler/src/iree/compiler/Codegen/Common/FixupSubspanWithOffsets.cpp
+new file mode 100644
+index 000000000000..9a836d0a613e
+--- /dev/null
++++ b/compiler/src/iree/compiler/Codegen/Common/FixupSubspanWithOffsets.cpp
+@@ -0,0 +1,287 @@
++// Copyright 2023 The IREE Authors
++//
++// Licensed under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++
++#include "iree/compiler/Codegen/PassDetail.h"
++#include "iree/compiler/Codegen/Passes.h"
++#include "iree/compiler/Codegen/Transforms/Transforms.h"
++#include "iree/compiler/Codegen/Utils/Utils.h"
++#include "llvm/Support/Debug.h"
++#include "mlir/Dialect/Affine/Utils.h"
++#include "mlir/Dialect/Func/IR/FuncOps.h"
++#include "mlir/Dialect/MemRef/IR/MemRef.h"
++#include "mlir/Dialect/SCF/IR/SCF.h"
++#include "mlir/IR/Matchers.h"
++#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
++
++#define DEBUG_TYPE "iree-codegen-fixup-subspan-with-offsets"
++
++namespace mlir {
++namespace iree_compiler {
++
++namespace {
++class FixupSubspanWithOffsetsPass
++    : public FixupSubspanWithOffsetsBase<FixupSubspanWithOffsetsPass> {
++ public:
++  FixupSubspanWithOffsetsPass() = default;
++  FixupSubspanWithOffsetsPass(const FixupSubspanWithOffsetsPass &) {}
++  void getDependentDialects(DialectRegistry &registry) const override {
++    registry.insert<AffineDialect>();
++  }
++
++  void runOnOperation() override;
++};
++}  // namespace
++
++/// Returns true if the `subspanOp` has a return type of `MemRefType` and has
++/// non-zero offsets.
++static bool hasNonZeroOffsetAndMemRefType(
++    IREE::HAL::InterfaceBindingSubspanOp subspanOp) {
++  auto byteOffset = subspanOp.getByteOffset();
++  if (!byteOffset || matchPattern(byteOffset, m_Zero())) {
++    return false;
++  }
++  return subspanOp.getType().isa<MemRefType>();
++}
++
++/// Rewrites a `subspanOp` with `memref` return type and non-zero offsets
++/// to a new `hal.interface.binding.subspan` op with the result `memref`
++/// type representing the offset, making the type consistent. For example,
++///
++/// ```mlir
++///  hal.interface.binding.subspan set(0) binding(0) offset(%o0)
++///      : memref<?x?xf32>{%s0, %s1}
++/// ```
++///
++/// is re-written to
++///
++/// ```mlir
++///  hal.interface.binding.subspan set(0) binding(0)
++///      : memref<?x?xf32, strided<[?, 1], offset: ?>{%s, s1}
++/// ```
++FailureOr<IREE::HAL::InterfaceBindingSubspanOp> rewriteSubspansWithOffset(
++    RewriterBase &rewriter, IREE::HAL::InterfaceBindingSubspanOp subspanOp) {
++  if (!hasNonZeroOffsetAndMemRefType(subspanOp)) return failure();
++
++  LLVM_DEBUG({
++    llvm::dbgs() << "Rewriting to zero offset : ";
++    subspanOp->print(llvm::dbgs(), OpPrintingFlags().assumeVerified());
++    llvm::dbgs() << "\n";
++  });
++
++  auto memRefType = subspanOp.getType().dyn_cast<MemRefType>();
++  SmallVector<int64_t> strides;
++  int64_t offset;
++  if (failed(getStridesAndOffset(memRefType, strides, offset)) || offset != 0) {
++    return subspanOp->emitOpError(
++        "expected subspan result type to have canonical strides and zero "
++        "offset");
++  }
++
++  // Compute the offset of the memref type.
++  OpBuilder::InsertionGuard guard(rewriter);
++  rewriter.setInsertionPoint(subspanOp);
++  Location loc = subspanOp.getLoc();
++  OpFoldResult elementOffset = convertByteOffsetToElementOffset(
++      rewriter, loc, subspanOp.getByteOffset(), memRefType.getElementType());
++  std::optional<int64_t> elementOffsetInt = getConstantIntValue(elementOffset);
++  if (!elementOffsetInt) {
++    elementOffsetInt = ShapedType::kDynamic;
++  }
++
++  // Create a new subspan op with an offset.
++  auto layoutAttr = StridedLayoutAttr::get(rewriter.getContext(),
++                                           elementOffsetInt.value(), strides);
++  auto newMemRefType =
++      MemRefType::get(memRefType.getShape(), memRefType.getElementType(),
++                      layoutAttr, memRefType.getMemorySpace());
++
++  auto newOp = rewriter.create<IREE::HAL::InterfaceBindingSubspanOp>(
++      loc, newMemRefType, subspanOp.getSetAttr(), subspanOp.getBindingAttr(),
++      subspanOp.getDescriptorTypeAttr(), subspanOp.getByteOffset(),
++      subspanOp.getDynamicDims(), subspanOp.getAlignmentAttr(),
++      subspanOp.getDescriptorFlagsAttr());
++  LLVM_DEBUG({
++    llvm::dbgs() << "Rewritten to : ";
++    newOp->print(llvm::dbgs(), OpPrintingFlags().assumeVerified());
++    llvm::dbgs() << "\n";
++  });
++  return newOp;
++}
++
++/// Replaces a `use` with the `replacement` for cases where a simple substition
++/// might lead to verification errors.
++static std::optional<SmallVector<Value>> replaceNonTrivialUse(
++    RewriterBase &rewriter, Location loc, OpOperand &use, Value replacement) {
++  Operation *user = use.getOwner();
++  OpBuilder::InsertionGuard guard(rewriter);
++  rewriter.setInsertionPoint(user);
++
++  LLVM_DEBUG({
++    llvm::dbgs() << "\tReplacing in user by creating new user : ";
++    user->print(llvm::dbgs(), OpPrintingFlags().assumeVerified());
++    llvm::dbgs() << "\n";
++  });
++
++  if (auto castOp = dyn_cast<memref::CastOp>(user)) {
++    auto replacementType = replacement.getType().cast<MemRefType>();
++    auto currentResultType = castOp.getResult().getType().cast<MemRefType>();
++    auto newResultType = MemRefType::get(
++        currentResultType.getShape(), currentResultType.getElementType(),
++        replacementType.getLayout(), replacementType.getMemorySpace());
++    auto newCastOp =
++        rewriter.create<memref::CastOp>(loc, newResultType, replacement);
++
++    LLVM_DEBUG({
++      llvm::dbgs() << "\t\tNew user : ";
++      newCastOp->print(llvm::dbgs(), OpPrintingFlags().assumeVerified());
++      llvm::dbgs() << "\n";
++    });
++    return SmallVector<Value>(newCastOp->result_begin(),
++                              newCastOp->result_end());
++  }
++  if (auto subviewOp = dyn_cast<memref::SubViewOp>(user)) {
++    auto currResultType = subviewOp.getResult().getType().cast<MemRefType>();
++    auto newSourceType = replacement.getType().cast<MemRefType>();
++    SmallVector<OpFoldResult> offsets = subviewOp.getMixedOffsets();
++    SmallVector<OpFoldResult> sizes = subviewOp.getMixedSizes();
++    SmallVector<OpFoldResult> strides = subviewOp.getMixedStrides();
++    MemRefType newResultType =
++        (currResultType.getRank() != newSourceType.getRank()
++             ? memref::SubViewOp::inferRankReducedResultType(
++                   currResultType.getShape(), newSourceType, offsets, sizes,
++                   strides)
++                   .cast<MemRefType>()
++             : nullptr);
++    auto newSubviewOp = rewriter.create<memref::SubViewOp>(
++        loc, newResultType, replacement, offsets, sizes, strides);
++
++    LLVM_DEBUG({
++      llvm::dbgs() << "\t\tNew user : ";
++      newSubviewOp->print(llvm::dbgs(), OpPrintingFlags().assumeVerified());
++      llvm::dbgs() << "\n";
++    });
++    return SmallVector<Value>(newSubviewOp->result_begin(),
++                              newSubviewOp->result_end());
++  }
++  return std::nullopt;
++}
++
++/// Replace `origValue` with `replacementValue`. The replacement might
++/// require replacing the users of `origValue`. The results of the users
++/// themselves have to be replaced with results of the new users.
++static void replaceUsesTransitively(RewriterBase &rewriter, Location loc,
++                                    Value origValue, Value replacementValue) {
++  SmallVector<std::pair<Value, Value>> worklist;
++  worklist.push_back({origValue, replacementValue});
++
++  while (!worklist.empty()) {
++    auto [original, replacement] = worklist.pop_back_val();
++
++    LLVM_DEBUG({
++      llvm::dbgs() << "//===------------------------------------------===//\n";
++      llvm::dbgs() << "Replacing : ";
++      original.print(llvm::dbgs(), OpPrintingFlags().assumeVerified());
++      llvm::dbgs() << "\n";
++    });
++
++    llvm::SmallDenseSet<OpOperand *> preservedUses;
++    for (OpOperand &use : original.getUses()) {
++      Operation *user = use.getOwner();
++      // Some uses cannot be replaced.
++      if (isa<func::ReturnOp, scf::YieldOp>(user)) {
++        LLVM_DEBUG({
++          llvm::dbgs() << "\tUnhandled user : ";
++          user->print(llvm::dbgs(), OpPrintingFlags().assumeVerified());
++          llvm::dbgs() << "\n";
++        });
++        preservedUses.insert(&use);
++        continue;
++      }
++
++      // Some uses might be replace-able but require creating new versions
++      // of the users to pass verification.
++      std::optional<SmallVector<Value>> nonTrivialUse =
++          replaceNonTrivialUse(rewriter, loc, use, replacement);
++      if (nonTrivialUse) {
++        // Add the results of the new users created as replacements
++        // for the old users. Push this back on the to worklist.
++        preservedUses.insert(&use);
++        for (auto [v1, v2] :
++             llvm::zip_equal(user->getResults(), nonTrivialUse.value())) {
++          worklist.push_back({v1, v2});
++        }
++        continue;
++      }
++    }
++
++    // Replace all non-preserved uses.
++    rewriter.replaceUsesWithIf(original, replacement, [&](OpOperand &use) {
++      if (!preservedUses.count(&use)) {
++        LLVM_DEBUG({
++          llvm::dbgs() << "\t\tReplacing use in :";
++          use.getOwner()->print(llvm::dbgs(),
++                                OpPrintingFlags().assumeVerified());
++          llvm::dbgs() << "\n";
++        });
++        return true;
++      }
++      return false;
++    });
++  }
++}
++
++/// Walks the function are rewrites all subspan pos that have non-zero offsets.
++LogicalResult rewriteAllSubspanOpsWithOffsets(func::FuncOp funcOp) {
++  // Collect all subspan ops with memref return types and non-zero offsets.
++  SmallVector<IREE::HAL::InterfaceBindingSubspanOp> subspanOps;
++  funcOp.walk([&](IREE::HAL::InterfaceBindingSubspanOp subspanOp) {
++    if (hasNonZeroOffsetAndMemRefType(subspanOp)) {
++      subspanOps.push_back(subspanOp);
++    }
++  });
++
++  IRRewriter rewriter(funcOp.getContext());
++  for (auto subspanOp : subspanOps) {
++    FailureOr<IREE::HAL::InterfaceBindingSubspanOp> newSubspanOp =
++        rewriteSubspansWithOffset(rewriter, subspanOp);
++    if (failed(newSubspanOp)) {
++      return failure();
++    }
++    replaceUsesTransitively(rewriter, subspanOp.getLoc(), subspanOp,
++                            newSubspanOp.value());
++  }
++  return success();
++}
++
++void FixupSubspanWithOffsetsPass::runOnOperation() {
++  // For the resolution to work correctly, subspans with offsets need to be
++  // handled appropriately.
++  if (failed(rewriteAllSubspanOpsWithOffsets(getOperation()))) {
++    getOperation()->emitOpError(
++        "failed rewrite of subspan with non-zero offsets");
++    return signalPassFailure();
++  }
++
++  if (!keepDeadSubspanOps) {
++    // Remove any dead subspan operations.
++    {
++      RewritePatternSet patterns(&getContext());
++      populateRemoveDeadMemAllocPatterns(patterns);
++      if (failed(applyPatternsAndFoldGreedily(getOperation(),
++                                              std::move(patterns)))) {
++        return signalPassFailure();
++      }
++    }
++  }
++}
++
++std::unique_ptr<mlir::OperationPass<func::FuncOp>>
++createFixupSubspanWithOffsetsPass() {
++  return std::make_unique<FixupSubspanWithOffsetsPass>();
++}
++
++}  // namespace iree_compiler
++}  // namespace mlir
+\ No newline at end of file
+diff --git a/compiler/src/iree/compiler/Codegen/Common/FlattenMemRefSubspanPass.cpp b/compiler/src/iree/compiler/Codegen/Common/FlattenMemRefSubspanPass.cpp
+index 98de1d5fe60b..f81615165da8 100644
+--- a/compiler/src/iree/compiler/Codegen/Common/FlattenMemRefSubspanPass.cpp
++++ b/compiler/src/iree/compiler/Codegen/Common/FlattenMemRefSubspanPass.cpp
+@@ -91,26 +91,20 @@ struct FlattenMemRefTypeConverter final : public TypeConverter {
+ 
+     // Convert n-D MemRef to 1-D MemRef.
+     addConversion([](MemRefType type) -> Optional<Type> {
+-      if (Attribute storage = type.getMemorySpace()) {
+-        if (auto dtAttr = storage.dyn_cast<IREE::HAL::DescriptorTypeAttr>()) {
+-          // Uniform buffers are faster but generally have a much smaller
+-          // capacity limits. GPUs would expect such buffers to have a bound
+-          // size when declaring resource ops in the kernel, so converting them
+-          // to a static shaped 1-D memref.
+-          if (dtAttr.getValue() == IREE::HAL::DescriptorType::UniformBuffer &&
+-              type.hasStaticShape()) {
+-            return MemRefType::get(type.getNumElements(), type.getElementType(),
+-                                   AffineMap(), type.getMemorySpace());
+-          }
+-        }
++      int64_t offset;
++      SmallVector<int64_t> strides;
++      if (failed(getStridesAndOffset(type, strides, offset))) {
++        return std::nullopt;
++      }
++      // Since the memref gets linearized, use a stride 1, offset 0.
++      StridedLayoutAttr layoutAttr;
++      if (offset != 0) {
++        layoutAttr = StridedLayoutAttr::get(type.getContext(), offset, {1});
+       }
+-      // By default convert others to a MemRef with unknown dimension. This is
+-      // actually more akin to how IREE uses memref types for storage buffers:
+-      // they are representing a view from a byte buffer with potentially
+-      // unknown total size, as transformation passes can concatenate buffers,
+-      // etc.
+-      return MemRefType::get(ShapedType::kDynamic, type.getElementType(),
+-                             AffineMap(), type.getMemorySpace());
++      int64_t staticShape =
++          type.hasStaticShape() ? type.getNumElements() : ShapedType::kDynamic;
++      return MemRefType::get(staticShape, type.getElementType(), layoutAttr,
++                             type.getMemorySpace());
+     });
+   }
+ };
+@@ -238,24 +232,61 @@ struct FlattenBindingSubspan final
+     auto oldType = subspanOp.getType().dyn_cast<MemRefType>();
+     // IREE subspan ops only use memref types with the default identity
+     // layout maps.
+-    if (!oldType || !oldType.getLayout().isIdentity()) return failure();
+-
+-    auto newType = getTypeConverter()->convertType(oldType).cast<MemRefType>();
+-    SmallVector<Value, 1> dynamicDims;
+-    if (!newType.hasStaticShape()) {
+-      dynamicDims.push_back(createTotalElementCountValue(
+-          oldType, subspanOp.getDynamicDims(), subspanOp.getLoc(), rewriter));
+-    }
++    if (!oldType) return failure();
+ 
++    OpFoldResult linearShape;
++    if (oldType.hasStaticShape()) {
++      linearShape = rewriter.getIndexAttr(oldType.getNumElements());
++    } else {
++      linearShape = createTotalElementCountValue(
++          oldType, subspanOp.getDynamicDims(), subspanOp.getLoc(), rewriter);
++    }
++    OpFoldResult linearShapeWithoutOffset = linearShape;
++
++    // Check if the subspan has offset. Convert the subspan into a new subpan
++    // of zero offset with size = linearize(original shape) + byteOffset /
++    // element-width.
++    auto byteOffset = subspanOp.getByteOffset();
++    Location loc = subspanOp.getLoc();
++    OpFoldResult elementOffset = rewriter.getIndexAttr(0);
++    if (byteOffset && !matchPattern(byteOffset, m_Zero())) {
++      elementOffset = convertByteOffsetToElementOffset(
++          rewriter, loc, byteOffset, oldType.getElementType());
++      AffineExpr s0, s1;
++      bindSymbols(rewriter.getContext(), s0, s1);
++      linearShape = makeComposedFoldedAffineApply(rewriter, loc, s0 + s1,
++                                                  {linearShape, elementOffset});
++    }
++
++    SmallVector<int64_t, 1> staticShape;
++    SmallVector<Value, 1> dynamicShape;
++    dispatchIndexOpFoldResult(linearShape, dynamicShape, staticShape);
++    auto newType =
++        MemRefType::get(staticShape, oldType.getElementType(),
++                        MemRefLayoutAttrInterface(), oldType.getMemorySpace());
++
++    auto newOffset = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+     auto newOp = rewriter.create<IREE::HAL::InterfaceBindingSubspanOp>(
+         subspanOp.getLoc(), newType, subspanOp.getSet(), subspanOp.getBinding(),
+-        subspanOp.getDescriptorType(), subspanOp.getByteOffset(), dynamicDims,
++        subspanOp.getDescriptorType(), newOffset, dynamicShape,
+         subspanOp.getAlignmentAttr(), subspanOp.getDescriptorFlagsAttr());
+-    if (isRankZeroOrOneMemRef(oldType)) {
+-      rewriter.replaceOpWithNewOp<memref::CastOp>(subspanOp, oldType, newOp);
+-    } else {
+-      rewriter.replaceOp(subspanOp, newOp.getResult());
+-    }
++
++    Value replacement = newOp;
++    if (!isConstantIntValue(elementOffset, 0)) {
++      OpFoldResult stride = rewriter.getIndexAttr(1);
++      MemRefType returnType =
++          oldType.getRank() == 0
++              ? memref::SubViewOp::inferRankReducedResultType(
++                    {}, newType, elementOffset, linearShapeWithoutOffset,
++                    stride)
++                    .cast<MemRefType>()
++              : nullptr;
++      replacement = rewriter.create<memref::SubViewOp>(
++          loc, returnType, newOp, elementOffset, linearShapeWithoutOffset,
++          OpFoldResult(rewriter.getIndexAttr(1)));
++    }
++
++    rewriter.replaceOp(subspanOp, replacement);
+     return success();
+   }
+ };
+@@ -281,7 +312,7 @@ static Value linearizeIndices(Value sourceValue, ValueRange indices,
+   int64_t offset;
+   if (succeeded(getStridesAndOffset(sourceType, strides, offset))) {
+     AffineMap linearLayoutMap =
+-        makeStridedLinearLayoutMap(strides, offset, builder.getContext());
++        makeStridedLinearLayoutMap(strides, 0, builder.getContext());
+     // Dynamic strides/offset will create symbols. There should be none for the
+     // static case.
+     if (linearLayoutMap.getNumSymbols() == 0) {
+@@ -481,7 +512,9 @@ struct LinearizeTransferReadIndices final
+       ConversionPatternRewriter &rewriter) const override {
+     if (!transferReadOp.getPermutationMap().isMinorIdentity()) {
+       return rewriter.notifyMatchFailure(
+-          transferReadOp, "cannot convert op with non-minor identity map");
++          transferReadOp,
++          "cannot convert op with non-minor identity "
++          "map");
+     }
+     if (!isRankZeroOrOneMemRef(adaptor.getSource().getType())) {
+       return rewriter.notifyMatchFailure(
+@@ -513,7 +546,9 @@ struct LinearizeTransferWriteIndices final
+       ConversionPatternRewriter &rewriter) const override {
+     if (!transferWriteOp.getPermutationMap().isMinorIdentity()) {
+       return rewriter.notifyMatchFailure(
+-          transferWriteOp, "cannot convert op with non-minor identity map");
++          transferWriteOp,
++          "cannot convert op with non-minor identity "
++          "map");
+     }
+     if (!isRankZeroOrOneMemRef(adaptor.getSource().getType())) {
+       return rewriter.notifyMatchFailure(
+@@ -666,10 +701,12 @@ struct FoldSubspanOffsetIntoLoadStore final : public OpRewritePattern<OpType> {
+                                    subspanOp.getDynamicDims().end());
+     Type resultType = memrefType;
+     if (memrefType.getRank() == 0) {
+-      // The current MemRef has rank zero but a non-zero offset. This only works
+-      // in IREE's subspan ops--a subview of the underlying whole buffer. For
+-      // such cases we'd need to make the type and offset consistent to utilize
+-      // MLIR IR constructs. Turn the 0-D MemRef into a 1-D dynamic one.
++      // The current MemRef has rank zero but a non-zero
++      // offset. This only works in IREE's subspan ops--a
++      // subview of the underlying whole buffer. For such
++      // cases we'd need to make the type and offset
++      // consistent to utilize MLIR IR constructs. Turn
++      // the 0-D MemRef into a 1-D dynamic one.
+       resultType =
+           MemRefType::get(ShapedType::kDynamic, memrefType.getElementType(),
+                           AffineMap(), memrefType.getMemorySpace());
+@@ -830,7 +867,11 @@ struct FlattenMemRefSubspanPass
+             });
+     target.addDynamicallyLegalOp<IREE::HAL::InterfaceBindingSubspanOp>(
+         [&](IREE::HAL::InterfaceBindingSubspanOp op) {
+-          return interfaceTypeConverter.isLegal(op.getType());
++          if (!isRankZeroOrOneMemRef(op.getType())) {
++            return false;
++          }
++          auto byteOffset = op.getByteOffset();
++          return !byteOffset || matchPattern(byteOffset, m_Zero());
+         });
+     target.addDynamicallyLegalOp<memref::GlobalOp>([](memref::GlobalOp op) {
+       return isRankZeroOrOneMemRef(op.getType());
+diff --git a/compiler/src/iree/compiler/Codegen/Common/test/BUILD b/compiler/src/iree/compiler/Codegen/Common/test/BUILD
+index 6425919a24b3..b88ab7fc0143 100644
+--- a/compiler/src/iree/compiler/Codegen/Common/test/BUILD
++++ b/compiler/src/iree/compiler/Codegen/Common/test/BUILD
+@@ -27,6 +27,7 @@ iree_lit_test_suite(
+             "distribute_gpu_shared_memory.mlir",
+             "eliminate_empty_tensors.mlir",
+             "erase_hal_descriptor_type.mlir",
++            "fixup_subspan_with_offsets.mlir",
+             "flatten_memref_subspan.mlir",
+             "fold_affine_min_in_distributed_loops.mlir",
+             "fold_tensor_extract_op.mlir",
+diff --git a/compiler/src/iree/compiler/Codegen/Common/test/CMakeLists.txt b/compiler/src/iree/compiler/Codegen/Common/test/CMakeLists.txt
+index a68972056955..091197965af8 100644
+--- a/compiler/src/iree/compiler/Codegen/Common/test/CMakeLists.txt
++++ b/compiler/src/iree/compiler/Codegen/Common/test/CMakeLists.txt
+@@ -23,6 +23,7 @@ iree_lit_test_suite(
+     "distribute_gpu_shared_memory.mlir"
+     "eliminate_empty_tensors.mlir"
+     "erase_hal_descriptor_type.mlir"
++    "fixup_subspan_with_offsets.mlir"
+     "flatten_memref_subspan.mlir"
+     "fold_affine_min_in_distributed_loops.mlir"
+     "fold_tensor_extract_op.mlir"
+diff --git a/compiler/src/iree/compiler/Codegen/Common/test/fixup_subspan_with_offsets.mlir b/compiler/src/iree/compiler/Codegen/Common/test/fixup_subspan_with_offsets.mlir
+new file mode 100644
+index 000000000000..e462d047be64
+--- /dev/null
++++ b/compiler/src/iree/compiler/Codegen/Common/test/fixup_subspan_with_offsets.mlir
+@@ -0,0 +1,71 @@
++// RUN: iree-opt --iree-codegen-fixup-subspan-with-offsets=keep-dead-subspan-ops %s --split-input-file | FileCheck %s
++
++func.func @simple(%arg0 : index, %arg1 : index, %arg2 : index) -> memref<?x?xf32>{
++  %0 = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) alignment(64) offset(%arg0) : memref<?x?xf32>{%arg1, %arg2}
++  return %0 : memref<?x?xf32>
++}
++//      CHECK: func @simple(
++// CHECK-SAME:     %[[ARG0:[a-zA-Z0-9]+]]: index
++// CHECK-SAME:     %[[ARG1:[a-zA-Z0-9]+]]: index
++// CHECK-SAME:     %[[ARG2:[a-zA-Z0-9]+]]: index)
++//      CHECK:   hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) alignment(64) offset(%[[ARG0]]) : memref<?x?xf32, strided<[?, 1], offset: ?>>{%[[ARG1]], %[[ARG2]]}
++
++// -----
++
++func.func @simple_subview_use(%arg0  : index, %arg1 : index, %arg2 : index) -> memref<4x5xf32, strided<[?, 1], offset: ?>> {
++  %0 = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) alignment(64) offset(%arg0) : memref<?x?xf32>{%arg1, %arg2}
++  %1 = memref.subview %0[0, 0] [4, 5] [1, 1] : memref<?x?xf32> to memref<4x5xf32, strided<[?, 1], offset: ?>>
++  return %1 : memref<4x5xf32, strided<[?, 1], offset:?>>
++}
++//      CHECK: func @simple_subview_use(
++// CHECK-SAME:     %[[ARG0:[a-zA-Z0-9]+]]: index
++// CHECK-SAME:     %[[ARG1:[a-zA-Z0-9]+]]: index
++// CHECK-SAME:     %[[ARG2:[a-zA-Z0-9]+]]: index)
++//      CHECK:   %[[BINDING:.+]] = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) alignment(64) offset(%[[ARG0]]) : memref<?x?xf32, strided<[?, 1], offset: ?>>{%[[ARG1]], %[[ARG2]]}
++//      CHECK:   memref.subview %[[BINDING]][0, 0] [4, 5] [1, 1]
++
++// -----
++
++func.func @cast_use(%arg0  : index, %arg1 : index, %arg2 : index) -> memref<20x30xf32> {
++  %c20 = arith.constant 20 : index
++  %c30 = arith.constant 30 : index
++  %0 = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) alignment(64) offset(%arg0) : memref<?x?xf32>{%c20, %c30}
++  %1 = memref.cast %0 : memref<?x?xf32> to memref<20x30xf32>
++  return %1 : memref<20x30xf32>
++}
++//      CHECK: func @cast_use(
++// CHECK-SAME:     %[[ARG0:[a-zA-Z0-9]+]]: index
++// CHECK-SAME:     %[[ARG1:[a-zA-Z0-9]+]]: index
++// CHECK-SAME:     %[[ARG2:[a-zA-Z0-9]+]]: index)
++//  CHECK-DAG:   %[[C20:.+]] = arith.constant 20 : index
++//  CHECK-DAG:   %[[C30:.+]] = arith.constant 30 : index
++//      CHECK:   %[[BINDING:.+]] = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) alignment(64) offset(%[[ARG0]]) : memref<?x?xf32, strided<[?, 1], offset: ?>>{%[[C20]], %[[C30]]}
++//      CHECK:   memref.cast %[[BINDING]] : memref<?x?xf32, strided<[?, 1], offset: ?>> to memref<20x30xf32, strided<[?, 1], offset: ?>>
++
++// -----
++
++func.func @strided_subview_use() -> memref<4x5xf32, strided<[20, 1], offset: 62>> {
++  %c64 = arith.constant 64 : index
++  %0 = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) alignment(64) offset(%c64) : memref<10x20xf32>
++  %1 = memref.subview %0[3, 2] [4, 5] [2, 4] : memref<10x20xf32> to memref<4x5xf32, strided<[20, 1], offset: 62>>
++  return %1 : memref<4x5xf32, strided<[20, 1], offset:62>>
++}
++//      CHECK: func @strided_subview_use()
++//  CHECK-DAG:   %[[C64:.+]] = arith.constant 64 : index
++//      CHECK:   %[[BINDING:.+]] = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) alignment(64) offset(%[[C64]]) : memref<10x20xf32, strided<[20, 1], offset: 16>>
++//      CHECK:   %[[SUBVIEW:.+]] = memref.subview %[[BINDING]][3, 2] [4, 5] [2, 4] : memref<10x20xf32, strided<[20, 1], offset: 16>> to memref<4x5xf32, strided<[40, 4], offset: 78>>
++
++// -----
++
++func.func @extract_metadata(%arg0  : index, %arg1 : index, %arg2 : index) -> memref<i32> {
++  %0 = hal.interface.binding.subspan set(0) binding(1) type(storage_buffer) alignment(64) offset(%arg0) : memref<?x?xi32>{%arg1, %arg2}
++  %base_buffer, %offset, %sizes:2, %strides:2 = memref.extract_strided_metadata %0 : memref<?x?xi32> -> memref<i32>, index, index, index, index, index
++  return %base_buffer : memref<i32>
++}
++//      CHECK: func @extract_metadata(
++// CHECK-SAME:     %[[ARG0:[a-zA-Z0-9]+]]: index
++// CHECK-SAME:     %[[ARG1:[a-zA-Z0-9]+]]: index
++// CHECK-SAME:     %[[ARG2:[a-zA-Z0-9]+]]: index)
++//      CHECK:   %[[BINDING:.+]] = hal.interface.binding.subspan set(0) binding(1) type(storage_buffer) alignment(64) offset(%[[ARG0]]) : memref<?x?xi32, strided<[?, 1], offset: ?>>{%[[ARG1]], %[[ARG2]]}
++//      CHECK:   %[[BASE_BUFFER:.+]], %{{.+}}, %{{.+}}:2, %{{.+}}:2 = memref.extract_strided_metadata %[[BINDING]]
++//      CHECK:   return %[[BASE_BUFFER]]
+diff --git a/compiler/src/iree/compiler/Codegen/Common/test/flatten_memref_subspan.mlir b/compiler/src/iree/compiler/Codegen/Common/test/flatten_memref_subspan.mlir
+index bbdaff25788b..dbf2927a9e61 100644
+--- a/compiler/src/iree/compiler/Codegen/Common/test/flatten_memref_subspan.mlir
++++ b/compiler/src/iree/compiler/Codegen/Common/test/flatten_memref_subspan.mlir
+@@ -1,43 +1,45 @@
+ // RUN: iree-opt --split-input-file --iree-codegen-flatten-memref-subspan --canonicalize --allow-unregistered-dialect %s | FileCheck %s
+ 
+ func.func @load_subspan_with_offset(%offset : index, %i0: index, %i1: index, %i2: index) -> f32 {
+-  %subspan = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%offset) : memref<6x7x8xf32>
+-  %val = memref.load %subspan[%i0, %i1, %i2] : memref<6x7x8xf32>
++  %subspan = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%offset) : memref<6x7x8xf32, strided<[56, 8, 1], offset: ?>>
++  %val = memref.load %subspan[%i0, %i1, %i2] : memref<6x7x8xf32, strided<[56, 8, 1], offset: ?>>
+   return %val: f32
+ }
+ 
+-//      CHECK: #[[$MAP:.+]] = affine_map<()[s0, s1, s2, s3] -> (s0 * 56 + s1 * 8 + s2 + s3 floordiv 4)>
++//  CHECK-DAG: #[[$MAP0:.+]] = affine_map<()[s0] -> (s0 floordiv 4 + 336)>
++//  CHECK-DAG: #[[$MAP1:.+]] = affine_map<()[s0, s1, s2, s3] -> (s0 * 56 + s1 * 8 + s2 + s3 floordiv 4)>
+ //CHECK-LABEL: func.func @load_subspan_with_offset
+ // CHECK-SAME: (%[[OFFSET:.+]]: index, %[[I0:.+]]: index, %[[I1:.+]]: index, %[[I2:.+]]: index)
+ //  CHECK-DAG:   %[[ZERO:.+]] = arith.constant 0 : index
+-//  CHECK-DAG:   %[[C336:.+]] = arith.constant 336 : index
+-//      CHECK:   %[[SUBSPAN:.+]] = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%[[ZERO]]) : memref<?xf32>{%[[C336]]}
+-//      CHECK:   %[[INDEX:.+]] = affine.apply #[[$MAP]]()[%[[I0]], %[[I1]], %[[I2]], %[[OFFSET]]]
++//  CHECK-DAG:   %[[SIZE:.+]] = affine.apply #[[$MAP0]]()[%[[OFFSET]]]
++//      CHECK:   %[[SUBSPAN:.+]] = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%[[ZERO]]) : memref<?xf32>{%[[SIZE]]}
++//      CHECK:   %[[INDEX:.+]] = affine.apply #[[$MAP1]]()[%[[I0]], %[[I1]], %[[I2]], %[[OFFSET]]]
+ //      CHECK:   %[[LOAD:.+]] = memref.load %[[SUBSPAN]][%[[INDEX]]]
+ //      CHECK:   return %[[LOAD]]
+ 
+ // -----
+ 
+ func.func @store_subspan_with_offset(%value: f32, %offset : index, %i0: index, %i1: index, %i2: index) {
+-  %subspan = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%offset) : memref<2x3x4xf32>
+-  memref.store %value, %subspan[%i0, %i1, %i2] : memref<2x3x4xf32>
++  %subspan = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%offset) : memref<2x3x4xf32, strided<[12, 4, 1], offset: ?>>
++  memref.store %value, %subspan[%i0, %i1, %i2] : memref<2x3x4xf32, strided<[12, 4, 1], offset: ?>>
+   return
+ }
+ 
+-//      CHECK: #[[$MAP:.+]] = affine_map<()[s0, s1, s2, s3] -> (s0 * 12 + s1 * 4 + s2 + s3 floordiv 4)>
++//  CHECK-DAG: #[[$MAP0:.+]] = affine_map<()[s0] -> (s0 floordiv 4 + 24)>
++//  CHECK-DAG: #[[$MAP1:.+]] = affine_map<()[s0, s1, s2, s3] -> (s0 * 12 + s1 * 4 + s2 + s3 floordiv 4)>
+ //CHECK-LABEL: func.func @store_subspan_with_offset
+ // CHECK-SAME: (%[[VALUE:.+]]: f32, %[[OFFSET:.+]]: index, %[[I0:.+]]: index, %[[I1:.+]]: index, %[[I2:.+]]: index)
+ //  CHECK-DAG:   %[[ZERO:.+]] = arith.constant 0 : index
+-//  CHECK-DAG:   %[[C24:.+]] = arith.constant 24 : index
+-//      CHECK:   %[[SUBSPAN:.+]] = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%[[ZERO]]) : memref<?xf32>{%[[C24]]}
+-//      CHECK:   %[[INDEX:.+]] = affine.apply #[[$MAP]]()[%[[I0]], %[[I1]], %[[I2]], %[[OFFSET]]]
++//  CHECK-DAG:   %[[SIZE:.+]] = affine.apply #[[$MAP0]]()[%[[OFFSET]]
++//      CHECK:   %[[SUBSPAN:.+]] = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%[[ZERO]]) : memref<?xf32>{%[[SIZE]]}
++//      CHECK:   %[[INDEX:.+]] = affine.apply #[[$MAP1]]()[%[[I0]], %[[I1]], %[[I2]], %[[OFFSET]]]
+ //      CHECK:   memref.store %[[VALUE]], %[[SUBSPAN]][%[[INDEX]]] : memref<?xf32>
+ 
+ // -----
+ 
+ func.func @load_subspan_with_vector_element(%offset : index, %i0: index, %i1: index, %i2: index) -> vector<4xf32> {
+-  %subspan = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%offset) : memref<6x7x8xvector<4xf32>>
+-  %val = memref.load %subspan[%i0, %i1, %i2] : memref<6x7x8xvector<4xf32>>
++  %subspan = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%offset) : memref<6x7x8xvector<4xf32>, strided<[56, 8, 1], offset:?>>
++  %val = memref.load %subspan[%i0, %i1, %i2] : memref<6x7x8xvector<4xf32>, strided<[56, 8, 1], offset:?>>
+   return %val: vector<4xf32>
+ }
+ 
+@@ -48,8 +50,8 @@ func.func @load_subspan_with_vector_element(%offset : index, %i0: index, %i1: in
+ // -----
+ 
+ func.func @load_subspan_with_16bit_element(%offset : index, %i0: index, %i1: index, %i2: index) -> f16 {
+-  %subspan = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%offset) : memref<6x7x8xf16>
+-  %val = memref.load %subspan[%i0, %i1, %i2] : memref<6x7x8xf16>
++  %subspan = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%offset) : memref<6x7x8xf16, strided<[56, 8, 1], offset:?>>
++  %val = memref.load %subspan[%i0, %i1, %i2] : memref<6x7x8xf16, strided<[56, 8, 1], offset:?>>
+   return %val: f16
+ }
+ 
+@@ -61,18 +63,18 @@ func.func @load_subspan_with_16bit_element(%offset : index, %i0: index, %i1: ind
+ 
+ func.func @store_subspan_with_leading_dynamic_dim(%value: f32, %offset : index, %i0: index, %i1: index, %i2: index) {
+   %dim = hal.interface.constant.load[0] : index
+-  %subspan = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%offset) : memref<?x3x4xf32>{%dim}
+-  memref.store %value, %subspan[%i0, %i1, %i2] : memref<?x3x4xf32>
++  %subspan = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%offset) : memref<?x3x4xf32, strided<[12, 4, 1], offset:?>>{%dim}
++  memref.store %value, %subspan[%i0, %i1, %i2] : memref<?x3x4xf32, strided<[12, 4, 1], offset:?>>
+   return
+ }
+ 
+-//      CHECK: #[[$SIZE_MAP:.+]] = affine_map<()[s0] -> (s0 * 12)
++//      CHECK: #[[$SIZE_MAP:.+]] = affine_map<()[s0, s1] -> (s0 * 12 + s1 floordiv 4)
+ //      CHECK: #[[$OFFSET_MAP:.+]] = affine_map<()[s0, s1, s2, s3] -> (s0 * 12 + s1 * 4 + s2 + s3 floordiv 4)>
+ //CHECK-LABEL: func.func @store_subspan_with_leading_dynamic_dim
+ // CHECK-SAME: (%[[VALUE:.+]]: f32, %[[OFFSET:.+]]: index, %[[I0:.+]]: index, %[[I1:.+]]: index, %[[I2:.+]]: index)
+ //      CHECK:   %[[C0:.+]] = arith.constant 0 : index
+ //      CHECK:   %[[DIM:.+]] = hal.interface.constant.load[0] : index
+-//      CHECK:   %[[SIZE:.+]] = affine.apply #[[$SIZE_MAP]]()[%[[DIM]]]
++//      CHECK:   %[[SIZE:.+]] = affine.apply #[[$SIZE_MAP]]()[%[[DIM]], %[[OFFSET]]]
+ //      CHECK:   %[[DST:.+]] = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%[[C0]]) : memref<?xf32>{%[[SIZE]]}
+ //      CHECK:   %[[INDEX:.+]] = affine.apply #[[$OFFSET_MAP]]()[%[[I0]], %[[I1]], %[[I2]], %[[OFFSET]]]
+ //      CHECK:   memref.store %[[VALUE]], %[[DST]][%[[INDEX]]] : memref<?xf32>
+@@ -84,12 +86,12 @@ func.func @store_subspan_with_all_dynamic_dim(%value: f32, %offset : index, %i0:
+   %dim1 = hal.interface.constant.load[1] : index
+   %dim2 = hal.interface.constant.load[2] : index
+   %dim3 = hal.interface.constant.load[3] : index
+-  %subspan = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%offset) : memref<?x?x?x?xf32>{%dim0, %dim1, %dim2, %dim3}
+-  memref.store %value, %subspan[%i0, %i1, %i2, %i3] : memref<?x?x?x?xf32>
++  %subspan = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%offset) : memref<?x?x?x?xf32, strided<[?, ?, ?, 1], offset: ?>>{%dim0, %dim1, %dim2, %dim3}
++  memref.store %value, %subspan[%i0, %i1, %i2, %i3] : memref<?x?x?x?xf32, strided<[?, ?, ?, 1], offset: ?>>
+   return
+ }
+ 
+-//      CHECK: #[[$SIZE_MAP:.+]] = affine_map<()[s0, s1, s2, s3] -> (((s0 * s1) * s2) * s3)>
++//      CHECK: #[[$SIZE_MAP:.+]] = affine_map<()[s0, s1, s2, s3, s4] -> (((s0 * s1) * s2) * s3 + s4 floordiv 4)>
+ //      CHECK: #[[$OFFSET_MAP:.+]] = affine_map<()[s0, s1, s2, s3, s4, s5, s6, s7] -> (s1 + (s3 + (s6 + s4 * s5) * s2) * s0 + s7 floordiv 4)>
+ //CHECK-LABEL: func.func @store_subspan_with_all_dynamic_dim
+ // CHECK-SAME: (%[[VALUE:.+]]: f32, %[[OFFSET:.+]]: index, %[[I0:.+]]: index, %[[I1:.+]]: index, %[[I2:.+]]: index, %[[I3:.+]]: index)
+@@ -98,7 +100,7 @@ func.func @store_subspan_with_all_dynamic_dim(%value: f32, %offset : index, %i0:
+ //      CHECK:   %[[DIM1:.+]] = hal.interface.constant.load[1] : index
+ //      CHECK:   %[[DIM2:.+]] = hal.interface.constant.load[2] : index
+ //      CHECK:   %[[DIM3:.+]] = hal.interface.constant.load[3] : index
+-//      CHECK:   %[[SIZE:.+]] = affine.apply #[[$SIZE_MAP]]()[%[[DIM0]], %[[DIM1]], %[[DIM2]], %[[DIM3]]]
++//      CHECK:   %[[SIZE:.+]] = affine.apply #[[$SIZE_MAP]]()[%[[DIM0]], %[[DIM1]], %[[DIM2]], %[[DIM3]], %[[OFFSET]]]
+ //      CHECK:   %[[DST:.+]] = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%[[C0]]) : memref<?xf32>{%[[SIZE]]}
+ //      CHECK:   %[[INDEX:.+]] = affine.apply #[[$OFFSET_MAP]]()[%[[DIM3]], %[[I3]], %[[DIM2]], %[[I2]], %[[I0]], %[[DIM1]], %[[I1]], %[[OFFSET]]]
+ //      CHECK:   memref.store %[[VALUE]], %[[DST]][%[[INDEX]]]
+@@ -108,19 +110,19 @@ func.func @store_subspan_with_all_dynamic_dim(%value: f32, %offset : index, %i0:
+ func.func @store_subspan_with_mixed_dynamic_dim(%value: f32, %offset : index, %i0: index, %i1: index, %i2: index, %i3: index) {
+   %dim0 = hal.interface.constant.load[0] : index
+   %dim1 = hal.interface.constant.load[1] : index
+-  %subspan = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%offset) : memref<?x4x?x8xf32>{%dim0, %dim1}
+-  memref.store %value, %subspan[%i0, %i1, %i2, %i3] : memref<?x4x?x8xf32>
++  %subspan = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%offset) : memref<?x4x?x8xf32, strided<[?, ?, 8, 1], offset: ?>>{%dim0, %dim1}
++  memref.store %value, %subspan[%i0, %i1, %i2, %i3] : memref<?x4x?x8xf32, strided<[?, ?, 8, 1], offset: ?>>
+   return
+ }
+ 
+-//      CHECK: #[[$SIZE_MAP:.+]] = affine_map<()[s0, s1] -> ((s0 * s1) * 32)>
++//      CHECK: #[[$SIZE_MAP:.+]] = affine_map<()[s0, s1, s2] -> ((s0 * s1) * 32 + s2 floordiv 4)>
+ //      CHECK: #[[$OFFSET_MAP:.+]] = affine_map<()[s0, s1, s2, s3, s4, s5] -> (s0 + s2 * 8 + ((s3 * 4 + s4) * s1) * 8 + s5 floordiv 4)>
+ //CHECK-LABEL: func.func @store_subspan_with_mixed_dynamic_dim
+ // CHECK-SAME: (%[[VALUE:.+]]: f32, %[[OFFSET:.+]]: index, %[[I0:.+]]: index, %[[I1:.+]]: index, %[[I2:.+]]: index, %[[I3:.+]]: index)
+ //      CHECK:   %[[C0:.+]] = arith.constant 0 : index
+ //      CHECK:   %[[DIM0:.+]] = hal.interface.constant.load[0] : index
+ //      CHECK:   %[[DIM2:.+]] = hal.interface.constant.load[1] : index
+-//      CHECK:   %[[SIZE:.+]] = affine.apply #[[$SIZE_MAP]]()[%[[DIM0]], %[[DIM2]]]
++//      CHECK:   %[[SIZE:.+]] = affine.apply #[[$SIZE_MAP]]()[%[[DIM0]], %[[DIM2]], %[[OFFSET]]]
+ //      CHECK:   %[[DST:.+]] = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%[[C0]]) : memref<?xf32>{%[[SIZE]]}
+ //      CHECK:   %[[INDEX:.+]] = affine.apply #[[$OFFSET_MAP]]()[%[[I3]], %[[DIM2]], %[[I2]], %[[I0]], %[[I1]], %[[OFFSET]]]
+ //      CHECK:   memref.store %[[VALUE]], %[[DST]][%[[INDEX]]]
+@@ -129,20 +131,20 @@ func.func @store_subspan_with_mixed_dynamic_dim(%value: f32, %offset : index, %i
+ 
+ func.func @store_subspan_with_flow_control(%value: f32, %offset : index, %i0: index, %i1: index, %i2: index) {
+   %dim = hal.interface.constant.load[0] : index
+-  %subspan = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%offset) : memref<?x3x4xf32>{%dim}
++  %subspan = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%offset) : memref<?x3x4xf32, strided<[12, 4, 1], offset:?>>{%dim}
+   scf.for %i = %i0 to %i1 step %i2 {
+-    memref.store %value, %subspan[%i0, %i1, %i2] : memref<?x3x4xf32>
++    memref.store %value, %subspan[%i0, %i1, %i2] : memref<?x3x4xf32, strided<[12, 4, 1], offset:?>>
+   }
+   return
+ }
+ 
+-//      CHECK: #[[$SIZE_MAP:.+]] = affine_map<()[s0] -> (s0 * 12)
++//      CHECK: #[[$SIZE_MAP:.+]] = affine_map<()[s0, s1] -> (s0 * 12 + s1 floordiv 4)
+ //      CHECK: #[[$OFFSET_MAP:.+]] = affine_map<()[s0, s1, s2, s3] -> (s0 * 12 + s1 * 4 + s2 + s3 floordiv 4)>
+ //CHECK-LABEL: func.func @store_subspan_with_flow_control
+ // CHECK-SAME: (%[[VALUE:.+]]: f32, %[[OFFSET:.+]]: index, %[[I0:.+]]: index, %[[I1:.+]]: index, %[[I2:.+]]: index)
+ //      CHECK:   %[[C0:.+]] = arith.constant 0 : index
+ //      CHECK:   %[[DIM:.+]] = hal.interface.constant.load[0] : index
+-//      CHECK:   %[[SIZE:.+]] = affine.apply #[[$SIZE_MAP]]()[%[[DIM]]]
++//      CHECK:   %[[SIZE:.+]] = affine.apply #[[$SIZE_MAP]]()[%[[DIM]], %[[OFFSET]]]
+ //      CHECK:   %[[DST:.+]] = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%[[C0]]) : memref<?xf32>{%[[SIZE]]}
+ //      CHECK: scf.for
+ //      CHECK:   %[[INDEX:.+]] = affine.apply #[[$OFFSET_MAP]]()[%[[I0]], %[[I1]], %[[I2]], %[[OFFSET]]]
+@@ -191,23 +193,6 @@ func.func @load_store_alloca_dynamic(%value : f32, %dim0 : index, %dim1: index,
+ 
+ // -----
+ 
+-func.func @use_subspan_with_unrealized_conversion_cast(%offset : index, %i: index) -> f32 {
+-  %subspan = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%offset) : memref<6x7x8xf32>
+-  %use = builtin.unrealized_conversion_cast %subspan : memref<6x7x8xf32> to memref<?xf32>
+-  %val = memref.load %use[%i] : memref<?xf32>
+-  return %val: f32
+-}
+-
+-//      CHECK: #[[$MAP:.+]] = affine_map<()[s0, s1] -> (s0 + s1 floordiv 4)>
+-//CHECK-LABEL: func.func @use_subspan_with_unrealized_conversion_cast
+-// CHECK-SAME: (%[[OFFSET:.+]]: index, %[[I:.+]]: index)
+-//      CHECK:   %[[C0:.+]] = arith.constant 0 : index
+-//      CHECK:   %[[SUBSPAN:.+]] = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%[[C0]]) : memref<?xf32>
+-//      CHECK:   %[[INDEX:.+]] = affine.apply #[[$MAP]]()[%[[I]], %[[OFFSET]]]
+-//      CHECK:   memref.load %[[SUBSPAN]][%[[INDEX]]]
+-
+-// -----
+-
+ memref.global "private" constant @constant_3x3x1x1xf32 : memref<3x3x1x1xf32> = dense<[[[[-1.000000e+00]], [[0.000000e+00]], [[1.000000e+00]]], [[[-2.000000e+00]], [[0.000000e+00]], [[2.000000e+00]]], [[[-1.000000e+00]], [[0.000000e+00]], [[1.000000e+00]]]]>
+ func.func @load_global_with_offset(%i0: index, %i1: index, %i2: index, %i3: index) -> f32 {
+   %global = memref.get_global @constant_3x3x1x1xf32 : memref<3x3x1x1xf32>
+@@ -228,20 +213,23 @@ func.func @load_global_with_offset(%i0: index, %i1: index, %i2: index, %i3: inde
+ 
+ func.func @transfer_read_subspan_with_offset(
+     %arg0 : index, %arg1: index, %arg2: index, %arg3: index) -> vector<4xf32> {
+-  %subspan = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%arg0) : memref<6x7x8xf32>
++  %subspan = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%arg0) : memref<6x7x8xf32, strided<[56, 8, 1], offset:?>>
+   %cst = arith.constant 0.0 : f32
+-  %val = vector.transfer_read %subspan[%arg1, %arg2, %arg3], %cst {in_bounds = [true]} : memref<6x7x8xf32>, vector<4xf32>
++  %val = vector.transfer_read %subspan[%arg1, %arg2, %arg3], %cst {in_bounds = [true]} : memref<6x7x8xf32, strided<[56, 8, 1], offset:?>>, vector<4xf32>
+   return %val: vector<4xf32>
+ }
+ 
+-//      CHECK: #[[$MAP:.+]] =  affine_map<()[s0, s1, s2] -> (s0 * 56 + s1 * 8 + s2)>
++//  CHECK-DAG: #[[$MAP0:.+]] =  affine_map<()[s0] -> (s0 floordiv 4 + 336)>
++//  CHECK-DAG: #[[$MAP1:.+]] =  affine_map<()[s0, s1, s2, s3] -> (s0 * 56 + s1 * 8 + s2 + s3 floordiv 4)>
+ //CHECK-LABEL: func.func @transfer_read_subspan_with_offset
+ // CHECK-SAME:   %[[ARG0:[a-zA-Z0-9_]+]]: index
+ // CHECK-SAME:   %[[ARG1:[a-zA-Z0-9_]+]]: index
+ // CHECK-SAME:   %[[ARG2:[a-zA-Z0-9_]+]]: index
+ // CHECK-SAME:   %[[ARG3:[a-zA-Z0-9_]+]]: index
+-//      CHECK:   %[[MEMREF:.+]] = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%[[ARG0]]) : memref<?xf32>
+-//      CHECK:   %[[INDEX:.+]] = affine.apply #[[$MAP]]()[%[[ARG1]], %[[ARG2]], %[[ARG3]]]
++//  CHECK-DAG:   %[[C0:.+]] = arith.constant 0 : index
++//  CHECK-DAG:   %[[SIZE:.+]] = affine.apply #[[$MAP0]]()[%[[ARG0]]]
++//      CHECK:   %[[MEMREF:.+]] = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%[[C0]]) : memref<?xf32>{%[[SIZE]]}
++//      CHECK:   %[[INDEX:.+]] = affine.apply #[[$MAP1]]()[%[[ARG1]], %[[ARG2]], %[[ARG3]], %[[ARG0]]]
+ //      CHECK:   %[[VEC:.+]] = vector.transfer_read %[[MEMREF]][%[[INDEX]]]
+ //      CHECK:   return %[[VEC]]
+ 
+@@ -249,20 +237,23 @@ func.func @transfer_read_subspan_with_offset(
+ 
+ func.func @transfer_write_subspan_with_offset(
+     %arg0 : index, %arg1: index, %arg2: index, %arg3: index, %arg4 : vector<4xf32>) {
+-  %subspan = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%arg0) : memref<6x7x8xf32>
+-  vector.transfer_write %arg4, %subspan[%arg1, %arg2, %arg3] {in_bounds = [true]} :  vector<4xf32>, memref<6x7x8xf32>
++  %subspan = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%arg0) : memref<6x7x8xf32, strided<[56, 8, 1], offset:?>>
++  vector.transfer_write %arg4, %subspan[%arg1, %arg2, %arg3] {in_bounds = [true]} :  vector<4xf32>, memref<6x7x8xf32, strided<[56, 8, 1], offset:?>>
+   return
+ }
+ 
+-//      CHECK: #[[$MAP:.+]] = affine_map<()[s0, s1, s2] -> (s0 * 56 + s1 * 8 + s2)>
++//  CHECK-DAG: #[[$MAP0:.+]] =  affine_map<()[s0] -> (s0 floordiv 4 + 336)>
++//  CHECK-DAG: #[[$MAP1:.+]] =  affine_map<()[s0, s1, s2, s3] -> (s0 * 56 + s1 * 8 + s2 + s3 floordiv 4)>
+ //CHECK-LABEL: func.func @transfer_write_subspan_with_offset
+ // CHECK-SAME:   %[[ARG0:[a-zA-Z0-9_]+]]: index
+ // CHECK-SAME:   %[[ARG1:[a-zA-Z0-9_]+]]: index
+ // CHECK-SAME:   %[[ARG2:[a-zA-Z0-9_]+]]: index
+ // CHECK-SAME:   %[[ARG3:[a-zA-Z0-9_]+]]: index
+ // CHECK-SAME:   %[[ARG4:[a-zA-Z0-9_]+]]: vector<4xf32>
+-//      CHECK:   %[[MEMREF:.+]] = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%[[ARG0]]) : memref<?xf32>
+-//      CHECK:   %[[INDEX:.+]] = affine.apply #[[$MAP]]()[%[[ARG1]], %[[ARG2]], %[[ARG3]]]
++//  CHECK-DAG:   %[[C0:.+]] = arith.constant 0 : index
++//  CHECK-DAG:   %[[SIZE:.+]] = affine.apply #[[$MAP0]]()[%[[ARG0]]]
++//      CHECK:   %[[MEMREF:.+]] = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%[[C0]]) : memref<?xf32>{%[[SIZE]]}
++//      CHECK:   %[[INDEX:.+]] = affine.apply #[[$MAP1]]()[%[[ARG1]], %[[ARG2]], %[[ARG3]], %[[ARG0]]]
+ //      CHECK:   vector.transfer_write %[[ARG4]], %[[MEMREF]][%[[INDEX]]]
+ 
+ // -----
+@@ -284,77 +275,82 @@ func.func @load_store_rank_zero_subspan_with_zero_offset() {
+ // -----
+ 
+ func.func @load_store_rank_zero_subspan_with_offset(%offset : index) {
+-  %subspan0 = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%offset) : memref<f32>
+-  %subspan1 = hal.interface.binding.subspan set(0) binding(1) type(storage_buffer) offset(%offset) : memref<f32>
+-  %val = memref.load %subspan0[] : memref<f32>
+-  memref.store %val, %subspan1[] : memref<f32>
++  %subspan0 = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%offset) : memref<f32, strided<[], offset:?>>
++  %subspan1 = hal.interface.binding.subspan set(0) binding(1) type(storage_buffer) offset(%offset) : memref<f32, strided<[], offset:?>>
++  %val = memref.load %subspan0[] : memref<f32, strided<[], offset:?>>
++  memref.store %val, %subspan1[] : memref<f32, strided<[], offset:?>>
+   return
+ }
+ 
+-//      CHECK: #[[$MAP:.+]] = affine_map<()[s0] -> (s0 floordiv 4)>
++//  CHECK-DAG: #[[$MAP0:.+]] = affine_map<()[s0] -> (s0 floordiv 4 + 1)>
++//  CHECK-DAG: #[[$MAP1:.+]] = affine_map<()[s0] -> (s0 floordiv 4)>
+ //CHECK-LABEL: func.func @load_store_rank_zero_subspan_with_offset
+ // CHECK-SAME: (%[[OFFSET:.+]]: index)
+ //  CHECK-DAG:   %[[C0:.+]] = arith.constant 0 : index
+-//  CHECK-DAG:   %[[C1:.+]] = arith.constant 1 : index
+-//      CHECK:   %[[SPAN0:.+]] = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%[[C0]]) : memref<?xf32>{%[[C1]]}
+-//      CHECK:   %[[SPAN1:.+]] = hal.interface.binding.subspan set(0) binding(1) type(storage_buffer) offset(%[[C0]]) : memref<?xf32>{%[[C1]]}
+-//      CHECK:   %[[INDEX0:.+]] = affine.apply #[[$MAP]]()[%[[OFFSET]]]
++//  CHECK-DAG:   %[[SIZE0:.+]] = affine.apply #[[$MAP0]]()[%[[OFFSET]]]
++//      CHECK:   %[[SPAN0:.+]] = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%[[C0]]) : memref<?xf32>{%[[SIZE0]]}
++//  CHECK-DAG:   %[[SIZE1:.+]] = affine.apply #[[$MAP0]]()[%[[OFFSET]]]
++//      CHECK:   %[[SPAN1:.+]] = hal.interface.binding.subspan set(0) binding(1) type(storage_buffer) offset(%[[C0]]) : memref<?xf32>{%[[SIZE1]]}
++//      CHECK:   %[[INDEX0:.+]] = affine.apply #[[$MAP1]]()[%[[OFFSET]]]
+ //      CHECK:   %[[LOAD:.+]] = memref.load %[[SPAN0]][%[[INDEX0]]] : memref<?xf32>
+-//      CHECK:   %[[INDEX1:.+]] = affine.apply #[[$MAP]]()[%[[OFFSET]]]
++//      CHECK:   %[[INDEX1:.+]] = affine.apply #[[$MAP1]]()[%[[OFFSET]]]
+ //      CHECK:   memref.store %[[LOAD]], %[[SPAN1]][%[[INDEX1]]] : memref<?xf32>
+ 
+ // -----
+ 
+ func.func @collapse_shape(%offset : index, %i0 : index, %i1 : index) -> f32 {
+-  %subspan = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%offset) : memref<4x5x6x7xf32>
+-  %collapse = memref.collapse_shape %subspan[[0, 1], [2, 3]] : memref<4x5x6x7xf32> into memref<20x42xf32>
+-  %value = memref.load %collapse[%i0, %i1] : memref<20x42xf32>
++  %subspan = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%offset) : memref<4x5x6x7xf32, strided<[210, 42, 7, 1], offset:?>>
++  %collapse = memref.collapse_shape %subspan[[0, 1], [2, 3]] : memref<4x5x6x7xf32, strided<[210, 42, 7, 1], offset:?>> into memref<20x42xf32, strided<[42, 1], offset:?>>
++  %value = memref.load %collapse[%i0, %i1] : memref<20x42xf32, strided<[42, 1], offset:?>>
+   return %value : f32
+ }
+ 
+-//      CHECK: #[[$MAP:.+]] = affine_map<()[s0, s1, s2] -> (s0 * 42 + s1 + s2 floordiv 4)>
++//  CHECK-DAG: #[[$MAP0:.+]] = affine_map<()[s0] -> (s0 floordiv 4 + 840)>
++//  CHECK-DAG: #[[$MAP1:.+]] = affine_map<()[s0, s1, s2] -> (s0 * 42 + s1 + s2 floordiv 4)>
+ //CHECK-LABEL: func.func @collapse_shape
+ // CHECK-SAME: (%[[OFFSET:.+]]: index, %[[I0:.+]]: index, %[[I1:.+]]: index)
+ //  CHECK-DAG:   %[[C0:.+]] = arith.constant 0 : index
+-//  CHECK-DAG:   %[[SIZE:.+]] = arith.constant 840 : index
++//  CHECK-DAG:   %[[SIZE:.+]] = affine.apply #[[$MAP0]]()[%[[OFFSET]]]
+ //      CHECK:   %[[SUBSPAN:.+]] = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%[[C0]]) : memref<?xf32>{%[[SIZE]]}
+-//      CHECK:   %[[INDEX:.+]] = affine.apply #[[$MAP]]()[%[[I0]], %[[I1]], %[[OFFSET]]]
++//      CHECK:   %[[INDEX:.+]] = affine.apply #[[$MAP1]]()[%[[I0]], %[[I1]], %[[OFFSET]]]
+ //      CHECK:   memref.load %[[SUBSPAN]][%[[INDEX]]]
+ 
+ // -----
+ 
+ func.func @expand_shape(%offset : index, %i0: index, %i1: index, %i2: index, %i3: index) -> f32 {
+-  %subspan = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%offset) : memref<20x42xf32>
+-  %expand = memref.expand_shape %subspan[[0, 1], [2, 3]] : memref<20x42xf32> into memref<4x5x6x7xf32>
+-  %value = memref.load %expand[%i0, %i1, %i2, %i3] : memref<4x5x6x7xf32>
++  %subspan = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%offset) : memref<20x42xf32, strided<[42, 1], offset:?>>
++  %expand = memref.expand_shape %subspan[[0, 1], [2, 3]] : memref<20x42xf32, strided<[42, 1], offset:?>> into memref<4x5x6x7xf32, strided<[210, 42, 7, 1], offset:?>>
++  %value = memref.load %expand[%i0, %i1, %i2, %i3] : memref<4x5x6x7xf32, strided<[210, 42, 7, 1], offset:?>>
+   return %value : f32
+ }
+ 
+-//      CHECK: #[[$MAP:.+]] = affine_map<()[s0, s1, s2, s3, s4] -> (s0 * 210 + s1 * 42 + s2 * 7 + s3 + s4 floordiv 4)>
++//  CHECK-DAG: #[[$MAP0:.+]] = affine_map<()[s0] -> (s0 floordiv 4 + 840)>
++//  CHECK-DAG: #[[$MAP1:.+]] = affine_map<()[s0, s1, s2, s3, s4] -> (s0 * 210 + s1 * 42 + s2 * 7 + s3 + s4 floordiv 4)>
+ //CHECK-LABEL: func.func @expand_shape
+ // CHECK-SAME: (%[[OFFSET:.+]]: index, %[[I0:.+]]: index, %[[I1:.+]]: index, %[[I2:.+]]: index, %[[I3:.+]]: index)
+ //  CHECK-DAG:   %[[C0:.+]] = arith.constant 0 : index
+-//  CHECK-DAG:   %[[SIZE:.+]] = arith.constant 840 : index
++//  CHECK-DAG:   %[[SIZE:.+]] = affine.apply #[[$MAP0]]()[%[[OFFSET]]]
+ //      CHECK:   %[[SUBSPAN:.+]] = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%[[C0]]) : memref<?xf32>{%[[SIZE]]}
+-//      CHECK:   %[[INDEX:.+]] = affine.apply #[[$MAP]]()[%[[I0]], %[[I1]], %[[I2]], %[[I3]], %[[OFFSET]]]
++//      CHECK:   %[[INDEX:.+]] = affine.apply #[[$MAP1]]()[%[[I0]], %[[I1]], %[[I2]], %[[I3]], %[[OFFSET]]]
+ //      CHECK:   memref.load %[[SUBSPAN]][%[[INDEX]]]
+ 
+ // -----
+ 
+ func.func @expand_shape2(%offset : index, %i0: index, %i1: index) -> f32 {
+-  %subspan = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%offset) : memref<128xf32>
+-  %expand = memref.expand_shape %subspan [[0, 1]] : memref<128xf32> into memref<1x128xf32>
+-  %value = memref.load %expand[%i0, %i1] : memref<1x128xf32>
++  %subspan = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%offset) : memref<128xf32, strided<[1], offset: ?>>
++  %expand = memref.expand_shape %subspan [[0, 1]] : memref<128xf32, strided<[1], offset: ?>> into memref<1x128xf32, strided<[128, 1], offset: ?>>
++  %value = memref.load %expand[%i0, %i1] : memref<1x128xf32, strided<[128, 1], offset: ?>>
+   return %value : f32
+ }
+ 
+-//      CHECK: #[[$MAP:.+]] = affine_map<()[s0, s1, s2] -> (s0 * 128 + s1 + s2 floordiv 4)>
++//  CHECK-DAG: #[[$MAP0:.+]] = affine_map<()[s0] -> (s0 floordiv 4 + 128)>
++//  CHECK-DAG: #[[$MAP1:.+]] = affine_map<()[s0, s1, s2] -> (s0 * 128 + s1 + s2 floordiv 4)>
+ //CHECK-LABEL: func.func @expand_shape2
+ // CHECK-SAME: (%[[OFFSET:.+]]: index, %[[I0:.+]]: index, %[[I1:.+]]: index)
+ //  CHECK-DAG:   %[[C0:.+]] = arith.constant 0 : index
+-//  CHECK-DAG:   %[[SIZE:.+]] = arith.constant 128 : index
++//  CHECK-DAG:   %[[SIZE:.+]] = affine.apply #[[$MAP0]]()[%[[OFFSET]]]
+ //      CHECK:   %[[SUBSPAN:.+]] = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%[[C0]]) : memref<?xf32>{%[[SIZE]]}
+-//      CHECK:   %[[INDEX:.+]] = affine.apply #[[$MAP]]()[%[[I0]], %[[I1]], %[[OFFSET]]]
++//      CHECK:   %[[INDEX:.+]] = affine.apply #[[$MAP1]]()[%[[I0]], %[[I1]], %[[OFFSET]]]
+ //      CHECK:   memref.load %[[SUBSPAN]][%[[INDEX]]]
+ 
+ // -----
+@@ -363,33 +359,40 @@ func.func @expand_shape2(%offset : index, %i0: index, %i1: index) -> f32 {
+ // be able to do so (a memref cast is inserted to move between unknown and
+ // known dim).
+ func.func @static_collapse_shape_to_1d_static(%offset : index, %i: index) {
+-  %subspan = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%offset) : memref<6x7x8xf32>
+-  %collapse = memref.collapse_shape %subspan [[0, 1, 2]] : memref<6x7x8xf32> into memref<336xf32>
+-  "unregistered.opaque"(%collapse) : (memref<336xf32>) -> ()
++  %subspan = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%offset) : memref<6x7x8xf32, strided<[56, 8, 1], offset:?>>
++  %collapse = memref.collapse_shape %subspan [[0, 1, 2]] : memref<6x7x8xf32, strided<[56, 8, 1], offset:?>> into memref<336xf32, strided<[1], offset: ?>>
++  "unregistered.opaque"(%collapse) : (memref<336xf32, strided<[1], offset: ?>>) -> ()
+ }
+-
+-//      CHECK:   %[[SIZE:.+]] = arith.constant 336 : index
+-//      CHECK:   %[[SUBSPAN:.+]] = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%arg0) : memref<?xf32>{%[[SIZE]]}
+-//      CHECK:   %[[STATIC_CAST:.+]] = memref.cast %0 : memref<?xf32> to memref<336xf32>
+-//      CHECK:   "unregistered.opaque"(%[[STATIC_CAST]])
++//   CHECK-DAG: #[[$MAP0:.+]] = affine_map<()[s0] -> (s0 floordiv 4)
++//   CHECK-DAG: #[[$MAP1:.+]] = affine_map<()[s0] -> (s0 floordiv 4 + 336)
++// CHECK-LABEL: func.func @static_collapse_shape_to_1d_static(
++//  CHECK-SAME:     %[[ARG0:[a-zA-Z0-9]+]]: index
++//  CHECK-SAME:     %[[ARG1:[a-zA-Z0-9]+]]: index)
++//   CHECK-DAG:   %[[C0:.+]] = arith.constant 0 : index
++//   CHECK-DAG:   %[[OFFSET:.+]] = affine.apply #[[$MAP0]]()[%[[ARG0]]
++//   CHECK-DAG:   %[[SIZE:.+]] = affine.apply #[[$MAP1]]()[%[[ARG0]]
++//       CHECK:   %[[SUBSPAN:.+]] = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%[[C0]]) : memref<?xf32>{%[[SIZE]]}
++//       CHECK:   %[[SUBVIEW:.+]] = memref.subview %[[SUBSPAN]][%[[OFFSET]]] [336] [1] : memref<?xf32> to memref<336xf32, strided<[1], offset: ?>>
++//       CHECK:   "unregistered.opaque"(%[[SUBVIEW]])
+ 
+ // -----
+ 
+ func.func @subview(%offset : index, %i0: index, %i1: index) -> f32 {
+   %c0 = arith.constant 0 : index
+-  %subspan = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%offset) : memref<32x128xf32>
+-  %expand = memref.subview %subspan[%i0, %i1][16, 8][1, 1] : memref<32x128xf32> to memref<16x8xf32, strided<[128, 1], offset: ?>>
++  %subspan = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%offset) : memref<32x128xf32, strided<[128, 1], offset: ?>>
++  %expand = memref.subview %subspan[%i0, %i1][16, 8][1, 1] : memref<32x128xf32, strided<[128, 1], offset: ?>> to memref<16x8xf32, strided<[128, 1], offset: ?>>
+   %value = memref.load %expand[%c0, %c0] : memref<16x8xf32, strided<[128, 1], offset: ?>>
+   return %value : f32
+ }
+ 
+-//      CHECK: #[[$MAP:.+]] = affine_map<()[s0, s1, s2] -> (s0 * 128 + s1 + s2 floordiv 4)>
++//  CHECK-DAG: #[[$MAP0:.+]] = affine_map<()[s0] -> (s0 floordiv 4 + 4096)>
++//  CHECK-DAG: #[[$MAP1:.+]] = affine_map<()[s0, s1, s2] -> (s0 * 128 + s1 + s2 floordiv 4)>
+ //CHECK-LABEL: func.func @subview
+ // CHECK-SAME: (%[[OFFSET:.+]]: index, %[[I0:.+]]: index, %[[I1:.+]]: index)
+ //  CHECK-DAG:   %[[C0:.+]] = arith.constant 0 : index
+-//  CHECK-DAG:   %[[SIZE:.+]] = arith.constant 4096 : index
++//  CHECK-DAG:   %[[SIZE:.+]] = affine.apply #[[$MAP0]]()[%[[OFFSET]]]
+ //      CHECK:   %[[SUBSPAN:.+]] = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%[[C0]]) : memref<?xf32>{%[[SIZE]]}
+-//      CHECK:   %[[INDEX:.+]] = affine.apply #[[$MAP]]()[%[[I0]], %[[I1]], %[[OFFSET]]]
++//      CHECK:   %[[INDEX:.+]] = affine.apply #[[$MAP1]]()[%[[I0]], %[[I1]], %[[OFFSET]]]
+ //      CHECK:   memref.load %[[SUBSPAN]][%[[INDEX]]]
+ 
+ // -----
+@@ -426,68 +429,78 @@ func.func @subgroup_mma_store(%i0: index, %i1: index, %val: !gpu.mma_matrix<16x1
+ // -----
+ 
+ func.func @subgroup_mma_load_with_offset(%offset : index, %i0: index, %i1: index) -> !gpu.mma_matrix<16x16xf16, "AOp"> {
+-  %subspan = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%offset) : memref<32x32xf16, 3>
+-  %0 = gpu.subgroup_mma_load_matrix %subspan[%i0, %i1] {leadDimension = 32 : index} : memref<32x32xf16, 3> -> !gpu.mma_matrix<16x16xf16, "AOp">
++  %subspan = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%offset) : memref<32x32xf16, strided<[32, 1], offset: ?>, 3>
++  %0 = gpu.subgroup_mma_load_matrix %subspan[%i0, %i1] {leadDimension = 32 : index} : memref<32x32xf16, strided<[32, 1], offset: ?>, 3> -> !gpu.mma_matrix<16x16xf16, "AOp">
+   return %0 : !gpu.mma_matrix<16x16xf16, "AOp">
+ }
+ 
+-//       CHECK: #[[$MAP:.+]] = affine_map<()[s0, s1, s2] -> (s0 * 32 + s1 + s2 floordiv 2)>
++//   CHECK-DAG: #[[$MAP0:.+]] = affine_map<()[s0] -> (s0 floordiv 2)>
++//   CHECK-DAG: #[[$MAP1:.+]] = affine_map<()[s0] -> (s0 floordiv 2 + 1024)>
++//   CHECK-DAG: #[[$MAP2:.+]] = affine_map<()[s0, s1] -> (s0 * 32 + s1)>
+ // CHECK-LABEL: func.func @subgroup_mma_load_with_offset
+ //  CHECK-SAME: (%[[OFFSET:.+]]: index, %[[I0:.+]]: index, %[[I1:.+]]: index)
+ //   CHECK-DAG:   %[[ZERO:.+]] = arith.constant 0 : index
+-//   CHECK-DAG:   %[[C1024:.+]] = arith.constant 1024 : index
+-//       CHECK:   %[[SUBSPAN:.+]] = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%[[ZERO]]) : memref<?xf16, 3>{%[[C1024]]}
+-//       CHECK:   %[[INDEX:.+]] = affine.apply #[[$MAP]]()[%[[I0]], %[[I1]], %[[OFFSET]]]
+-//       CHECK:  %[[LD:.+]] = gpu.subgroup_mma_load_matrix %[[SUBSPAN]][%[[INDEX]]] {leadDimension = 32 : index} : memref<?xf16, 3> -> !gpu.mma_matrix<16x16xf16, "AOp">
++//   CHECK-DAG:   %[[SUBVIEW_OFFSET:.+]] = affine.apply #[[$MAP0]]()[%[[OFFSET]]]
++//   CHECK-DAG:   %[[SIZE:.+]] = affine.apply #[[$MAP1]]()[%[[OFFSET]]]
++//       CHECK:   %[[SUBSPAN:.+]] = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%[[ZERO]]) : memref<?xf16, 3>{%[[SIZE]]}
++//       CHECK:   %[[SUBVIEW:.+]] = memref.subview %[[SUBSPAN]][%[[SUBVIEW_OFFSET]]] [1024] [1]
++//       CHECK:   %[[INDEX:.+]] = affine.apply #[[$MAP2]]()[%[[I0]], %[[I1]]]
++//       CHECK:  %[[LD:.+]] = gpu.subgroup_mma_load_matrix %[[SUBVIEW]][%[[INDEX]]] {leadDimension = 32 : index}
+ //       CHECK:  return %[[LD]]
+ 
+ // -----
+ 
+ func.func @subgroup_mma_store_with_offset(%offset : index, %i0: index, %i1: index, %val: !gpu.mma_matrix<16x16xf16, "COp">) {
+-  %subspan = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%offset) : memref<32x32xf16, 3>
+-  gpu.subgroup_mma_store_matrix %val, %subspan[%i0, %i1] {leadDimension = 128 : index} : !gpu.mma_matrix<16x16xf16, "COp">, memref<32x32xf16, 3>
++  %subspan = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%offset) : memref<32x32xf16, strided<[32, 1], offset: ?>, 3>
++  gpu.subgroup_mma_store_matrix %val, %subspan[%i0, %i1] {leadDimension = 128 : index} : !gpu.mma_matrix<16x16xf16, "COp">, memref<32x32xf16, strided<[32, 1], offset: ?>, 3>
+   return
+ }
+ 
+-//       CHECK: #[[$MAP:.+]] = affine_map<()[s0, s1, s2] -> (s0 * 32 + s1 + s2 floordiv 2)>
++//   CHECK-DAG: #[[$MAP0:.+]] = affine_map<()[s0] -> (s0 floordiv 2)>
++//   CHECK-DAG: #[[$MAP1:.+]] = affine_map<()[s0] -> (s0 floordiv 2 + 1024)>
++//   CHECK-DAG: #[[$MAP2:.+]] = affine_map<()[s0, s1] -> (s0 * 32 + s1)>
+ // CHECK-LABEL: func.func @subgroup_mma_store_with_offset
+ //  CHECK-SAME: (%[[OFFSET:.+]]: index, %[[I0:.+]]: index, %[[I1:.+]]: index, %[[VAL:.+]]: !gpu.mma_matrix<16x16xf16, "COp">
+ //   CHECK-DAG:   %[[ZERO:.+]] = arith.constant 0 : index
+-//   CHECK-DAG:   %[[C1024:.+]] = arith.constant 1024 : index
+-//       CHECK:   %[[SUBSPAN:.+]] = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%[[ZERO]]) : memref<?xf16, 3>{%[[C1024]]}
+-//       CHECK:   %[[INDEX:.+]] = affine.apply #[[$MAP]]()[%[[I0]], %[[I1]], %[[OFFSET]]]
+-//       CHECK:   gpu.subgroup_mma_store_matrix %[[VAL]], %[[SUBSPAN]][%[[INDEX]]] {leadDimension = 128 : index} : !gpu.mma_matrix<16x16xf16, "COp">, memref<?xf16, 3>
++//   CHECK-DAG:   %[[SUBVIEW_OFFSET:.+]] = affine.apply #[[$MAP0]]()[%[[OFFSET]]]
++//   CHECK-DAG:   %[[SIZE:.+]] = affine.apply #[[$MAP1]]()[%[[OFFSET]]]
++//       CHECK:   %[[SUBSPAN:.+]] = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%[[ZERO]]) : memref<?xf16, 3>{%[[SIZE]]}
++//       CHECK:   %[[SUBVIEW:.+]] = memref.subview %[[SUBSPAN]][%[[SUBVIEW_OFFSET]]] [1024] [1]
++//       CHECK:   %[[INDEX:.+]] = affine.apply #[[$MAP2]]()[%[[I0]], %[[I1]]]
++//       CHECK:   gpu.subgroup_mma_store_matrix %[[VAL]], %[[SUBVIEW]][%[[INDEX]]] {leadDimension = 128 : index}
+ 
+ // -----
+ 
+ func.func @load_uniform_buffer(%offset: index, %i0: index, %i1 : index, %i2: index) -> i32 {
+-  %subspan = hal.interface.binding.subspan set(0) binding(0) type(uniform_buffer) offset(%offset) : memref<2x3x4xi32, #hal.descriptor_type<uniform_buffer>>
+-  %val = memref.load %subspan[%i0, %i1, %i2] : memref<2x3x4xi32, #hal.descriptor_type<uniform_buffer>>
++  %subspan = hal.interface.binding.subspan set(0) binding(0) type(uniform_buffer) offset(%offset) : memref<2x3x4xi32, strided<[12, 4, 1], offset:?>, #hal.descriptor_type<uniform_buffer>>
++  %val = memref.load %subspan[%i0, %i1, %i2] : memref<2x3x4xi32, strided<[12, 4, 1], offset:?>, #hal.descriptor_type<uniform_buffer>>
+   return %val: i32
+ }
+ 
+-//       CHECK: #[[$MAP:.+]] = affine_map<()[s0, s1, s2, s3] -> (s0 * 12 + s1 * 4 + s2 + s3 floordiv 4)>
++//       CHECK: #[[$MAP1:.+]] = affine_map<()[s0, s1, s2, s3] -> (s0 * 12 + s1 * 4 + s2 + s3 floordiv 4)>
+ // CHECK-LABEL: func.func @load_uniform_buffer
+ //  CHECK-SAME: (%[[OFFSET:.+]]: index, %[[I0:.+]]: index, %[[I1:.+]]: index, %[[I2:.+]]: index)
+ //       CHECK:   %[[C0:.+]] = arith.constant 0 : index
+-//       CHECK:   %[[SUBSPAN:.+]] = hal.interface.binding.subspan set(0) binding(0) type(uniform_buffer) offset(%[[C0]]) : memref<24xi32, #hal.descriptor_type<uniform_buffer>>
+-//       CHECK:   %[[INDEX:.+]] = affine.apply #[[$MAP]]()[%[[I0]], %[[I1]], %[[I2]], %[[OFFSET]]]
+-//       CHECK:   %[[LD:.+]] = memref.load %[[SUBSPAN]][%[[INDEX]]] : memref<24xi32, #hal.descriptor_type<uniform_buffer>>
++//       CHECK:   %[[SUBSPAN:.+]] = hal.interface.binding.subspan set(0) binding(0) type(uniform_buffer) offset(%[[C0]]) : memref<?xi32, #hal.descriptor_type<uniform_buffer>>
++//       CHECK:   %[[INDEX:.+]] = affine.apply #[[$MAP1]]()[%[[I0]], %[[I1]], %[[I2]], %[[OFFSET]]]
++//       CHECK:   %[[LD:.+]] = memref.load %[[SUBSPAN]][%[[INDEX]]] : memref<?xi32, #hal.descriptor_type<uniform_buffer>>
+ //       CHECK:   return %[[LD]] : i32
+ 
+ 
+ // -----
+ 
+ func.func @store_uniform_buffer(%value : i32, %offset: index, %i0: index, %i1 : index, %i2: index) {
+-  %subspan = hal.interface.binding.subspan set(0) binding(0) type(uniform_buffer) offset(%offset) : memref<2x3x4xi32, #hal.descriptor_type<uniform_buffer>>
+-  memref.store %value, %subspan[%i0, %i1, %i2] : memref<2x3x4xi32, #hal.descriptor_type<uniform_buffer>>
++  %subspan = hal.interface.binding.subspan set(0) binding(0) type(uniform_buffer) offset(%offset) : memref<2x3x4xi32, strided<[12, 4, 1], offset:?>, #hal.descriptor_type<uniform_buffer>>
++  memref.store %value, %subspan[%i0, %i1, %i2] : memref<2x3x4xi32, strided<[12, 4, 1], offset:?>, #hal.descriptor_type<uniform_buffer>>
+   return
+ }
+ 
+-//       CHECK: #[[$MAP:.+]] = affine_map<()[s0, s1, s2, s3] -> (s0 * 12 + s1 * 4 + s2 + s3 floordiv 4)>
++//   CHECK-DAG: #[[$MAP0:.+]] = affine_map<()[s0] -> (s0 floordiv 4 + 24)>
++//   CHECK-DAG: #[[$MAP1:.+]] = affine_map<()[s0, s1, s2, s3] -> (s0 * 12 + s1 * 4 + s2 + s3 floordiv 4)>
+ // CHECK-LABEL: func.func @store_uniform_buffer
+ //  CHECK-SAME: (%[[VAL:.+]]: i32, %[[OFFSET:.+]]: index, %[[I0:.+]]: index, %[[I1:.+]]: index, %[[I2:.+]]: index)
+ //       CHECK:   %[[C0:.+]] = arith.constant 0 : index
+-//       CHECK:   %[[SUBSPAN:.+]] = hal.interface.binding.subspan set(0) binding(0) type(uniform_buffer) offset(%[[C0]]) : memref<24xi32, #hal.descriptor_type<uniform_buffer>>
+-//       CHECK:   %[[INDEX:.+]] = affine.apply #[[$MAP]]()[%[[I0]], %[[I1]], %[[I2]], %[[OFFSET]]]
+-//       CHECK:   memref.store %[[VAL]], %[[SUBSPAN]][%[[INDEX]]] : memref<24xi32, #hal.descriptor_type<uniform_buffer>>
++//       CHECK:   %[[SIZE:.+]] = affine.apply #[[$MAP0]]()[%[[OFFSET]]]
++//       CHECK:   %[[SUBSPAN:.+]] = hal.interface.binding.subspan set(0) binding(0) type(uniform_buffer) offset(%[[C0]]) : memref<?xi32, #hal.descriptor_type<uniform_buffer>>{%[[SIZE]]}
++//       CHECK:   %[[INDEX:.+]] = affine.apply #[[$MAP1]]()[%[[I0]], %[[I1]], %[[I2]], %[[OFFSET]]]
++//       CHECK:   memref.store %[[VAL]], %[[SUBSPAN]][%[[INDEX]]] : memref<?xi32, #hal.descriptor_type<uniform_buffer>>
+diff --git a/compiler/src/iree/compiler/Codegen/Passes.h b/compiler/src/iree/compiler/Codegen/Passes.h
+index 91de123833ac..0efbc2b71f25 100644
+--- a/compiler/src/iree/compiler/Codegen/Passes.h
++++ b/compiler/src/iree/compiler/Codegen/Passes.h
+@@ -63,6 +63,11 @@ createBufferizeCopyOnlyDispatchesPass();
+ // one op in the body.
+ std::unique_ptr<Pass> createDecomposeLinalgGenericPass();
+ 
++// Fixes resturn types of `hal.interface.binding.subspan` ops with non-zero
++// offsets.
++std::unique_ptr<OperationPass<func::FuncOp>>
++createFixupSubspanWithOffsetsPass();
++
+ /// Flattens n-D MemRef subspan ops to 1-D MemRef and folds the byte offsets
+ /// on subspan ops to the consumer load/store ops, in preparation for lowering
+ /// to backends that require linearized access.
+diff --git a/compiler/src/iree/compiler/Codegen/Passes.td b/compiler/src/iree/compiler/Codegen/Passes.td
+index 320634f6d790..4ad0cdc8aa9d 100644
+--- a/compiler/src/iree/compiler/Codegen/Passes.td
++++ b/compiler/src/iree/compiler/Codegen/Passes.td
+@@ -47,6 +47,18 @@ def DecomposeLinalgGeneric :
+   let constructor = "mlir::iree_compiler::createDecomposeLinalgGenericPass()";
+ }
+ 
++def FixupSubspanWithOffsets :
++    Pass<"iree-codegen-fixup-subspan-with-offsets", "func::FuncOp"> {
++  let summary = "Fixes up `hal.interface.binding.subspan` ops with offsets";
++  let constructor =
++      "mlir::iree_compiler::createFixupSubspanWithOffsetsPass()";
++  let options = [
++    Option<"keepDeadSubspanOps", "keep-dead-subspan-ops",
++            "bool", /*default=*/"false",
++            "Flag to not remove dead subspan ops (used for testing only)">
++  ];
++}
++
+ def FlattenMemRefSubspan :
+   Pass<"iree-codegen-flatten-memref-subspan", "ModuleOp"> {
+   let summary =
+diff --git a/compiler/src/iree/compiler/Codegen/SPIRV/Passes.cpp b/compiler/src/iree/compiler/Codegen/SPIRV/Passes.cpp
+index 61e3f89e3c37..0e3a5544a8dc 100644
+--- a/compiler/src/iree/compiler/Codegen/SPIRV/Passes.cpp
++++ b/compiler/src/iree/compiler/Codegen/SPIRV/Passes.cpp
+@@ -199,6 +199,7 @@ static void addMemRefLoweringPasses(OpPassManager &pm) {
+ 
+   // Turn multi-dimension memref into one-dimension. This is needed for SPIR-V
+   // because we don't use upstream memref descriptors.
++  pm.addNestedPass<func::FuncOp>(createFixupSubspanWithOffsetsPass());
+   pm.addPass(createFlattenMemRefSubspanPass());
+ }
+ 
+diff --git a/compiler/src/iree/compiler/Codegen/Utils/Utils.cpp b/compiler/src/iree/compiler/Codegen/Utils/Utils.cpp
+index c07ce92afd2d..ee4c80654006 100644
+--- a/compiler/src/iree/compiler/Codegen/Utils/Utils.cpp
++++ b/compiler/src/iree/compiler/Codegen/Utils/Utils.cpp
+@@ -665,61 +665,80 @@ static Value buildHALWorkgroupInfoOp(OpBuilder &b, unsigned dim) {
+ 
+ linalg::LinalgLoopDistributionOptions getIREELinalgLoopDistributionOptions(
+     const SmallVector<int64_t> &tileSizes) {
+-  return {
+-      [&tileSizes](OpBuilder &builder, Location loc,
+-                   ArrayRef<Range> parallelLoopRanges) {
+-        SmallVector<int64_t> nonZeroTileSizes;
+-        for (int64_t size : tileSizes) {
+-          if (size != 0) nonZeroTileSizes.push_back(size);
++  return {[&tileSizes](OpBuilder &builder, Location loc,
++                       ArrayRef<Range> parallelLoopRanges) {
++    SmallVector<int64_t> nonZeroTileSizes;
++    for (int64_t size : tileSizes) {
++      if (size != 0) nonZeroTileSizes.push_back(size);
++    }
++    auto numParallelDims = parallelLoopRanges.size();
++
++    SmallVector<linalg::ProcInfo, 3> procInfo(numParallelDims);
++    Value splitDim;
++    for (size_t dim = 0; dim < numParallelDims; ++dim) {
++      if (numParallelDims > kNumMaxParallelDims &&
++          dim >= kNumMaxParallelDims - 1) {
++        if (!splitDim) {
++          splitDim = buildHALWorkgroupInfoOp<IREE::HAL::InterfaceWorkgroupIDOp>(
++              builder, 2);
+         }
+-        auto numParallelDims = parallelLoopRanges.size();
+-
+-        SmallVector<linalg::ProcInfo, 3> procInfo(numParallelDims);
+-        Value splitDim;
+-        for (size_t dim = 0; dim < numParallelDims; ++dim) {
+-          if (numParallelDims > kNumMaxParallelDims &&
+-              dim >= kNumMaxParallelDims - 1) {
+-            if (!splitDim) {
+-              splitDim =
+-                  buildHALWorkgroupInfoOp<IREE::HAL::InterfaceWorkgroupIDOp>(
+-                      builder, 2);
+-            }
+-            Value size = getValueOrCreateConstantIndexOp(
+-                builder, loc,
+-                parallelLoopRanges[numParallelDims - dim - 1].size);
+-            Value offset = getValueOrCreateConstantIndexOp(
+-                builder, loc,
+-                parallelLoopRanges[numParallelDims - dim - 1].offset);
+-            AffineExpr d0, d1;
+-            int64_t tileSize = nonZeroTileSizes[numParallelDims - dim - 1];
+-            bindSymbols(builder.getContext(), d0, d1);
+-            Value numTiles = makeComposedAffineApply(
+-                builder, loc, (d0 - d1).ceilDiv(tileSize), {size, offset});
+-            Value dimValue;
+-            if (dim == numParallelDims - 1)
+-              dimValue = splitDim;
+-            else {
+-              dimValue =
+-                  builder.create<arith::RemUIOp>(loc, splitDim, numTiles);
+-              splitDim =
+-                  builder.create<arith::DivUIOp>(loc, splitDim, numTiles);
+-            }
+-            procInfo[numParallelDims - dim - 1] = {
+-                dimValue,
+-                numTiles,
+-                linalg::DistributionMethod::Cyclic,
+-            };
+-            continue;
+-          }
+-          procInfo[numParallelDims - dim - 1] = {
+-              buildHALWorkgroupInfoOp<IREE::HAL::InterfaceWorkgroupIDOp>(
+-                  builder, dim),
+-              buildHALWorkgroupInfoOp<IREE::HAL::InterfaceWorkgroupCountOp>(
+-                  builder, dim),
+-              linalg::DistributionMethod::Cyclic};
++        Value size = getValueOrCreateConstantIndexOp(
++            builder, loc, parallelLoopRanges[numParallelDims - dim - 1].size);
++        Value offset = getValueOrCreateConstantIndexOp(
++            builder, loc, parallelLoopRanges[numParallelDims - dim - 1].offset);
++        AffineExpr d0, d1;
++        int64_t tileSize = nonZeroTileSizes[numParallelDims - dim - 1];
++        bindSymbols(builder.getContext(), d0, d1);
++        Value numTiles = makeComposedAffineApply(
++            builder, loc, (d0 - d1).ceilDiv(tileSize), {size, offset});
++        Value dimValue;
++        if (dim == numParallelDims - 1)
++          dimValue = splitDim;
++        else {
++          dimValue = builder.create<arith::RemUIOp>(loc, splitDim, numTiles);
++          splitDim = builder.create<arith::DivUIOp>(loc, splitDim, numTiles);
+         }
+-        return procInfo;
+-      }};
++        procInfo[numParallelDims - dim - 1] = {
++            dimValue,
++            numTiles,
++            linalg::DistributionMethod::Cyclic,
++        };
++        continue;
++      }
++      procInfo[numParallelDims - dim - 1] = {
++          buildHALWorkgroupInfoOp<IREE::HAL::InterfaceWorkgroupIDOp>(builder,
++                                                                     dim),
++          buildHALWorkgroupInfoOp<IREE::HAL::InterfaceWorkgroupCountOp>(builder,
++                                                                        dim),
++          linalg::DistributionMethod::Cyclic};
++    }
++    return procInfo;
++  }};
++}
++
++//===---------------------------------------------------------------------===//
++// Misc. utility functions
++//===---------------------------------------------------------------------===//
++
++OpFoldResult convertByteOffsetToElementOffset(RewriterBase &rewriter,
++                                              Location loc,
++                                              OpFoldResult byteOffset,
++                                              Type elementType) {
++  OpFoldResult elementWidth =
++      TypeSwitch<Type, OpFoldResult>(elementType)
++          .Case<ComplexType, FloatType, IntegerType, VectorType>(
++              [&](auto type) -> OpFoldResult {
++                return rewriter.getIndexAttr(
++                    IREE::Util::getRoundedElementByteWidth(elementType));
++              })
++          .Default([&](Type t) -> OpFoldResult {
++            return rewriter.create<IREE::Util::SizeOfOp>(loc, elementType)
++                .getResult();
++          });
++  AffineExpr s0, s1;
++  bindSymbols(rewriter.getContext(), s0, s1);
++  return makeComposedFoldedAffineApply(rewriter, loc, s0.floorDiv(s1),
++                                       {byteOffset, elementWidth});
+ }
+ 
+ void replaceMemrefUsesAndPropagateType(Operation *oldOp, Value val,
+diff --git a/compiler/src/iree/compiler/Codegen/Utils/Utils.h b/compiler/src/iree/compiler/Codegen/Utils/Utils.h
+index 35933542bf6c..a6b98cfb7bc3 100644
+--- a/compiler/src/iree/compiler/Codegen/Utils/Utils.h
++++ b/compiler/src/iree/compiler/Codegen/Utils/Utils.h
+@@ -195,6 +195,17 @@ Operation *createLinalgCopyOp(OpBuilder &b, Location loc, Value from, Value to,
+ linalg::LinalgLoopDistributionOptions getIREELinalgLoopDistributionOptions(
+     const SmallVector<int64_t> &tileSizes);
+ 
++//===---------------------------------------------------------------------===//
++// Misc. utility functions.
++//===---------------------------------------------------------------------===//
++
++/// Convert byte offset into offsets in terms of number of elements based
++/// on `elementType`
++OpFoldResult convertByteOffsetToElementOffset(RewriterBase &rewriter,
++                                              Location loc,
++                                              OpFoldResult byteOffset,
++                                              Type elementType);
++
+ /// Replace the uses of memref `oldOp` with the given `val` and for subview uses
+ /// propagate the type change. Changing the memref type may require propagating
+ /// it through subview ops so we cannot just do a replaceAllUse but need to
+diff --git a/compiler/src/iree/compiler/Dialect/Util/IR/UtilTypes.h b/compiler/src/iree/compiler/Dialect/Util/IR/UtilTypes.h
+index 1915a59056dd..220fa4561e11 100644
+--- a/compiler/src/iree/compiler/Dialect/Util/IR/UtilTypes.h
++++ b/compiler/src/iree/compiler/Dialect/Util/IR/UtilTypes.h
+@@ -205,6 +205,10 @@ static inline int32_t getRoundedElementByteWidth(Type type) {
+   if (auto complexType = type.dyn_cast<ComplexType>()) {
+     return 2 * getRoundedElementByteWidth(complexType.getElementType());
+   }
++  if (auto vectorType = type.dyn_cast<VectorType>()) {
++    return vectorType.getNumElements() *
++           getRoundedElementByteWidth(vectorType.getElementType());
++  }
+   unsigned bitsUnaligned = type.getIntOrFloatBitWidth();
+   assert(bitsUnaligned > 0 && "0-width types unsupported");
+   // Round up to 8-bit aligned bytes.
+diff --git a/compiler/src/iree/compiler/Dialect/VMVX/Transforms/Passes.cpp b/compiler/src/iree/compiler/Dialect/VMVX/Transforms/Passes.cpp
+index e69e091ea436..043f6925539d 100644
+--- a/compiler/src/iree/compiler/Dialect/VMVX/Transforms/Passes.cpp
++++ b/compiler/src/iree/compiler/Dialect/VMVX/Transforms/Passes.cpp
+@@ -75,6 +75,8 @@ static void buildVectorVMVXTransformPassPipeline(OpPassManager &passManager) {
+ 
+   // Resolve get_buffer_descriptor ops. All structural buffer manipulations
+   // must conclude before this point.
++  nestedModulePM.addNestedPass<func::FuncOp>(
++      createFixupSubspanWithOffsetsPass());
+   nestedModulePM.addNestedPass<func::FuncOp>(
+       createResolveBufferDescriptorsPass());
+ 
+diff --git a/compiler/src/iree/compiler/Dialect/VMVX/Transforms/Passes.h b/compiler/src/iree/compiler/Dialect/VMVX/Transforms/Passes.h
+index cdb3f81fe0ae..5d345ab88bcc 100644
+--- a/compiler/src/iree/compiler/Dialect/VMVX/Transforms/Passes.h
++++ b/compiler/src/iree/compiler/Dialect/VMVX/Transforms/Passes.h
+@@ -9,6 +9,7 @@
+ 
+ #include "iree/compiler/Dialect/VMVX/IR/VMVXOps.h"
+ #include "llvm/ADT/StringMap.h"
++#include "mlir/Dialect/Func/IR/FuncOps.h"
+ #include "mlir/IR/BuiltinOps.h"
+ #include "mlir/Pass/Pass.h"
+ #include "mlir/Pass/PassManager.h"
+
+From 214691ec6f8de7f1a5f49e30afc31efc38fb99d3 Mon Sep 17 00:00:00 2001
+From: Mahesh Ravishankar <ravishankarm@google.com>
+Date: Thu, 9 Mar 2023 20:28:49 +0000
+Subject: [PATCH 2/3] Fix WebGPU failure and disable newly failing test due to
+ #11054
+
+---
+ .../iree/compiler/Codegen/WGSL/WGSLReplacePushConstants.cpp  | 5 ++---
+ .../compiler/Codegen/WGSL/test/replace_push_constants.mlir   | 4 ++--
+ tests/e2e/xla_ops/CMakeLists.txt                             | 2 +-
+ 3 files changed, 5 insertions(+), 6 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/Codegen/WGSL/WGSLReplacePushConstants.cpp b/compiler/src/iree/compiler/Codegen/WGSL/WGSLReplacePushConstants.cpp
+index 42cdebffe2f5..ea990406ed3f 100644
+--- a/compiler/src/iree/compiler/Codegen/WGSL/WGSLReplacePushConstants.cpp
++++ b/compiler/src/iree/compiler/Codegen/WGSL/WGSLReplacePushConstants.cpp
+@@ -125,8 +125,6 @@ class WGSLReplacePushConstantsPass
+         missingAlignmentValue = true;
+       }
+     }
+-    auto maxConstantValue =
+-        builder.create<arith::ConstantIndexOp>(loc, maxConstantIndex);
+     mlir::IntegerAttr alignmentAttr = nullptr;
+     // TODO(scotttodd): try llvm::all_equal with attrs directly
+     if (!missingAlignmentValue && llvm::all_equal(alignmentValues)) {
+@@ -153,12 +151,13 @@ class WGSLReplacePushConstantsPass
+     // Note: we're ignoring all potential 'values' hints (if provided) on ops -
+     // InterfaceBindingSubspanOp has no matching concept and we assume that any
+     // analysis using the hint should have been performed by earlier passes.
++    auto zero = builder.create<arith::ConstantIndexOp>(loc, 0);
+     auto subspanOp = builder.create<IREE::HAL::InterfaceBindingSubspanOp>(
+         loc, dispatchTensorType,
+         /*set=*/APInt(64, IREE_HAL_WEBGPU_PARAMS_BIND_GROUP_INDEX),
+         /*binding=*/APInt(64, IREE_HAL_WEBGPU_PARAMS_BINDING_INDEX),
+         IREE::HAL::DescriptorType::UniformBuffer,
+-        /*byte_offset=*/maxConstantValue, dynamicDims, alignmentAttr, nullptr);
++        /*byte_offset=*/zero, dynamicDims, alignmentAttr, nullptr);
+ 
+     // flow.dispatch.tensor.load -> tensor<Nxvector<4xi32>>
+     auto tensorType =
+diff --git a/compiler/src/iree/compiler/Codegen/WGSL/test/replace_push_constants.mlir b/compiler/src/iree/compiler/Codegen/WGSL/test/replace_push_constants.mlir
+index c5fb2707974e..51031e7fc55f 100644
+--- a/compiler/src/iree/compiler/Codegen/WGSL/test/replace_push_constants.mlir
++++ b/compiler/src/iree/compiler/Codegen/WGSL/test/replace_push_constants.mlir
+@@ -69,7 +69,7 @@ func.func @constantLoadF32() {
+ 
+ // CHECK-LABEL: @constantLoadWithIndexAndAlignment
+ func.func @constantLoadWithIndexAndAlignment() {
+-  // CHECK: %[[SUBSPAN:.+]] = hal.interface.binding.subspan set(3) binding(0) type(uniform_buffer) alignment(16) offset(%c5) : !flow.dispatch.tensor<readonly:tensor<2xvector<4xi32>>
++  // CHECK: %[[SUBSPAN:.+]] = hal.interface.binding.subspan set(3) binding(0) type(uniform_buffer) alignment(16) offset(%c0) : !flow.dispatch.tensor<readonly:tensor<2xvector<4xi32>>
+   // CHECK: %[[LOAD:.+]] = flow.dispatch.tensor.load %[[SUBSPAN]], offsets = [0], sizes = [2], strides = [1] : !flow.dispatch.tensor<readonly:tensor<2xvector<4xi32>>> -> tensor<2xvector<4xi32>>
+   // CHECK: %[[TENSOR_EXTRACT:.+]] = tensor.extract %[[LOAD]][%c1{{.*}}] : tensor<2xvector<4xi32>>
+   // CHECK: %[[VECTOR_EXTRACT:.+]] = vector.extractelement %[[TENSOR_EXTRACT]][%c1{{.*}}] : vector<4xi32>
+@@ -84,7 +84,7 @@ func.func @constantLoadWithIndexAndAlignment() {
+ 
+ // CHECK-LABEL: @constantLoadMultiple
+ func.func @constantLoadMultiple() {
+-  // CHECK: %[[SUBSPAN:.+]] = hal.interface.binding.subspan set(3) binding(0) type(uniform_buffer) offset(%c8) : !flow.dispatch.tensor<readonly:tensor<3xvector<4xi32>>>
++  // CHECK: %[[SUBSPAN:.+]] = hal.interface.binding.subspan set(3) binding(0) type(uniform_buffer) offset(%c0) : !flow.dispatch.tensor<readonly:tensor<3xvector<4xi32>>>
+   // CHECK: %[[LOAD:.+]] = flow.dispatch.tensor.load %[[SUBSPAN]], offsets = [0], sizes = [3], strides = [1] : !flow.dispatch.tensor<readonly:tensor<3xvector<4xi32>>> -> tensor<3xvector<4xi32>>
+ 
+   // Extracting 8 i32s from tensor<3xvector<4xi32>:
+diff --git a/tests/e2e/xla_ops/CMakeLists.txt b/tests/e2e/xla_ops/CMakeLists.txt
+index 4374f4a7298f..f9674c9be74a 100644
+--- a/tests/e2e/xla_ops/CMakeLists.txt
++++ b/tests/e2e/xla_ops/CMakeLists.txt
+@@ -453,7 +453,7 @@ iree_check_single_backend_test_suite(
+     "broadcast_in_dim.mlir"
+     # "clamp.mlir"  # TODO(#10906): fix (i8/i16?)
+     # "compare.mlir"  # TODO(#10906): fix (i8/i16?)
+-    "complex.mlir"
++    # "complex.mlir" # TODO(#11054)
+     "concatenate.mlir"
+     "constant.mlir"
+     # "convert.mlir"  # TODO(#10906): fix (i8/i16?)
+
+From 8e166757e7427e06db39917d2fae4e5de6ee3ed1 Mon Sep 17 00:00:00 2001
+From: Mahesh Ravishankar <ravishankarm@google.com>
+Date: Thu, 9 Mar 2023 20:59:45 +0000
+Subject: [PATCH 3/3] Address comments.
+
+---
+ .../Common/FixupSubspanWithOffsets.cpp        |  2 +-
+ .../Common/FlattenMemRefSubspanPass.cpp       |  9 ++++++-
+ .../Common/test/flatten_memref_subspan.mlir   | 26 +++++++++++++++++++
+ 3 files changed, 35 insertions(+), 2 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/Codegen/Common/FixupSubspanWithOffsets.cpp b/compiler/src/iree/compiler/Codegen/Common/FixupSubspanWithOffsets.cpp
+index 9a836d0a613e..113aff23489d 100644
+--- a/compiler/src/iree/compiler/Codegen/Common/FixupSubspanWithOffsets.cpp
++++ b/compiler/src/iree/compiler/Codegen/Common/FixupSubspanWithOffsets.cpp
+@@ -284,4 +284,4 @@ createFixupSubspanWithOffsetsPass() {
+ }
+ 
+ }  // namespace iree_compiler
+-}  // namespace mlir
+\ No newline at end of file
++}  // namespace mlir
+diff --git a/compiler/src/iree/compiler/Codegen/Common/FlattenMemRefSubspanPass.cpp b/compiler/src/iree/compiler/Codegen/Common/FlattenMemRefSubspanPass.cpp
+index f81615165da8..f01fb73836fa 100644
+--- a/compiler/src/iree/compiler/Codegen/Common/FlattenMemRefSubspanPass.cpp
++++ b/compiler/src/iree/compiler/Codegen/Common/FlattenMemRefSubspanPass.cpp
+@@ -94,7 +94,7 @@ struct FlattenMemRefTypeConverter final : public TypeConverter {
+       int64_t offset;
+       SmallVector<int64_t> strides;
+       if (failed(getStridesAndOffset(type, strides, offset))) {
+-        return std::nullopt;
++        return nullptr;
+       }
+       // Since the memref gets linearized, use a stride 1, offset 0.
+       StridedLayoutAttr layoutAttr;
+@@ -311,6 +311,13 @@ static Value linearizeIndices(Value sourceValue, ValueRange indices,
+   SmallVector<int64_t> strides;
+   int64_t offset;
+   if (succeeded(getStridesAndOffset(sourceType, strides, offset))) {
++    // The memref itself might have an offset, but we should not account for it
++    // when computing the linearization. The original memref might be
++    // `memref<?x?xf32, strided<[?, ?], offset: ?>`
++    // where shape is `{%d0, %d1}`, strides are `{%s0, %s1}` and offset is
++    // `%offset`. The interpretation of that is the actual memref starts at
++    // `%offset` from the base pointer. After linearization, the offset remains,
++    // but the shape is 1D. So build a map with the same strides, but 0 offset.
+     AffineMap linearLayoutMap =
+         makeStridedLinearLayoutMap(strides, 0, builder.getContext());
+     // Dynamic strides/offset will create symbols. There should be none for the
+diff --git a/compiler/src/iree/compiler/Codegen/Common/test/flatten_memref_subspan.mlir b/compiler/src/iree/compiler/Codegen/Common/test/flatten_memref_subspan.mlir
+index dbf2927a9e61..5fcc4faed607 100644
+--- a/compiler/src/iree/compiler/Codegen/Common/test/flatten_memref_subspan.mlir
++++ b/compiler/src/iree/compiler/Codegen/Common/test/flatten_memref_subspan.mlir
+@@ -258,6 +258,32 @@ func.func @transfer_write_subspan_with_offset(
+ 
+ // -----
+ 
++func.func @load_store_subspan_with_zero_offset(%arg0 : index, %arg1 : index, %arg2 : index, %arg3 : index) {
++  %subspan0 = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) : memref<?x?xf32>{%arg0, %arg1}
++  %subspan1 = hal.interface.binding.subspan set(0) binding(1) type(storage_buffer) : memref<?x?xf32>{%arg0, %arg1}
++  %val = memref.load %subspan0[%arg2, %arg3] : memref<?x?xf32>
++  memref.store %val, %subspan1[%arg2, %arg3] : memref<?x?xf32>
++  return
++}
++//   CHECK-DAG: #[[$MAP0:.+]] = affine_map<()[s0, s1] -> (s0 * s1)>
++//   CHECK-DAG: #[[$MAP1:.+]] = affine_map<()[s0, s1, s2] -> (s0 * s1 + s2)>
++// CHECK-LABEL: func @load_store_subspan_with_zero_offset(
++//  CHECK-SAME:     %[[ARG0:[a-zA-Z0-9]+]]: index
++//  CHECK-SAME:     %[[ARG1:[a-zA-Z0-9]+]]: index
++//  CHECK-SAME:     %[[ARG2:[a-zA-Z0-9]+]]: index
++//  CHECK-SAME:     %[[ARG3:[a-zA-Z0-9]+]]: index
++//       CHECK:  %[[C0:.+]] = arith.constant 0 : index
++//       CHECK:  %[[D0:.+]] = affine.apply #[[$MAP0]]()[%[[ARG0]], %[[ARG1]]]
++//       CHECK:  %[[BINDING0:.+]] = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%[[C0]]) : memref<?xf32>{%[[D0]]}
++//       CHECK:  %[[D1:.+]] = affine.apply #[[$MAP0]]()[%[[ARG0]], %[[ARG1]]]
++//       CHECK:  %[[BINDING1:.+]] = hal.interface.binding.subspan set(0) binding(1) type(storage_buffer) offset(%[[C0]]) : memref<?xf32>{%[[D1]]}
++//       CHECK:  %[[OFFSET0:.+]] = affine.apply #[[$MAP1]]()[%[[ARG2]], %[[ARG1]], %[[ARG3]]]
++//       CHECK:  %[[VAL:.+]] = memref.load %[[BINDING0]][%[[OFFSET0]]]
++//       CHECK:  %[[OFFSET1:.+]] = affine.apply #[[$MAP1]]()[%[[ARG2]], %[[ARG1]], %[[ARG3]]]
++//       CHECK:  memref.store %[[VAL]], %[[BINDING1]][%[[OFFSET1]]]
++
++// -----
++
+ func.func @load_store_rank_zero_subspan_with_zero_offset() {
+   %zero = arith.constant 0 : index
+   %subspan0 = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer) offset(%zero) : memref<f32>

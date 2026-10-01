@@ -1,0 +1,72 @@
+From 1005a82c255c8bd9f2cfcdbdb64468da49e0a3ab Mon Sep 17 00:00:00 2001
+From: Dunfan Lu <ldfrank533@outlook.com>
+Date: Sat, 1 Aug 2026 23:13:21 +0000
+Subject: [PATCH] [Inductor] Fix uniform decomposition on non contiguous view
+ (#191709)
+
+fixes #191193
+
+generate for storage len, and then use as_strided to reshape back
+
+Pull Request resolved: https://github.com/pytorch/pytorch/pull/191709
+Approved by: https://github.com/jansel
+---
+ test/inductor/test_torchinductor.py | 15 +++++++++++++++
+ torch/_inductor/decomposition.py    | 13 +++++++------
+ 2 files changed, 22 insertions(+), 6 deletions(-)
+
+diff --git a/test/inductor/test_torchinductor.py b/test/inductor/test_torchinductor.py
+index ecde96d84cb2e..1eddee29d9cdb 100644
+--- a/test/inductor/test_torchinductor.py
++++ b/test/inductor/test_torchinductor.py
+@@ -8060,6 +8060,21 @@ def fn(x):
+         compiled_out = compiled(a)
+         self.assertNotEqual(eager_out, compiled_out)
+ 
++    @config.patch(fallback_random=False)
++    def test_uniform_non_contiguous_view(self):
++        def fn(x):
++            y = x[:, ::2, :]
++            y.uniform_(0.0, 1.0)
++            return y
++
++        x = torch.randn(3, 5, 6, device=self.device)
++        compiled = torch.compile(fn, fullgraph=True)
++        res = compiled(x.clone())
++        ref = fn(x.clone())
++        self.assertEqual(res.shape, ref.shape)
++        self.assertEqual(res.stride(), ref.stride())
++        self.assertTrue(bool(((res >= 0.0) & (res <= 1.0)).all()))
++
+     def test_complex_from_real_imag(self):
+         def fn(x, y):
+             return aten.complex.default(x, y)
+diff --git a/torch/_inductor/decomposition.py b/torch/_inductor/decomposition.py
+index c20b95dfea3e4..64daf558db78c 100644
+--- a/torch/_inductor/decomposition.py
++++ b/torch/_inductor/decomposition.py
+@@ -935,17 +935,18 @@ def uniform(
+     stride: list[int | torch.SymInt],
+     generator: torch.Generator | None = None,
+ ) -> torch.Tensor:
++    storage_len = utils.compute_required_storage_length(
++        cast(list[int], shape), cast(list[int], stride), 0
++    )
++    sample_shape: list[int | torch.SymInt] = [storage_len]
+     if generator is None:
+-        rand_samples = torch.rand(shape, dtype=dtype, device=device)
++        rand_samples = torch.rand(sample_shape, dtype=dtype, device=device)
+     else:
+         rand_samples = torch.rand(
+-            shape, generator=generator, dtype=dtype, device=device
++            sample_shape, generator=generator, dtype=dtype, device=device
+         )
+     res = (high - low) * rand_samples + low
+-
+-    if tuple(stride) != utils.make_contiguous_strides_for(cast(list[int], shape)):
+-        return res.as_strided(shape, stride)
+-    return res
++    return res.as_strided(shape, stride)
+ 
+ 
+ @register_decomposition(quantized.linear_dynamic_fp16_unpacked_weight.default)

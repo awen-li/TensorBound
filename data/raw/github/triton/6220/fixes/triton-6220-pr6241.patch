@@ -1,0 +1,428 @@
+From 74a7fbf731c8f92f744c56c008cb9d9346cc03da Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Tue, 18 Mar 2025 21:29:10 -0700
+Subject: [PATCH 01/11] Update
+
+Update
+
+Update
+
+Update
+
+Update
+
+Update
+
+Update
+
+Update
+
+Update
+
+Update
+
+Update
+
+Update
+
+Update
+
+Update
+
+Update
+
+Update
+---
+ .../TritonGPUToLLVM/ViewOpToLLVM.cpp          | 49 ++++++++++++++++---
+ 1 file changed, 42 insertions(+), 7 deletions(-)
+
+diff --git a/lib/Conversion/TritonGPUToLLVM/ViewOpToLLVM.cpp b/lib/Conversion/TritonGPUToLLVM/ViewOpToLLVM.cpp
+index 44d125f5ebac..99a638826384 100644
+--- a/lib/Conversion/TritonGPUToLLVM/ViewOpToLLVM.cpp
++++ b/lib/Conversion/TritonGPUToLLVM/ViewOpToLLVM.cpp
+@@ -392,8 +392,10 @@ struct MemDescSubviewOpConversion
+     Location loc = op->getLoc();
+     auto b = TritonLLVMOpBuilder(loc, rewriter);
+     auto srcTy = op.getSrc().getType();
++    auto destTy = op.getResult().getType();
+     auto llvmElemTy = getTypeConverter()->convertType(srcTy.getElementType());
+     auto layoutOrder = getOrder(srcTy);
++    auto enc = srcTy.getEncoding();
+ 
+     // newBase = base + offset
+     auto smemObj = getSharedMemoryObjectFromStruct(loc, adaptor.getSrc(),
+@@ -408,13 +410,46 @@ struct MemDescSubviewOpConversion
+     for (int i = rankReduced; i < opOffsetVals.size(); i++) {
+       offsetVals.push_back(b.add(opOffsetVals[i], smemObj.getOffsets()[i]));
+     }
+-    // Compute the offset based on the original strides of the shared memory
+-    // object
+-    auto offset = dot(rewriter, loc, opOffsetVals, opSmemStrides);
+-    auto elemPtrTy = smemObj.getBase().getType();
+-    smemObj = SharedMemoryObject(
+-        b.gep(elemPtrTy, llvmElemTy, smemObj.getBase(), offset), llvmElemTy,
+-        offsetVals);
++    Value offset = b.undef(i32_ty);
++    auto allocShape = srcTy.getAllocShape();
++    bool isSimpleSubview = allocShape.take_back(destRank) == destTy.getShape() ||
++        !isa<NVMMASharedEncodingAttr>(enc);
++    if (!isSimpleSubview) {
++      auto nvmmaEnc = cast<NVMMASharedEncodingAttr>(enc);
++      assert(destRank >= 2 && "Shape size should be >= 2 when using NVMMAShared encoding");
++      auto swizzleStride = b.i32_val((nvmmaEnc.getSwizzlingByteWidth() * 8)  / llvmElemTy.getIntOrFloatBitWidth());
++      // base - (stridedOff * swizzledStride + contigOff / swizzledStride *
++      // tileSize + contigOff % swizzledStride)
++      // + stridedInc * swizzledStride + contigInc / swizzledStride *
++      // tileSize + contigInc % swizzledStride
++      offset = b.i32_val(0);
++      for (auto i = 0; i < opOffsetVals.size() - 2; ++i) {
++        offset = b.add(offset, b.mul(opOffsetVals[i], opSmemStrides[i]));
++      }
++      auto stridedDim = destRank - 1 - layoutOrder[0];
++      auto contigDim = destRank - 1 - layoutOrder[1];
++      auto stridedOff = smemObj.getOffsets()[stridedDim];
++      auto contigOff = smemObj.getOffsets()[contigDim];
++      auto stridedInc = offsetVals[stridedDim];
++      auto contigInc = offsetVals[contigDim];
++      int allocStridedDim = allocShape.size() - 1 - layoutOrder[0];
++      auto tileSize =
++          b.mul(b.i32_val(allocShape[allocStridedDim]), swizzleStride);
++      offset = b.sub(offset, b.mul(stridedOff, swizzleStride));
++      offset = b.sub(offset, b.mul(b.udiv(contigOff, swizzleStride), tileSize));
++      offset = b.sub(offset, b.urem(contigOff, swizzleStride));
++      offset = b.add(offset, b.mul(stridedInc, swizzleStride));
++      offset = b.add(offset, b.mul(b.udiv(contigInc, swizzleStride), tileSize));
++      offset = b.add(offset, b.urem(contigInc, swizzleStride));
++    } else {
++      // Compute the offset based on the original strides of the shared memory
++      // object
++      offset = dot(rewriter, loc, opOffsetVals, opSmemStrides);
++    }
++    auto base = smemObj.getBase();
++    auto elemPtrTy = base.getType();
++    smemObj = SharedMemoryObject(b.gep(elemPtrTy, llvmElemTy, base, offset),
++                                 llvmElemTy, offsetVals);
+     auto retVal = getStructFromSharedMemoryObject(loc, smemObj, rewriter);
+     rewriter.replaceOp(op, retVal);
+     return success();
+
+From 8fc0371cd5b4345f55b0be9bc97808457544c961 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Tue, 18 Mar 2025 23:57:40 -0700
+Subject: [PATCH 02/11] Update
+
+---
+ lib/Conversion/TritonGPUToLLVM/ViewOpToLLVM.cpp | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/lib/Conversion/TritonGPUToLLVM/ViewOpToLLVM.cpp b/lib/Conversion/TritonGPUToLLVM/ViewOpToLLVM.cpp
+index 99a638826384..b7f3718084a0 100644
+--- a/lib/Conversion/TritonGPUToLLVM/ViewOpToLLVM.cpp
++++ b/lib/Conversion/TritonGPUToLLVM/ViewOpToLLVM.cpp
+@@ -412,12 +412,15 @@ struct MemDescSubviewOpConversion
+     }
+     Value offset = b.undef(i32_ty);
+     auto allocShape = srcTy.getAllocShape();
+-    bool isSimpleSubview = allocShape.take_back(destRank) == destTy.getShape() ||
++    bool isSimpleSubview =
++        allocShape.take_back(destRank) == destTy.getShape() ||
+         !isa<NVMMASharedEncodingAttr>(enc);
+     if (!isSimpleSubview) {
+       auto nvmmaEnc = cast<NVMMASharedEncodingAttr>(enc);
+-      assert(destRank >= 2 && "Shape size should be >= 2 when using NVMMAShared encoding");
+-      auto swizzleStride = b.i32_val((nvmmaEnc.getSwizzlingByteWidth() * 8)  / llvmElemTy.getIntOrFloatBitWidth());
++      assert(destRank >= 2 &&
++             "Shape size should be >= 2 when using NVMMAShared encoding");
++      auto swizzleStride = b.i32_val((nvmmaEnc.getSwizzlingByteWidth() * 8) /
++                                     llvmElemTy.getIntOrFloatBitWidth());
+       // base - (stridedOff * swizzledStride + contigOff / swizzledStride *
+       // tileSize + contigOff % swizzledStride)
+       // + stridedInc * swizzledStride + contigInc / swizzledStride *
+
+From 4df9440600661f937e06683a66b1340dbe0beeca Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Wed, 19 Mar 2025 00:32:27 -0700
+Subject: [PATCH 03/11] Fix
+
+---
+ lib/Conversion/TritonGPUToLLVM/ViewOpToLLVM.cpp | 9 +++------
+ test/Conversion/tritongpu_to_llvm.mlir          | 1 +
+ 2 files changed, 4 insertions(+), 6 deletions(-)
+
+diff --git a/lib/Conversion/TritonGPUToLLVM/ViewOpToLLVM.cpp b/lib/Conversion/TritonGPUToLLVM/ViewOpToLLVM.cpp
+index b7f3718084a0..99a638826384 100644
+--- a/lib/Conversion/TritonGPUToLLVM/ViewOpToLLVM.cpp
++++ b/lib/Conversion/TritonGPUToLLVM/ViewOpToLLVM.cpp
+@@ -412,15 +412,12 @@ struct MemDescSubviewOpConversion
+     }
+     Value offset = b.undef(i32_ty);
+     auto allocShape = srcTy.getAllocShape();
+-    bool isSimpleSubview =
+-        allocShape.take_back(destRank) == destTy.getShape() ||
++    bool isSimpleSubview = allocShape.take_back(destRank) == destTy.getShape() ||
+         !isa<NVMMASharedEncodingAttr>(enc);
+     if (!isSimpleSubview) {
+       auto nvmmaEnc = cast<NVMMASharedEncodingAttr>(enc);
+-      assert(destRank >= 2 &&
+-             "Shape size should be >= 2 when using NVMMAShared encoding");
+-      auto swizzleStride = b.i32_val((nvmmaEnc.getSwizzlingByteWidth() * 8) /
+-                                     llvmElemTy.getIntOrFloatBitWidth());
++      assert(destRank >= 2 && "Shape size should be >= 2 when using NVMMAShared encoding");
++      auto swizzleStride = b.i32_val((nvmmaEnc.getSwizzlingByteWidth() * 8)  / llvmElemTy.getIntOrFloatBitWidth());
+       // base - (stridedOff * swizzledStride + contigOff / swizzledStride *
+       // tileSize + contigOff % swizzledStride)
+       // + stridedInc * swizzledStride + contigInc / swizzledStride *
+diff --git a/test/Conversion/tritongpu_to_llvm.mlir b/test/Conversion/tritongpu_to_llvm.mlir
+index e92a1ee70be9..8f5b9eeb5b2f 100644
+--- a/test/Conversion/tritongpu_to_llvm.mlir
++++ b/test/Conversion/tritongpu_to_llvm.mlir
+@@ -532,6 +532,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+     // CHECK-NEXT: llvm.mlir.constant(512 : i32) : i32
+     // CHECK-NEXT: llvm.add
+     // CHECK-NEXT: llvm.add
++    // CHECK-NEXT: llvm.mlir.undef
+     // CHECK-NEXT: llvm.mlir.constant(0 : i32) : i32
+     // CHECK-NEXT: llvm.mul
+     // CHECK-NEXT: llvm.add
+
+From 628567d262e9dd985c2db3ecac4e2b24644f8da8 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Wed, 19 Mar 2025 00:32:49 -0700
+Subject: [PATCH 04/11] Lint
+
+---
+ lib/Conversion/TritonGPUToLLVM/ViewOpToLLVM.cpp | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/lib/Conversion/TritonGPUToLLVM/ViewOpToLLVM.cpp b/lib/Conversion/TritonGPUToLLVM/ViewOpToLLVM.cpp
+index 99a638826384..b7f3718084a0 100644
+--- a/lib/Conversion/TritonGPUToLLVM/ViewOpToLLVM.cpp
++++ b/lib/Conversion/TritonGPUToLLVM/ViewOpToLLVM.cpp
+@@ -412,12 +412,15 @@ struct MemDescSubviewOpConversion
+     }
+     Value offset = b.undef(i32_ty);
+     auto allocShape = srcTy.getAllocShape();
+-    bool isSimpleSubview = allocShape.take_back(destRank) == destTy.getShape() ||
++    bool isSimpleSubview =
++        allocShape.take_back(destRank) == destTy.getShape() ||
+         !isa<NVMMASharedEncodingAttr>(enc);
+     if (!isSimpleSubview) {
+       auto nvmmaEnc = cast<NVMMASharedEncodingAttr>(enc);
+-      assert(destRank >= 2 && "Shape size should be >= 2 when using NVMMAShared encoding");
+-      auto swizzleStride = b.i32_val((nvmmaEnc.getSwizzlingByteWidth() * 8)  / llvmElemTy.getIntOrFloatBitWidth());
++      assert(destRank >= 2 &&
++             "Shape size should be >= 2 when using NVMMAShared encoding");
++      auto swizzleStride = b.i32_val((nvmmaEnc.getSwizzlingByteWidth() * 8) /
++                                     llvmElemTy.getIntOrFloatBitWidth());
+       // base - (stridedOff * swizzledStride + contigOff / swizzledStride *
+       // tileSize + contigOff % swizzledStride)
+       // + stridedInc * swizzledStride + contigInc / swizzledStride *
+
+From 5f9ecd37b88d4a94016c8141a99e8e12c8133185 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Wed, 19 Mar 2025 09:09:07 -0700
+Subject: [PATCH 05/11] Update comments
+
+---
+ lib/Conversion/TritonGPUToLLVM/ViewOpToLLVM.cpp | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/lib/Conversion/TritonGPUToLLVM/ViewOpToLLVM.cpp b/lib/Conversion/TritonGPUToLLVM/ViewOpToLLVM.cpp
+index b7f3718084a0..ee4534180b34 100644
+--- a/lib/Conversion/TritonGPUToLLVM/ViewOpToLLVM.cpp
++++ b/lib/Conversion/TritonGPUToLLVM/ViewOpToLLVM.cpp
+@@ -421,14 +421,14 @@ struct MemDescSubviewOpConversion
+              "Shape size should be >= 2 when using NVMMAShared encoding");
+       auto swizzleStride = b.i32_val((nvmmaEnc.getSwizzlingByteWidth() * 8) /
+                                      llvmElemTy.getIntOrFloatBitWidth());
+-      // base - (stridedOff * swizzledStride + contigOff / swizzledStride *
+-      // tileSize + contigOff % swizzledStride)
+-      // + stridedInc * swizzledStride + contigInc / swizzledStride *
+-      // tileSize + contigInc % swizzledStride
+       offset = b.i32_val(0);
+       for (auto i = 0; i < opOffsetVals.size() - 2; ++i) {
+         offset = b.add(offset, b.mul(opOffsetVals[i], opSmemStrides[i]));
+       }
++      // newOffset = offset - (stridedOff * swizzledStride + contigOff /
++      // swizzledStride * tileSize + contigOff % swizzledStride)
++      // + stridedInc * swizzledStride + contigInc / swizzledStride *
++      // tileSize + contigInc % swizzledStride
+       auto stridedDim = destRank - 1 - layoutOrder[0];
+       auto contigDim = destRank - 1 - layoutOrder[1];
+       auto stridedOff = smemObj.getOffsets()[stridedDim];
+
+From 2f6463b81590525e718217b40eedf96b1a35e0b8 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Fri, 21 Mar 2025 21:15:25 -0400
+Subject: [PATCH 06/11] Add a test case
+
+---
+ test/Conversion/tritongpu_to_llvm.mlir | 36 ++++++++++++++++++++++++++
+ 1 file changed, 36 insertions(+)
+
+diff --git a/test/Conversion/tritongpu_to_llvm.mlir b/test/Conversion/tritongpu_to_llvm.mlir
+index 8f5b9eeb5b2f..4c0fa0ee89c3 100644
+--- a/test/Conversion/tritongpu_to_llvm.mlir
++++ b/test/Conversion/tritongpu_to_llvm.mlir
+@@ -551,6 +551,42 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+ 
+ // -----
+ 
++#shared0 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
++#smem = #ttg.shared_memory
++module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
++  // CHECK: llvm.mlir.global external @global_smem
++  // CHECK-LABEL: basic_subview
++  tt.func @nvmma_subview() {
++    // CHECK-NEXT: llvm.mlir.undef
++    // CHECK-NEXT: llvm.mlir.constant(32 : i32) : i32
++    // CHECK-NEXT: llvm.mlir.constant(0 : i32) : i32
++    // CHECK-NEXT: llvm.mlir.constant(16 : i32) : i32
++    // CHECK-NEXT: llvm.mul
++    // CHECK-NEXT: llvm.mul
++    // CHECK-NEXT: llvm.sub
++    // CHECK-NEXT: llvm.udiv
++    // CHECK-NEXT: llvm.mul
++    // CHECK-NEXT: llvm.sub
++    // CHECK-NEXT: llvm.urem
++    // CHECK-NEXT: llvm.sub
++    // CHECK-NEXT: llvm.mul
++    // CHECK-NEXT: llvm.add
++    // CHECK-NEXT: llvm.udiv
++    // CHECK-NEXT: llvm.mul
++    // CHECK-NEXT: llvm.add
++    // CHECK-NEXT: llvm.urem
++    // CHECK-NEXT: llvm.add
++    // CHECK-NEXT: llvm.getelementptr %10[%35] : (!llvm.ptr<3>, i32) -> !llvm.ptr<3>, f32
++    %index = arith.constant 1 : i32
++    %zero = arith.constant 0 : i32
++    %0 = ttg.local_alloc : () -> !ttg.memdesc<16x128xf32, #shared0, #smem, mutable>
++    %1 = ttg.memdesc_subview %0[%index, %zero, %zero] : !ttg.memdesc<16x64xf32, #shared0, #smem, mutable> -> !ttg.memdesc<16x32xf32, #shared0, #smem, mutable>
++    tt.return
++  }
++}
++
++// -----
++
+ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+   // CHECK-LABEL: basic_async_wait
+   tt.func @basic_async_wait() {
+
+From 3330c953b30d61d42a1be6f0f07476cee9c54a6e Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Fri, 21 Mar 2025 21:16:23 -0400
+Subject: [PATCH 07/11] Update
+
+---
+ test/Conversion/tritongpu_to_llvm.mlir | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/test/Conversion/tritongpu_to_llvm.mlir b/test/Conversion/tritongpu_to_llvm.mlir
+index 4c0fa0ee89c3..bd7452976841 100644
+--- a/test/Conversion/tritongpu_to_llvm.mlir
++++ b/test/Conversion/tritongpu_to_llvm.mlir
+@@ -555,9 +555,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+ #smem = #ttg.shared_memory
+ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+   // CHECK: llvm.mlir.global external @global_smem
+-  // CHECK-LABEL: basic_subview
++  // CHECK-LABEL: nvmma_subview
+   tt.func @nvmma_subview() {
+-    // CHECK-NEXT: llvm.mlir.undef
++    // CHECK: llvm.mlir.addressof @global_smem
++    // CHECK: llvm.mlir.undef
+     // CHECK-NEXT: llvm.mlir.constant(32 : i32) : i32
+     // CHECK-NEXT: llvm.mlir.constant(0 : i32) : i32
+     // CHECK-NEXT: llvm.mlir.constant(16 : i32) : i32
+
+From 7f0f1a6b17383b6100f2daa2c2969258195b29cc Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Fri, 21 Mar 2025 21:28:31 -0400
+Subject: [PATCH 08/11] Update
+
+---
+ test/Conversion/tritongpu_to_llvm.mlir | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/test/Conversion/tritongpu_to_llvm.mlir b/test/Conversion/tritongpu_to_llvm.mlir
+index bd7452976841..f72585ae38f6 100644
+--- a/test/Conversion/tritongpu_to_llvm.mlir
++++ b/test/Conversion/tritongpu_to_llvm.mlir
+@@ -577,7 +577,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+     // CHECK-NEXT: llvm.add
+     // CHECK-NEXT: llvm.urem
+     // CHECK-NEXT: llvm.add
+-    // CHECK-NEXT: llvm.getelementptr %10[%35] : (!llvm.ptr<3>, i32) -> !llvm.ptr<3>, f32
++    // CHECK-NEXT: llvm.getelementptr
+     %index = arith.constant 1 : i32
+     %zero = arith.constant 0 : i32
+     %0 = ttg.local_alloc : () -> !ttg.memdesc<16x128xf32, #shared0, #smem, mutable>
+
+From 831644fcd240fca2fd4636b7891e8ffc6d145407 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Fri, 21 Mar 2025 21:30:15 -0400
+Subject: [PATCH 09/11] Fix
+
+---
+ test/Conversion/tritongpu_to_llvm.mlir | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/test/Conversion/tritongpu_to_llvm.mlir b/test/Conversion/tritongpu_to_llvm.mlir
+index f72585ae38f6..f0794021361b 100644
+--- a/test/Conversion/tritongpu_to_llvm.mlir
++++ b/test/Conversion/tritongpu_to_llvm.mlir
+@@ -581,7 +581,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+     %index = arith.constant 1 : i32
+     %zero = arith.constant 0 : i32
+     %0 = ttg.local_alloc : () -> !ttg.memdesc<16x128xf32, #shared0, #smem, mutable>
+-    %1 = ttg.memdesc_subview %0[%index, %zero, %zero] : !ttg.memdesc<16x64xf32, #shared0, #smem, mutable> -> !ttg.memdesc<16x32xf32, #shared0, #smem, mutable>
++    %1 = ttg.memdesc_subview %0[%zero, %zero] : !ttg.memdesc<16x128xf32, #shared0, #smem, mutable> -> !ttg.memdesc<16x32xf32, #shared0, #smem, mutable>
+     tt.return
+   }
+ }
+
+From 458dc1057bcdd0813a892a912e106bd15552c65a Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Fri, 21 Mar 2025 21:31:02 -0400
+Subject: [PATCH 10/11] Update
+
+---
+ test/Conversion/tritongpu_to_llvm.mlir | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/test/Conversion/tritongpu_to_llvm.mlir b/test/Conversion/tritongpu_to_llvm.mlir
+index f0794021361b..b716928379c4 100644
+--- a/test/Conversion/tritongpu_to_llvm.mlir
++++ b/test/Conversion/tritongpu_to_llvm.mlir
+@@ -558,7 +558,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+   // CHECK-LABEL: nvmma_subview
+   tt.func @nvmma_subview() {
+     // CHECK: llvm.mlir.addressof @global_smem
+-    // CHECK: llvm.mlir.undef
++    // CHECK: llvm.mlir.undef : i32
+     // CHECK-NEXT: llvm.mlir.constant(32 : i32) : i32
+     // CHECK-NEXT: llvm.mlir.constant(0 : i32) : i32
+     // CHECK-NEXT: llvm.mlir.constant(16 : i32) : i32
+
+From f4ffb1ecbda2aa90cb6533d08042934819b796d2 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Fri, 21 Mar 2025 22:14:36 -0400
+Subject: [PATCH 11/11] Update element bit width
+
+---
+ test/Conversion/tritongpu_to_llvm.mlir | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/test/Conversion/tritongpu_to_llvm.mlir b/test/Conversion/tritongpu_to_llvm.mlir
+index b716928379c4..14495fb4d138 100644
+--- a/test/Conversion/tritongpu_to_llvm.mlir
++++ b/test/Conversion/tritongpu_to_llvm.mlir
+@@ -551,7 +551,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+ 
+ // -----
+ 
+-#shared0 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
++#shared0 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 32}>
+ #smem = #ttg.shared_memory
+ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+   // CHECK: llvm.mlir.global external @global_smem

@@ -1,0 +1,57 @@
+From 147b1d70778c99cb4774bc080ffdb5ad2450b148 Mon Sep 17 00:00:00 2001
+From: Ben Vanik <ben.vanik@gmail.com>
+Date: Tue, 28 Mar 2023 15:46:48 -0700
+Subject: [PATCH] Refreshing local stack state after VM import calls. Prior to
+ the work adding wait frames it was not possible for the native imports to
+ grow the VM stack. The bytecode dispatch loop was exploiting this to keep the
+ hot data references in registers and only refreshing them when it thought it
+ needed to. #12670 signaled that this is an issue as the hal.fence.await
+ import could push a wait frame even in synchronous mode, grow the stack, and
+ cause the cached dispatch data references to become invalid. Now we
+ unconditionally refresh the references after each call regardless of whether
+ an import or not.
+
+---
+ runtime/src/iree/vm/bytecode/dispatch.c | 21 ++++++++++++++++-----
+ 1 file changed, 16 insertions(+), 5 deletions(-)
+
+diff --git a/runtime/src/iree/vm/bytecode/dispatch.c b/runtime/src/iree/vm/bytecode/dispatch.c
+index 63b4fac7127f..31473daf4419 100644
+--- a/runtime/src/iree/vm/bytecode/dispatch.c
++++ b/runtime/src/iree/vm/bytecode/dispatch.c
+@@ -1638,12 +1638,15 @@ static iree_status_t iree_vm_bytecode_dispatch(
+         bytecode_data =
+             module->bytecode_data.data +
+             module->function_descriptor_table[function_ordinal].bytecode_offset;
+-        regs_i32 = regs.i32;
+-        IREE_BUILTIN_ASSUME_ALIGNED(regs_i32, 16);
+-        regs_ref = regs.ref;
+-        IREE_BUILTIN_ASSUME_ALIGNED(regs_ref, 16);
+-        pc = current_frame->pc;
+       }
++
++      // Restore the local dispatch variables that may have changed during the
++      // function call due to stack growth.
++      regs_i32 = regs.i32;
++      IREE_BUILTIN_ASSUME_ALIGNED(regs_i32, 16);
++      regs_ref = regs.ref;
++      IREE_BUILTIN_ASSUME_ALIGNED(regs_ref, 16);
++      pc = current_frame->pc;
+     });
+ 
+     DISPATCH_OP(CORE, CallVariadic, {
+@@ -1672,6 +1675,14 @@ static iree_status_t iree_vm_bytecode_dispatch(
+       IREE_RETURN_IF_ERROR(iree_vm_bytecode_call_import_variadic(
+           stack, module_state, function_ordinal, regs, segment_size_list,
+           src_reg_list, dst_reg_list, &current_frame, &regs));
++
++      // Restore the local dispatch variables that may have changed during the
++      // function call due to stack growth.
++      regs_i32 = regs.i32;
++      IREE_BUILTIN_ASSUME_ALIGNED(regs_i32, 16);
++      regs_ref = regs.ref;
++      IREE_BUILTIN_ASSUME_ALIGNED(regs_ref, 16);
++      pc = current_frame->pc;
+     });
+ 
+     DISPATCH_OP(CORE, Return, {

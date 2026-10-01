@@ -1,0 +1,94 @@
+From 8aa653869efa970fd81185c2a8dfb8f42f7235c0 Mon Sep 17 00:00:00 2001
+From: Yanbo Liang <ybliang8@gmail.com>
+Date: Tue, 10 Mar 2026 08:45:42 +0000
+Subject: [PATCH] [Inductor] Support convert_element_type lowering to emulate
+ PyTorch eager numerics (#176781)
+
+Fix #176565
+
+Pull Request resolved: https://github.com/pytorch/pytorch/pull/176781
+Approved by: https://github.com/jansel, https://github.com/eellison
+---
+ test/inductor/test_cuda_repro.py | 19 +++++++++++++++++++
+ torch/_inductor/lowering.py      | 26 +++++++++++++++++++++++---
+ 2 files changed, 42 insertions(+), 3 deletions(-)
+
+diff --git a/test/inductor/test_cuda_repro.py b/test/inductor/test_cuda_repro.py
+index ad77c40af02ff..f43960f064e79 100644
+--- a/test/inductor/test_cuda_repro.py
++++ b/test/inductor/test_cuda_repro.py
+@@ -1459,6 +1459,25 @@ def fn(x, y, z):
+ 
+         self.assertEqual(ref, res)
+ 
++    @torch._inductor.config.patch(emulate_precision_casts=True)
++    @torch._inductor.config.patch(pattern_matcher=False)
++    def test_emulate_precision_casts_convert_element_type(self):
++        torch.manual_seed(0)
++        torch.cuda.manual_seed_all(0)
++
++        x = torch.rand(1000, device="cuda", dtype=torch.float32)
++
++        def fn(x):
++            x_bf16 = x.to(torch.bfloat16)
++            x_fp32_casted = x_bf16.to(torch.float32)
++            return x_fp32_casted
++
++        opt_fn = torch.compile(fn, backend="inductor", fullgraph=True, dynamic=True)
++
++        expected = fn(x)
++        actual = opt_fn(x)
++        self.assertEqual(expected, actual)
++
+     @torch._inductor.config.patch(emulate_precision_casts=True)
+     def test_emulate_precision_casts_norm_rounding(self):
+         torch.manual_seed(0)
+diff --git a/torch/_inductor/lowering.py b/torch/_inductor/lowering.py
+index 63aab595026b2..a5bb323ecc20c 100644
+--- a/torch/_inductor/lowering.py
++++ b/torch/_inductor/lowering.py
+@@ -856,13 +856,27 @@ def foreach_group_loop(groups, num_outputs, apply_fn, realize_outputs):
+     return outputs
+ 
+ 
+-def to_dtype(x: TensorBox, dtype: torch.dtype, copy: bool = False):
++def to_dtype(
++    x: TensorBox, dtype: torch.dtype, copy: bool = False, use_compute_types: bool = True
++):
+     src_dtype = x.get_dtype()
+     if src_dtype == dtype:
+         return clone(x) if copy else x
+ 
+     def _to_dtype(x):
+-        return ops.to_dtype(x, dtype, src_dtype=src_dtype)
++        result = ops.to_dtype(
++            x,
++            dtype,
++            src_dtype=src_dtype,
++            use_compute_types=use_compute_types,
++        )
++        low_pr_fp = (torch.bfloat16, torch.float16)
++        if not use_compute_types and dtype in low_pr_fp:
++            # Upcast back to compute type so fused consumers see a compute-type
++            # value. Without this, a raw low-precision value gets a redundant
++            # downcast from the consumer's input emulation.
++            result = ops.to_dtype(result, dtype)
++        return result
+ 
+     return make_pointwise(_to_dtype, override_return_dtype=dtype)(x)
+ 
+@@ -925,7 +939,13 @@ def _convert_element_type(x: TensorBox, dtype: torch.dtype):
+             return fallback_handler(
+                 prims.convert_element_type.default, add_to_fallback_set=False
+             )(x, dtype)
+-    return to_dtype(x, dtype, copy=True)
++    src_dtype = x.get_dtype()
++    low_pr_fp = (torch.bfloat16, torch.float16)
++    use_compute_types = not (
++        config.emulate_precision_casts
++        and (src_dtype in low_pr_fp or dtype in low_pr_fp)
++    )
++    return to_dtype(x, dtype, copy=True, use_compute_types=use_compute_types)
+ 
+ 
+ def to_dtype_bitcast(x: TensorBox, dtype: torch.dtype, *, copy=False):

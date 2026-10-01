@@ -1,0 +1,149 @@
+From b5af3924c0063ae48ee08e63acc27fdb52f9c1ec Mon Sep 17 00:00:00 2001
+From: Dan Zimmerman <danzimm@users.noreply.github.com>
+Date: Fri, 13 Dec 2024 05:14:47 -0600
+Subject: [PATCH] [FRONTEND] Insert zext prior to addptr with unsigned offset
+ (#5373)
+
+Hi triton friends ! This is my first PR here: I've tried to be
+thoughtful in my presentation and implementation. If I'm doing anything
+clearly inappropriate don't hesitate to mention so. This PR originally
+approached solving the problem listed below differently than it does
+now. Have a look at the posts edit history for the original idea.
+
+## Context (What)
+Currently the frontend lowers arguments to signless types regardless of
+the signedness the user provides (see e.g.
+[`dtype.to_ir`](https://github.com/triton-lang/triton/blob/main/python/triton/language/core.py#L507-L508)).
+I'm reading a little bit between the lines here, but this seems like a
+conscious design decision to align with how LLVM handles integers.
+
+While the signedness of the arguments does affect how certain operations
+are lowered (e.g.
+[`floordiv`](https://github.com/triton-lang/triton/blob/main/python/triton/language/semantic.py#L312-L315)
+generates either `udiv/sdiv`), not every instruction has signed vs.
+unsigned variants, in particular `tt.addptr` does not, so whether or not
+a value is signed is not passed on when creating this instruction.
+
+### A (Very) Contrived Example
+```
+import triton
+import triton.language as tl
+import torch
+@triton.jit
+def tst(x_ptr, y_ptr, Q: tl.uint32, K: tl.constexpr):
+    tl.store(x_ptr + tl.arange(0, K) + Q, tl.load(y_ptr + tl.arange(0, K)))
+x = torch.randn(32, dtype=torch.bfloat16, device='cuda:0')
+y = torch.randn(16, dtype=torch.bfloat16, device='cuda:0')
+tst[(1,)](x, y, 10, 16)
+```
+This lowers to
+```
+  tt.func public @tst(%arg0: !tt.ptr<bf16> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32} loc(), %arg1: !tt.ptr<bf16> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32} loc(), %arg2: i32 loc()) attributes {noinline = false} {
+    %0 = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32> loc(#loc1)
+    %1 = tt.splat %arg0 : !tt.ptr<bf16> -> tensor<16x!tt.ptr<bf16>> loc(#loc2)
+    %2 = tt.addptr %1, %0 : tensor<16x!tt.ptr<bf16>>, tensor<16xi32> loc(#loc2)
+    %3 = tt.splat %arg2 : i32 -> tensor<16xi32> loc(#loc3)
+    %4 = tt.addptr %2, %3 : tensor<16x!tt.ptr<bf16>>, tensor<16xi32> loc(#loc3)
+    %5 = tt.splat %arg1 : !tt.ptr<bf16> -> tensor<16x!tt.ptr<bf16>> loc(#loc4)
+    %6 = tt.addptr %5, %0 : tensor<16x!tt.ptr<bf16>>, tensor<16xi32> loc(#loc4)
+    %7 = tt.load %6 : tensor<16x!tt.ptr<bf16>> loc(#loc5)
+    tt.store %4, %7 : tensor<16x!tt.ptr<bf16>> loc(#loc6)
+    tt.return loc(#loc7)
+  } loc(#loc)
+```
+There is not a way to statically determine `%arg2` was declared
+unsigned. After this PR the above lowers to
+```
+  tt.func public @tst(%arg0: !tt.ptr<bf16> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32} loc("/home/danzimm/tross/triton/dz/tst.py":6:0), %arg1: !tt.ptr<bf16> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32} loc("/home/danzimm/tross/triton/dz/tst.py":6:0), %arg2: i32 loc("/home/danzimm/tross/triton/dz/tst.py":6:0)) attributes {noinline = false} {
+    %0 = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32, #blocked> loc(#loc1)
+    %1 = tt.splat %arg0 : !tt.ptr<bf16> -> tensor<16x!tt.ptr<bf16>, #blocked> loc(#loc2)
+    %2 = tt.addptr %1, %0 : tensor<16x!tt.ptr<bf16>, #blocked>, tensor<16xi32, #blocked> loc(#loc2)
+    %3 = arith.extui %arg2 : i32 to i64 loc(#loc3)
+    %4 = tt.splat %3 : i64 -> tensor<16xi64, #blocked> loc(#loc3)
+    %5 = tt.addptr %2, %4 : tensor<16x!tt.ptr<bf16>, #blocked>, tensor<16xi64, #blocked> loc(#loc3)
+    %6 = tt.splat %arg1 : !tt.ptr<bf16> -> tensor<16x!tt.ptr<bf16>, #blocked> loc(#loc4)
+    %7 = tt.addptr %6, %0 : tensor<16x!tt.ptr<bf16>, #blocked>, tensor<16xi32, #blocked> loc(#loc4)
+    %8 = tt.load %7 : tensor<16x!tt.ptr<bf16>, #blocked> loc(#loc5)
+    tt.store %5, %8 : tensor<16x!tt.ptr<bf16>, #blocked> loc(#loc6)
+    tt.return loc(#loc7)
+  } loc(#loc)
+```
+The only difference is the introduction of `arith.extui %arg2` which
+indicates `%arg2` was unsigned. This behavior matches clang's:
+https://godbolt.org/z/ah1oKMa43
+
+## Motivation (Why)
+In the AMD backend buffered load/store ops require non-negative offsets
+(see
+[`ConvertToBufferOps.cpp`](https://github.com/triton-lang/triton/blob/main/third_party/amd/lib/TritonAMDGPUTransforms/ConvertToBufferOps.cpp#L65)).
+Right now the only way to enable these operations is by inserting
+`tl.assume` statements manually. This is awkward, especially when
+there're several parameters, and isn't "standard" for kernel developers.
+
+On the other hand, typing is fairly standard, so it seems fitting to
+translate unsigned types to assume statements.
+
+This information could be useful for e.g. elision of `math.abs` or
+`scf.if` 'negative' branches.
+
+## Other Solutions Considered
+- Lower to signed types: this would break the "signless by default"
+paradigm, so seems not a good path forward
+- Introduce additional signed/unsigned instructions, e.g. `splats` and
+`splatu`: seems confusing/anti-paradigm since we would be encoding
+signedness into instructions that really don't care about signedness
+- Introduce `tt.addptru`: see discussion for below for why we opted to
+insert `zext` instead
+- Though I don't know for a fact NV *can't* optimize better if it knows
+its offsets are non-negative, my brief research doesn't indicate that it
+can't
+- Force users to specify `tl.assume` everywhere: this is viable but
+non-ideal since using `assume` isn't common for kernel developers
+
+## Open Questions
+-  How should we handle python typehints type checking?
+    - Punting this to another PR (if there is actually an issue)
+---
+ python/test/unit/language/test_annotations.py |  4 +++-
+ python/triton/language/semantic.py            | 10 +++++++++-
+ 2 files changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/python/test/unit/language/test_annotations.py b/python/test/unit/language/test_annotations.py
+index 0c1f065a10aa..087a14f50a03 100644
+--- a/python/test/unit/language/test_annotations.py
++++ b/python/test/unit/language/test_annotations.py
+@@ -26,10 +26,12 @@ def test_int_annotation(signed, width, device):
+     @triton.jit
+     @annotated_function(X=torch.tensor, v=f"tl.{'' if signed else 'u'}int{width}")
+     def _kernel(X, v):
+-        tl.store(X, v)
++        tl.store(X + v, v)
+ 
+     h = _kernel[(1, )](torch.empty(1, device=device), 3)
+     pfx = 'si' if signed else 'ui'
++    if not signed and width < 64:
++        assert "arith.extui %arg1" in h.asm["ttir"]
+     assert f'%arg1: i{width}' in h.asm["ttir"]
+     assert f'arith.{pfx}tofp' in h.asm["ttir"]
+ 
+diff --git a/python/triton/language/semantic.py b/python/triton/language/semantic.py
+index 8a83a290189f..89a7dac579a6 100644
+--- a/python/triton/language/semantic.py
++++ b/python/triton/language/semantic.py
+@@ -230,7 +230,15 @@ def add(input: tl.tensor | numbers.Number, other: tl.tensor | numbers.Number, sa
+         input_scalar_ty = input.type.scalar
+         other_scalar_ty = other.type.scalar
+     if input_scalar_ty.is_ptr():
+-        return tl.tensor(builder.create_addptr(input.handle, other.handle), input.type)
++        other_handle = other.handle
++        if other.dtype.is_int_unsigned() and other.dtype.int_bitwidth < 64:
++            # addptr treats offset as signed. Zero-extend unsigned offsets to ensure they're positive
++            if other.type.is_block():
++                i64_ty = tl.block_type(tl.int64, other.type.get_block_shapes()).to_ir(builder)
++            else:
++                i64_ty = tl.int64.to_ir(builder)
++            other_handle = builder.create_int_cast(other.handle, i64_ty, False)
++        return tl.tensor(builder.create_addptr(input.handle, other_handle), input.type)
+     # float + float
+     elif input_scalar_ty.is_floating():
+         return tl.tensor(builder.create_fadd(input.handle, other.handle), input.type)

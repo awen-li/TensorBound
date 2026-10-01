@@ -1,0 +1,73 @@
+From b6dede2b1ff6651ace00c2c378949c1d4a1d1104 Mon Sep 17 00:00:00 2001
+From: Stella Laurenzo <stellaraccident@gmail.com>
+Date: Thu, 6 Jul 2023 18:37:38 -0700
+Subject: [PATCH] Reserve extra scratch registers for >4byte remappings.
+
+Currently, if a branch remapping includes 64bit ints, it depends on the topology of the program as to whether enough scratch space happens to be available. In a case tested, it was not. This is because remappings are done 32bits at a time and presume that scratch space has been reserved for each word. This last part was not being done, resulting in the possibility of declared i32 register capacities to be off by the number of 64bit remappings in any CFG.
+
+Fixes the runtime crash in #14313 by generating proper code. However, additional runtime hardening work is needed:
+
+* The verifier is presently not verifying remapped register ordinals at all.
+* Even if verification is enabled for this, it does not trigger because it is verifying that they are in range of the maximum allowable (vs declared).
+* There should be padding between the i32/ref register storage areas, and ASAN marking should be done to catch any overflows.
+---
+ .../VM/Analysis/RegisterAllocation.cpp        | 31 ++++++++++++-------
+ 1 file changed, 19 insertions(+), 12 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/Dialect/VM/Analysis/RegisterAllocation.cpp b/compiler/src/iree/compiler/Dialect/VM/Analysis/RegisterAllocation.cpp
+index adf0a33e916d..ad9c441bb246 100644
+--- a/compiler/src/iree/compiler/Dialect/VM/Analysis/RegisterAllocation.cpp
++++ b/compiler/src/iree/compiler/Dialect/VM/Analysis/RegisterAllocation.cpp
+@@ -552,33 +552,40 @@ RegisterAllocation::remapSuccessorRegisters(Operation *op, int successorIndex) {
+   }
+ 
+   // The tail registers in each bank is reserved for swapping, when required.
+-  int scratchI32Reg = maxI32RegisterOrdinal_;
+-  int scratchRefReg = maxRefRegisterOrdinal_;
++  int localScratchI32RegCount = 0;
++  int localScratchRefRegCount = 0;
+   for (auto feedbackEdge : feedbackArcSet.feedbackEdges) {
+     Register scratchReg;
+     if (feedbackEdge.first.isRef()) {
+-      scratchReg =
+-          Register::getWithSameType(feedbackEdge.first, ++scratchRefReg);
++      localScratchRefRegCount += 1;
++      scratchReg = Register::getWithSameType(
++          feedbackEdge.first, maxRefRegisterOrdinal_ + localScratchRefRegCount);
+     } else {
+-      scratchReg =
+-          Register::getWithSameType(feedbackEdge.first, ++scratchI32Reg);
++      localScratchI32RegCount += 1;
++      scratchReg = Register::getWithSameType(
++          feedbackEdge.first, maxI32RegisterOrdinal_ + localScratchI32RegCount);
++      // Integer types that use more than one register slot will be emitted
++      // as remapping per 4-byte word, so we have to account for the extra
++      // temporaries. See BytecodeEncoder:encodeBranch().
++      assert(scratchReg.byteWidth() >= 4 && "expected >= i32");
++      localScratchI32RegCount += scratchReg.byteWidth() / 4 - 1;
+     }
+     feedbackArcSet.acyclicEdges.insert(feedbackArcSet.acyclicEdges.begin(),
+                                        {feedbackEdge.first, scratchReg});
+     feedbackArcSet.acyclicEdges.push_back({scratchReg, feedbackEdge.second});
+   }
+-  if (scratchI32Reg != maxI32RegisterOrdinal_) {
+-    scratchI32RegisterCount_ = std::max(scratchI32RegisterCount_,
+-                                        scratchI32Reg - maxI32RegisterOrdinal_);
++  if (localScratchI32RegCount > 0) {
++    scratchI32RegisterCount_ =
++        std::max(scratchI32RegisterCount_, localScratchI32RegCount);
+     assert(getMaxI32RegisterOrdinal() <= Register::kInt32RegisterCount &&
+            "spilling i32 regs");
+     if (getMaxI32RegisterOrdinal() > Register::kInt32RegisterCount) {
+       op->emitOpError() << "spilling entire i32 register address space";
+     }
+   }
+-  if (scratchRefReg != maxRefRegisterOrdinal_) {
+-    scratchRefRegisterCount_ = std::max(scratchRefRegisterCount_,
+-                                        scratchRefReg - maxRefRegisterOrdinal_);
++  if (localScratchRefRegCount > 0) {
++    scratchRefRegisterCount_ =
++        std::max(scratchRefRegisterCount_, localScratchRefRegCount);
+     assert(getMaxRefRegisterOrdinal() <= Register::kRefRegisterCount &&
+            "spilling ref regs");
+     if (getMaxRefRegisterOrdinal() > Register::kRefRegisterCount) {

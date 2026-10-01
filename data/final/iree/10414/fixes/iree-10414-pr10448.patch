@@ -1,0 +1,96 @@
+From 8466adea8516e11d826ad40919418303d575a0eb Mon Sep 17 00:00:00 2001
+From: Lei Zhang <antiagainst@google.com>
+Date: Fri, 16 Sep 2022 14:41:45 -0400
+Subject: [PATCH] [vulkan] Create zero binding for dummy sets in
+ BuiltinExecutables
+
+BuiltinExecutables would need to create dummy descriptor sets
+as placeholders. For such sets, we can set them to have zero
+bindings. This gives us a singal to avoid turning on push
+VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR bit
+when creating descriptor sets. Otherwise we would create multiple
+descriptor sets all with that bit and thus causing validation
+errors:
+
+```
+Validation Error: [ VUID-VkPipelineLayoutCreateInfo-pSetLayouts-00293 ]
+vkCreatePipelineLayout() Multiple push descriptor sets found. The Vulkan
+spec states: pSetLayouts must not contain more than one descriptor set
+layout that was created with VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR set
+```
+
+Fixes https://github.com/iree-org/iree/issues/10414
+---
+ .../hal/drivers/vulkan/builtin_executables.cc | 24 ++++++++++++-------
+ .../drivers/vulkan/native_pipeline_layout.cc  | 18 ++++++++------
+ 2 files changed, 26 insertions(+), 16 deletions(-)
+
+diff --git a/runtime/src/iree/hal/drivers/vulkan/builtin_executables.cc b/runtime/src/iree/hal/drivers/vulkan/builtin_executables.cc
+index dfbed2414703..7c434d758b3b 100644
+--- a/runtime/src/iree/hal/drivers/vulkan/builtin_executables.cc
++++ b/runtime/src/iree/hal/drivers/vulkan/builtin_executables.cc
+@@ -54,17 +54,23 @@ iree_status_t BuiltinExecutables::InitializeExecutables() {
+   IREE_TRACE_SCOPE();
+ 
+   // Create descriptor set layouts for our compute pipeline.
+-  // Even though we're just using one set, we still need to create layout
+-  // bindings for those preceding it.
++  // Even though we're just using one set, we still need to create dummy set
++  // layout (without any bindings) for those preceding this set.
+   for (size_t i = 0; i < IREE_HAL_VULKAN_BUILTIN_DESCRIPTOR_SET_COUNT; ++i) {
+     iree_hal_descriptor_set_layout_t* layout = NULL;
+-    iree_hal_descriptor_set_layout_binding_t layout_binding;
+-    layout_binding.binding = 0;
+-    layout_binding.type = IREE_HAL_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+-    layout_binding.flags = IREE_HAL_DESCRIPTOR_FLAG_NONE;
+-    IREE_RETURN_IF_ERROR(iree_hal_vulkan_native_descriptor_set_layout_create(
+-        logical_device_, IREE_HAL_DESCRIPTOR_SET_LAYOUT_FLAG_NONE,
+-        /*binding_count=*/1, &layout_binding, &layout));
++    if (i == IREE_HAL_VULKAN_BUILTIN_DESCRIPTOR_SET) {
++      iree_hal_descriptor_set_layout_binding_t layout_binding;
++      layout_binding.binding = 0;
++      layout_binding.type = IREE_HAL_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++      layout_binding.flags = IREE_HAL_DESCRIPTOR_FLAG_NONE;
++      IREE_RETURN_IF_ERROR(iree_hal_vulkan_native_descriptor_set_layout_create(
++          logical_device_, IREE_HAL_DESCRIPTOR_SET_LAYOUT_FLAG_NONE,
++          /*binding_count=*/1, &layout_binding, &layout));
++    } else {
++      IREE_RETURN_IF_ERROR(iree_hal_vulkan_native_descriptor_set_layout_create(
++          logical_device_, IREE_HAL_DESCRIPTOR_SET_LAYOUT_FLAG_NONE,
++          /*binding_count=*/0, /*bindings=*/nullptr, &layout));
++    }
+     descriptor_set_layouts_[i] = layout;
+   }
+ 
+diff --git a/runtime/src/iree/hal/drivers/vulkan/native_pipeline_layout.cc b/runtime/src/iree/hal/drivers/vulkan/native_pipeline_layout.cc
+index d8aeabb595f4..13ca650e1094 100644
+--- a/runtime/src/iree/hal/drivers/vulkan/native_pipeline_layout.cc
++++ b/runtime/src/iree/hal/drivers/vulkan/native_pipeline_layout.cc
+@@ -52,16 +52,20 @@ static iree_status_t iree_hal_vulkan_create_descriptor_set_layout(
+   create_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+   create_info.pNext = NULL;
+   create_info.flags = 0;
+-  if (logical_device->enabled_extensions().push_descriptors) {
+-    // Note that we can *only* use push descriptor sets if we set this create
+-    // flag. If push descriptors aren't supported we emulate them with normal
+-    // descriptors so it's fine to have kPushOnly without support.
+-    create_info.flags |=
+-        VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+-  }
+ 
+   VkDescriptorSetLayoutBinding* native_bindings = NULL;
+   if (binding_count > 0) {
++    if (logical_device->enabled_extensions().push_descriptors) {
++      // Note that we can *only* use push descriptor sets if we set this create
++      // flag. If push descriptors aren't supported we emulate them with normal
++      // descriptors so it's fine to have kPushOnly without support.
++      // Also we only enable this when there are at least one binding in it.
++      // (We can have dummy descriptor sets without any bindings for builtin
++      // executables.)
++      create_info.flags |=
++          VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
++    }
++
+     // TODO(benvanik): avoid this allocation if possible (inline_array).
+     IREE_RETURN_IF_ERROR(iree_allocator_malloc(
+         logical_device->host_allocator(),

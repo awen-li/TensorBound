@@ -1,0 +1,112 @@
+From ab01a238ebdda0623acae1eebb9a721d7d71e293 Mon Sep 17 00:00:00 2001
+From: Peter Hawkins <phawkins@google.com>
+Date: Tue, 22 Sep 2026 13:39:57 -0700
+Subject: [PATCH] Add large buffer regression test for psum_scatter.
+
+Adds test_psum_scatter_large to multiprocess all_reduce_test to verify
+that psum_scatter correctly handles large buffer transfers across devices,
+guarded by jaxlib_extension_version >= 496.
+
+[XLA] Clarify the API contract of ReduceScatter on xla::Communicator.
+
+Fixes https://github.com/jax-ml/jax/issues/40830
+Fixes https://github.com/jax-ml/jax/issues/40831
+
+PiperOrigin-RevId: 986204115
+---
+ MODULE.bazel                          |  6 ++--
+ jaxlib/xla_client.py                  |  2 +-
+ tests/multiprocess/all_reduce_test.py | 43 +++++++++++++++++++++++++++
+ 3 files changed, 47 insertions(+), 4 deletions(-)
+
+diff --git a/MODULE.bazel b/MODULE.bazel
+index d459b520a8b0..3cc874a51305 100644
+--- a/MODULE.bazel
++++ b/MODULE.bazel
+@@ -31,9 +31,9 @@ archive_override(
+ bazel_dep(name = "xla")
+ archive_override(
+     module_name = "xla",
+-    integrity = "sha256-D8AZEpBm1gblKW3OT6x5pXjthe+K8fFOViXUfcq0EtQ=",
+-    strip_prefix = "xla-c22ccfe7ac3bab53753efe609701aa9bd55e8bf0",
+-    urls = ["https://github.com/openxla/xla/archive/c22ccfe7ac3bab53753efe609701aa9bd55e8bf0.tar.gz"],
++    integrity = "sha256-I14H8//RXs+lD+0xppYZH0sO9OUq+kSs1Rquy7XjTkg=",
++    strip_prefix = "xla-f07f240fd39e7eb3424c05b46983788553f83806",
++    urls = ["https://github.com/openxla/xla/archive/f07f240fd39e7eb3424c05b46983788553f83806.tar.gz"],
+ )
+ 
+ # TODO: upstream, otherwise we have to duplicate the patches in jax
+diff --git a/jaxlib/xla_client.py b/jaxlib/xla_client.py
+index 709fe26fd75d..fea02ea9c411 100644
+--- a/jaxlib/xla_client.py
++++ b/jaxlib/xla_client.py
+@@ -45,7 +45,7 @@
+ # Please suffix the version number with a brief description of your change
+ # in a comment. The goal here is to force a merge conflict if two changes
+ # attempt to grab the same version number.
+-_version = 495  # Non-addressable shards in batched_copy_to_host_async
++_version = 496  # Fix Gloo reduce-scatter with large buffers
+ 
+ # An internal increasing version number for protecting jaxlib code against
+ # ifrt changes.
+diff --git a/tests/multiprocess/all_reduce_test.py b/tests/multiprocess/all_reduce_test.py
+index 911238da1d54..33949a150329 100644
+--- a/tests/multiprocess/all_reduce_test.py
++++ b/tests/multiprocess/all_reduce_test.py
+@@ -18,6 +18,7 @@
+ from jax import numpy as jnp
+ from jax._src import test_multiprocess as jt_multiprocess
+ from jax._src import test_util as jtu
++from jax._src.lib import jaxlib_extension_version
+ import numpy as np
+ 
+ 
+@@ -142,6 +143,48 @@ def test_psum_axis_index_groups(self):
+       expected = group0_expected if device_id % 2 == 0 else group1_expected
+       np.testing.assert_array_equal(np.squeeze(shard.data), expected)
+ 
++  def test_psum_scatter_large(self):
++    if jaxlib_extension_version < 496:
++      self.skipTest("Requires jaxlib_extension_version >= 496")
++    n = jax.device_count()
++    mesh = jtu.create_mesh((n,), ("x",))
++    spec = jax.P("x", None)
++
++    c = 2 * 1024 * 1024  # 8 MiB float32 output shard per rank
++    global_shape = (n, n * c)
++    sharding = jax.NamedSharding(mesh, spec)
++
++    @jax.jit
++    def f(x):
++      return jax.shard_map(
++          lambda y: lax.psum_scatter(y, "x", scatter_dimension=1, tiled=True),
++          mesh=mesh,
++          in_specs=spec,
++          out_specs=spec,
++      )(x)
++
++    def shard_callback(index):
++      r = index[0].start or 0
++      chunks = [
++          np.full((1, c), 100.0 * (k + 1) + r, dtype=np.float32)
++          for k in range(n)
++      ]
++      return np.concatenate(chunks, axis=1)
++
++    rank_sum = n * (n - 1) / 2
++    for it in range(10):
++      x = jax.make_array_from_callback(global_shape, sharding, shard_callback)
++      got = f(x)
++      for shard in got.addressable_shards:
++        r = shard.index[0].start or 0
++        expected = n * 100.0 * (r + 1) + rank_sum
++        if not np.all(shard.data == expected):
++          wrong = np.flatnonzero(shard.data.ravel() != expected)
++          self.fail(
++              f"iteration {it}: rank {r}: {wrong.size} of {c} elements wrong,"
++              f" got {shard.data.ravel()[wrong[0]]}, want {expected}"
++          )
++
+ 
+ if __name__ == "__main__":
+   jt_multiprocess.main()

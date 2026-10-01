@@ -1,0 +1,1736 @@
+From 928d9eaf3e9dbaf5809b3bfede6439223d38de81 Mon Sep 17 00:00:00 2001
+From: Isuru Fernando <ifernando@quansight.com>
+Date: Tue, 14 Jan 2025 13:46:59 +0000
+Subject: [PATCH 01/27] Update
+
+[ghstack-poisoned]
+---
+ torch/_inductor/decomposition.py | 107 ++++++++++++++++++-------------
+ 1 file changed, 63 insertions(+), 44 deletions(-)
+
+diff --git a/torch/_inductor/decomposition.py b/torch/_inductor/decomposition.py
+index e8020134d8487..c37f745067c90 100644
+--- a/torch/_inductor/decomposition.py
++++ b/torch/_inductor/decomposition.py
+@@ -9,7 +9,6 @@
+ 
+ import torch
+ import torch._decomp as decomp
+-import torch._prims_common as utils
+ import torch.ao.quantization.fx._decomposed
+ from torch._decomp import (
+     core_aten_decompositions,
+@@ -527,15 +526,15 @@ def view_copy_dtype(
+     return self.to(dtype).clone()
+ 
+ 
+-def get_like_layout(
+-    tensor: torch.Tensor,
++def _memory_format_like(
++    output: torch.Tensor,
++    input: torch.Tensor,
+     memory_format: Optional[torch.memory_format] = None,
+-) -> torch.memory_format:
+-    # TODO: _to_copy tensor to stride permutation
++) -> torch.Tensor:
+     if memory_format is torch.preserve_format or memory_format is None:
+-        return utils.suggest_memory_format(tensor)
++        return output.as_strided(input.shape, input.stride())
+     else:
+-        return memory_format
++        return output.to(memory_format=memory_format)
+ 
+ 
+ @register_decomposition(aten.rand_like)
+@@ -547,12 +546,16 @@ def rand_like(
+     memory_format: Optional[torch.memory_format] = None,
+     **kwargs: Any,
+ ) -> torch.Tensor:
+-    return torch.rand(
+-        [*self.size()],
+-        dtype=dtype or self.dtype,
+-        device=device or self.device,
+-        **kwargs,
+-    ).to(memory_format=get_like_layout(self, memory_format))
++    return _memory_format_like(
++        torch.rand(
++            [*self.size()],
++            dtype=dtype or self.dtype,
++            device=device or self.device,
++            **kwargs,
++        ),
++        self,
++        memory_format,
++    )
+ 
+ 
+ @register_decomposition(aten.randn_like)
+@@ -564,12 +567,16 @@ def randn_like(
+     memory_format: Optional[torch.memory_format] = None,
+     **kwargs: Any,
+ ) -> torch.Tensor:
+-    return torch.randn(
+-        [*self.size()],
+-        dtype=dtype or self.dtype,
+-        device=device or self.device,
+-        **kwargs,
+-    ).to(memory_format=get_like_layout(self, memory_format))
++    return _memory_format_like(
++        torch.randn(
++            [*self.size()],
++            dtype=dtype or self.dtype,
++            device=device or self.device,
++            **kwargs,
++        ),
++        self,
++        memory_format,
++    )
+ 
+ 
+ @register_decomposition(aten.full_like)
+@@ -582,16 +589,20 @@ def full_like(
+     device: Optional[torch.device] = None,
+     pin_memory: bool = False,
+     requires_grad: bool = False,
+-    memory_format: torch.memory_format = torch.preserve_format,
++    memory_format: Optional[torch.memory_format] = torch.preserve_format,
+ ) -> torch.Tensor:
+-    return torch.full(
+-        [*self.size()],
+-        fill_value,
+-        dtype=dtype or self.dtype,
+-        layout=layout or self.layout,
+-        device=device or self.device,
+-        requires_grad=requires_grad,
+-    ).to(memory_format=get_like_layout(self, memory_format))
++    return _memory_format_like(
++        torch.full(
++            [*self.size()],
++            fill_value,
++            dtype=dtype or self.dtype,
++            layout=layout or self.layout,
++            device=device or self.device,
++            requires_grad=requires_grad,
++        ),
++        self,
++        memory_format,
++    )
+ 
+ 
+ @register_decomposition(aten.randint_like.default)
+@@ -604,14 +615,18 @@ def randint_like(
+     memory_format: Optional[torch.memory_format] = None,
+     **kwargs: Any,
+ ) -> torch.Tensor:
+-    return aten.randint.low(
+-        0,
+-        high,
+-        [*self.size()],
+-        dtype=dtype or self.dtype,
+-        device=device or self.device,
+-        **kwargs,
+-    ).to(memory_format=get_like_layout(self, memory_format))
++    return _memory_format_like(
++        aten.randint.low(
++            0,
++            high,
++            [*self.size()],
++            dtype=dtype or self.dtype,
++            device=device or self.device,
++            **kwargs,
++        ),
++        self,
++        memory_format,
++    )
+ 
+ 
+ @register_decomposition(aten.randint_like.low_dtype)
+@@ -625,14 +640,18 @@ def randint_like_low(
+     memory_format: Optional[torch.memory_format] = None,
+     **kwargs: Any,
+ ) -> torch.Tensor:
+-    return aten.randint.low(
+-        low,
+-        high,
+-        [*self.size()],
+-        dtype=dtype or self.dtype,
+-        device=device or self.device,
+-        **kwargs,
+-    ).to(memory_format=get_like_layout(self, memory_format))
++    return _memory_format_like(
++        aten.randint.low(
++            low,
++            high,
++            [*self.size()],
++            dtype=dtype or self.dtype,
++            device=device or self.device,
++            **kwargs,
++        ),
++        self,
++        memory_format,
++    )
+ 
+ 
+ @register_decomposition(aten.randint.default)
+
+From af769ebb4c21281527b9562940045942af1e5945 Mon Sep 17 00:00:00 2001
+From: Isuru Fernando <ifernando@quansight.com>
+Date: Tue, 14 Jan 2025 15:26:13 +0000
+Subject: [PATCH 02/27] Update
+
+[ghstack-poisoned]
+---
+ torch/_inductor/decomposition.py | 85 +++++++++++---------------------
+ 1 file changed, 28 insertions(+), 57 deletions(-)
+
+diff --git a/torch/_inductor/decomposition.py b/torch/_inductor/decomposition.py
+index c37f745067c90..954cfe168547b 100644
+--- a/torch/_inductor/decomposition.py
++++ b/torch/_inductor/decomposition.py
+@@ -526,17 +526,6 @@ def view_copy_dtype(
+     return self.to(dtype).clone()
+ 
+ 
+-def _memory_format_like(
+-    output: torch.Tensor,
+-    input: torch.Tensor,
+-    memory_format: Optional[torch.memory_format] = None,
+-) -> torch.Tensor:
+-    if memory_format is torch.preserve_format or memory_format is None:
+-        return output.as_strided(input.shape, input.stride())
+-    else:
+-        return output.to(memory_format=memory_format)
+-
+-
+ @register_decomposition(aten.rand_like)
+ def rand_like(
+     self: torch.Tensor,
+@@ -546,16 +535,10 @@ def rand_like(
+     memory_format: Optional[torch.memory_format] = None,
+     **kwargs: Any,
+ ) -> torch.Tensor:
+-    return _memory_format_like(
+-        torch.rand(
+-            [*self.size()],
+-            dtype=dtype or self.dtype,
+-            device=device or self.device,
+-            **kwargs,
+-        ),
+-        self,
+-        memory_format,
++    result = torch.empty_like(
++        self, dtype=dtype, device=device, memory_format=memory_format, **kwargs
+     )
++    return aten.uniform_(result, 0, 1)
+ 
+ 
+ @register_decomposition(aten.randn_like)
+@@ -567,16 +550,10 @@ def randn_like(
+     memory_format: Optional[torch.memory_format] = None,
+     **kwargs: Any,
+ ) -> torch.Tensor:
+-    return _memory_format_like(
+-        torch.randn(
+-            [*self.size()],
+-            dtype=dtype or self.dtype,
+-            device=device or self.device,
+-            **kwargs,
+-        ),
+-        self,
+-        memory_format,
++    result = torch.empty_like(
++        self, dtype=dtype, device=device, memory_format=memory_format, **kwargs
+     )
++    return aten.normal_(result, 0, 1)
+ 
+ 
+ @register_decomposition(aten.full_like)
+@@ -591,18 +568,28 @@ def full_like(
+     requires_grad: bool = False,
+     memory_format: Optional[torch.memory_format] = torch.preserve_format,
+ ) -> torch.Tensor:
+-    return _memory_format_like(
+-        torch.full(
++    # Can't use aten.fill_ as that dispatches to full_like
++    if memory_format is torch.preserve_format or memory_format is None:
++        result = torch.empty_like(
++            self,
++            dtype=dtype,
++            device=device,
++            memory_format=memory_format,
++            pin_memory=pin_memory,
++            requires_grad=requires_grad,
++        )
++        full = torch.tensor(fill_value, device=device, dtype=dtype)
++        return aten.copy(result, full)
++    else:
++        result = torch.full(
+             [*self.size()],
+             fill_value,
+             dtype=dtype or self.dtype,
+             layout=layout or self.layout,
+             device=device or self.device,
+             requires_grad=requires_grad,
+-        ),
+-        self,
+-        memory_format,
+-    )
++        )
++        return result.to(memory_format=memory_format)
+ 
+ 
+ @register_decomposition(aten.randint_like.default)
+@@ -615,18 +602,10 @@ def randint_like(
+     memory_format: Optional[torch.memory_format] = None,
+     **kwargs: Any,
+ ) -> torch.Tensor:
+-    return _memory_format_like(
+-        aten.randint.low(
+-            0,
+-            high,
+-            [*self.size()],
+-            dtype=dtype or self.dtype,
+-            device=device or self.device,
+-            **kwargs,
+-        ),
+-        self,
+-        memory_format,
++    result = torch.empty_like(
++        self, dtype=dtype, device=device, memory_format=memory_format, **kwargs
+     )
++    return aten.random_(result, 0, high)
+ 
+ 
+ @register_decomposition(aten.randint_like.low_dtype)
+@@ -640,18 +619,10 @@ def randint_like_low(
+     memory_format: Optional[torch.memory_format] = None,
+     **kwargs: Any,
+ ) -> torch.Tensor:
+-    return _memory_format_like(
+-        aten.randint.low(
+-            low,
+-            high,
+-            [*self.size()],
+-            dtype=dtype or self.dtype,
+-            device=device or self.device,
+-            **kwargs,
+-        ),
+-        self,
+-        memory_format,
++    result = torch.empty_like(
++        self, dtype=dtype, device=device, memory_format=memory_format, **kwargs
+     )
++    return aten.random_(result, low, high)
+ 
+ 
+ @register_decomposition(aten.randint.default)
+
+From aa3fc9799ec1c4f41f8168f6df7a99c98f48a5e2 Mon Sep 17 00:00:00 2001
+From: Isuru Fernando <ifernando@quansight.com>
+Date: Tue, 14 Jan 2025 17:52:05 +0000
+Subject: [PATCH 03/27] Update
+
+[ghstack-poisoned]
+---
+ torch/_inductor/decomposition.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/torch/_inductor/decomposition.py b/torch/_inductor/decomposition.py
+index 954cfe168547b..3935ee9bf9f78 100644
+--- a/torch/_inductor/decomposition.py
++++ b/torch/_inductor/decomposition.py
+@@ -538,7 +538,7 @@ def rand_like(
+     result = torch.empty_like(
+         self, dtype=dtype, device=device, memory_format=memory_format, **kwargs
+     )
+-    return aten.uniform_(result, 0, 1)
++    return aten.copy(result, aten.uniform(result, 0, 1))
+ 
+ 
+ @register_decomposition(aten.randn_like)
+
+From 58526aff7b9289ee4fd1c976f735e127903ec5d2 Mon Sep 17 00:00:00 2001
+From: Isuru Fernando <ifernando@quansight.com>
+Date: Tue, 14 Jan 2025 19:01:57 +0000
+Subject: [PATCH 04/27] Update
+
+[ghstack-poisoned]
+---
+ torch/_inductor/decomposition.py | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/torch/_inductor/decomposition.py b/torch/_inductor/decomposition.py
+index 3935ee9bf9f78..5958ac9ab3342 100644
+--- a/torch/_inductor/decomposition.py
++++ b/torch/_inductor/decomposition.py
+@@ -553,7 +553,10 @@ def randn_like(
+     result = torch.empty_like(
+         self, dtype=dtype, device=device, memory_format=memory_format, **kwargs
+     )
+-    return aten.normal_(result, 0, 1)
++    return aten.copy(
++        result,
++        torch.randn(result.shape, dtype=result.dtype, device=result.device, **kwargs),
++    )
+ 
+ 
+ @register_decomposition(aten.full_like)
+@@ -605,7 +608,7 @@ def randint_like(
+     result = torch.empty_like(
+         self, dtype=dtype, device=device, memory_format=memory_format, **kwargs
+     )
+-    return aten.random_(result, 0, high)
++    return aten.copy(result, aten.random(result, 0, high))
+ 
+ 
+ @register_decomposition(aten.randint_like.low_dtype)
+@@ -622,7 +625,7 @@ def randint_like_low(
+     result = torch.empty_like(
+         self, dtype=dtype, device=device, memory_format=memory_format, **kwargs
+     )
+-    return aten.random_(result, low, high)
++    return aten.copy(result, aten.random(result, low, high))
+ 
+ 
+ @register_decomposition(aten.randint.default)
+
+From 433fb7e359a9522b2531f365fd0d5918accf1ebc Mon Sep 17 00:00:00 2001
+From: Isuru Fernando <ifernando@quansight.com>
+Date: Wed, 15 Jan 2025 09:05:44 +0000
+Subject: [PATCH 05/27] only full_like
+
+[ghstack-poisoned]
+---
+ torch/_inductor/decomposition.py | 59 ++++++++++++++++++++++----------
+ 1 file changed, 40 insertions(+), 19 deletions(-)
+
+diff --git a/torch/_inductor/decomposition.py b/torch/_inductor/decomposition.py
+index 5958ac9ab3342..4f80faa42223b 100644
+--- a/torch/_inductor/decomposition.py
++++ b/torch/_inductor/decomposition.py
+@@ -9,6 +9,7 @@
+ 
+ import torch
+ import torch._decomp as decomp
++import torch._prims_common as utils
+ import torch.ao.quantization.fx._decomposed
+ from torch._decomp import (
+     core_aten_decompositions,
+@@ -526,6 +527,17 @@ def view_copy_dtype(
+     return self.to(dtype).clone()
+ 
+ 
++def get_like_layout(
++    tensor: torch.Tensor,
++    memory_format: Optional[torch.memory_format] = None,
++) -> torch.memory_format:
++    # TODO: _to_copy tensor to stride permutation
++    if memory_format is torch.preserve_format or memory_format is None:
++        return utils.suggest_memory_format(tensor)
++    else:
++        return memory_format
++
++
+ @register_decomposition(aten.rand_like)
+ def rand_like(
+     self: torch.Tensor,
+@@ -535,10 +547,12 @@ def rand_like(
+     memory_format: Optional[torch.memory_format] = None,
+     **kwargs: Any,
+ ) -> torch.Tensor:
+-    result = torch.empty_like(
+-        self, dtype=dtype, device=device, memory_format=memory_format, **kwargs
+-    )
+-    return aten.copy(result, aten.uniform(result, 0, 1))
++    return torch.rand(
++        [*self.size()],
++        dtype=dtype or self.dtype,
++        device=device or self.device,
++        **kwargs,
++    ).to(memory_format=get_like_layout(self, memory_format))
+ 
+ 
+ @register_decomposition(aten.randn_like)
+@@ -550,13 +564,12 @@ def randn_like(
+     memory_format: Optional[torch.memory_format] = None,
+     **kwargs: Any,
+ ) -> torch.Tensor:
+-    result = torch.empty_like(
+-        self, dtype=dtype, device=device, memory_format=memory_format, **kwargs
+-    )
+-    return aten.copy(
+-        result,
+-        torch.randn(result.shape, dtype=result.dtype, device=result.device, **kwargs),
+-    )
++    return torch.randn(
++        [*self.size()],
++        dtype=dtype or self.dtype,
++        device=device or self.device,
++        **kwargs,
++    ).to(memory_format=get_like_layout(self, memory_format))
+ 
+ 
+ @register_decomposition(aten.full_like)
+@@ -605,10 +618,14 @@ def randint_like(
+     memory_format: Optional[torch.memory_format] = None,
+     **kwargs: Any,
+ ) -> torch.Tensor:
+-    result = torch.empty_like(
+-        self, dtype=dtype, device=device, memory_format=memory_format, **kwargs
+-    )
+-    return aten.copy(result, aten.random(result, 0, high))
++    return aten.randint.low(
++        0,
++        high,
++        [*self.size()],
++        dtype=dtype or self.dtype,
++        device=device or self.device,
++        **kwargs,
++    ).to(memory_format=get_like_layout(self, memory_format))
+ 
+ 
+ @register_decomposition(aten.randint_like.low_dtype)
+@@ -622,10 +639,14 @@ def randint_like_low(
+     memory_format: Optional[torch.memory_format] = None,
+     **kwargs: Any,
+ ) -> torch.Tensor:
+-    result = torch.empty_like(
+-        self, dtype=dtype, device=device, memory_format=memory_format, **kwargs
+-    )
+-    return aten.copy(result, aten.random(result, low, high))
++    return aten.randint.low(
++        low,
++        high,
++        [*self.size()],
++        dtype=dtype or self.dtype,
++        device=device or self.device,
++        **kwargs,
++    ).to(memory_format=get_like_layout(self, memory_format))
+ 
+ 
+ @register_decomposition(aten.randint.default)
+
+From 1035bb60089d113fac071f4a6c1a69d8aadc49a3 Mon Sep 17 00:00:00 2001
+From: Isuru Fernando <ifernando@quansight.com>
+Date: Thu, 16 Jan 2025 12:12:25 +0000
+Subject: [PATCH 06/27] Update
+
+[ghstack-poisoned]
+---
+ torch/_inductor/decomposition.py | 19 +++++++++----------
+ 1 file changed, 9 insertions(+), 10 deletions(-)
+
+diff --git a/torch/_inductor/decomposition.py b/torch/_inductor/decomposition.py
+index 9d5d9bc634b07..90d40d08e730f 100644
+--- a/torch/_inductor/decomposition.py
++++ b/torch/_inductor/decomposition.py
+@@ -585,6 +585,14 @@ def full_like(
+     memory_format: Optional[torch.memory_format] = torch.preserve_format,
+ ) -> torch.Tensor:
+     # Can't use aten.fill_ as that dispatches to full_like
++    full = torch.full(
++        [*self.size()],
++        fill_value,
++        dtype=dtype or self.dtype,
++        layout=layout or self.layout,
++        device=device or self.device,
++        requires_grad=requires_grad,
++    )
+     if memory_format is torch.preserve_format or memory_format is None:
+         result = torch.empty_like(
+             self,
+@@ -594,18 +602,9 @@ def full_like(
+             pin_memory=pin_memory,
+             requires_grad=requires_grad,
+         )
+-        full = torch.tensor(fill_value, device=device, dtype=dtype)
+         return aten.copy(result, full)
+     else:
+-        result = torch.full(
+-            [*self.size()],
+-            fill_value,
+-            dtype=dtype or self.dtype,
+-            layout=layout or self.layout,
+-            device=device or self.device,
+-            requires_grad=requires_grad,
+-        )
+-        return result.to(memory_format=memory_format)
++        return full.to(memory_format=memory_format)
+ 
+ 
+ @register_decomposition(aten.randint_like.default)
+
+From 9b8595b79b212f018ace60ded9db8cdf7fdfc631 Mon Sep 17 00:00:00 2001
+From: Isuru Fernando <ifernando@quansight.com>
+Date: Fri, 28 Mar 2025 20:23:57 +0000
+Subject: [PATCH 07/27] Update
+
+[ghstack-poisoned]
+---
+ torch/_inductor/decomposition.py | 38 --------------------------------
+ torch/_refs/__init__.py          |  1 +
+ 2 files changed, 1 insertion(+), 38 deletions(-)
+
+diff --git a/torch/_inductor/decomposition.py b/torch/_inductor/decomposition.py
+index c3aa345b7c140..0cda0c37156c2 100644
+--- a/torch/_inductor/decomposition.py
++++ b/torch/_inductor/decomposition.py
+@@ -574,44 +574,6 @@ def randn_like(
+     ).to(memory_format=get_like_layout(self, memory_format))
+ 
+ 
+-@register_decomposition(aten.full_like)
+-def full_like(
+-    self: torch.Tensor,
+-    fill_value: Union[int, float],
+-    *,
+-    dtype: Optional[torch.dtype] = None,
+-    layout: Optional[torch.layout] = None,
+-    device: Optional[torch.device] = None,
+-    pin_memory: bool = False,
+-    requires_grad: bool = False,
+-    memory_format: Optional[torch.memory_format] = torch.preserve_format,
+-) -> torch.Tensor:
+-    # Can't use aten.fill_ as that dispatches to full_like
+-    full = torch.full(
+-        [*self.size()],
+-        fill_value,
+-        dtype=dtype or self.dtype,
+-        layout=layout or self.layout,
+-        device=device or self.device,
+-        requires_grad=requires_grad,
+-    )
+-    if memory_format is torch.preserve_format or memory_format is None:
+-        if self.is_contiguous():
+-            return full
+-
+-        result = torch.empty_like(
+-            self,
+-            dtype=dtype,
+-            device=device,
+-            memory_format=memory_format,
+-            pin_memory=pin_memory,
+-            requires_grad=requires_grad,
+-        )
+-        return aten.copy(result, full)
+-    else:
+-        return full.to(memory_format=memory_format)
+-
+-
+ @register_decomposition(aten.randint_like.default)
+ def randint_like(
+     self: torch.Tensor,
+diff --git a/torch/_refs/__init__.py b/torch/_refs/__init__.py
+index 3cf2a0b521468..4c4ae6904e74c 100644
+--- a/torch/_refs/__init__.py
++++ b/torch/_refs/__init__.py
+@@ -5560,6 +5560,7 @@ def full(
+     return torch.fill(e, fill_value)  # type: ignore[arg-type]
+ 
+ 
++@register_decomposition(aten.full_like)
+ def full_like(
+     a: TensorLikeType,
+     fill_value: NumberType,
+
+From 86136da844a5e43106a58989efc0364706b9fa4b Mon Sep 17 00:00:00 2001
+From: Isuru Fernando <ifernando@quansight.com>
+Date: Tue, 1 Apr 2025 03:34:03 +0000
+Subject: [PATCH 08/27] Update
+
+[ghstack-poisoned]
+---
+ torch/_refs/__init__.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/torch/_refs/__init__.py b/torch/_refs/__init__.py
+index 4c4ae6904e74c..7bff944f098c0 100644
+--- a/torch/_refs/__init__.py
++++ b/torch/_refs/__init__.py
+@@ -5581,7 +5581,7 @@ def full_like(
+         requires_grad=requires_grad,
+         memory_format=memory_format,
+     )
+-    return fill(e, fill_value)
++    return prims.fill(e, fill_value)
+ 
+ 
+ @register_decomposition(aten.zeros_like)
+
+From 4d6a704fc390235640f56ec797b55f413789bd04 Mon Sep 17 00:00:00 2001
+From: Isuru Fernando <ifernando@quansight.com>
+Date: Tue, 1 Apr 2025 04:53:14 +0000
+Subject: [PATCH 09/27] Update
+
+[ghstack-poisoned]
+---
+ test/expect/HasDecompTest.test_has_decomposition.expect | 2 --
+ test/test_ops.py                                        | 2 --
+ torch/_decomp/__init__.py                               | 1 +
+ 3 files changed, 1 insertion(+), 4 deletions(-)
+
+diff --git a/test/expect/HasDecompTest.test_has_decomposition.expect b/test/expect/HasDecompTest.test_has_decomposition.expect
+index 3faa1186562f5..e993745c74d59 100644
+--- a/test/expect/HasDecompTest.test_has_decomposition.expect
++++ b/test/expect/HasDecompTest.test_has_decomposition.expect
+@@ -815,8 +815,6 @@ aten::from_file
+ aten::from_file.out
+ aten::full.names
+ aten::full.names_out
+-aten::full_like
+-aten::full_like.out
+ aten::gather
+ aten::gather.out
+ aten::geqrf
+diff --git a/test/test_ops.py b/test/test_ops.py
+index 871b643568ebe..77b15991aecfa 100644
+--- a/test/test_ops.py
++++ b/test/test_ops.py
+@@ -2295,7 +2295,6 @@ class TestRefsOpsInfo(TestCase):
+         "_refs.empty_strided",
+         "_refs.equal",
+         "_refs.full",
+-        "_refs.full_like",
+         "_refs.is_complex",
+         "_refs.to",
+         "_refs.mvlgamma",
+@@ -2410,7 +2409,6 @@ class TestRefsOpsInfo(TestCase):
+         "_refs.unflatten",
+         "_refs.sum_to_size",
+         # ref implementation missing kwargs
+-        "_refs.full_like",  # missing "layout"
+         "_refs.scalar_tensor",  # missing "layout"
+         # other
+         "_refs.block_diag",  # only refs._block_diag_iterable is in decomposition table
+diff --git a/torch/_decomp/__init__.py b/torch/_decomp/__init__.py
+index abb94b109cc0c..8f61fa15f9bc4 100644
+--- a/torch/_decomp/__init__.py
++++ b/torch/_decomp/__init__.py
+@@ -346,6 +346,7 @@ def _core_aten_decompositions_post_autograd() -> dict[
+             aten.floor_divide,
+             aten.frac,
+             aten.frac_,
++            aten.full_like,
+             aten._fused_moving_avg_obs_fq_helper,
+             aten.gelu_,
+             aten.gelu_backward,
+
+From 09c7371a6bc821e2ad3c0b116ac21b5bdee7b1f8 Mon Sep 17 00:00:00 2001
+From: Isuru Fernando <ifernando@quansight.com>
+Date: Wed, 2 Apr 2025 14:46:25 +0000
+Subject: [PATCH 10/27] Update
+
+[ghstack-poisoned]
+---
+ torch/_inductor/lowering.py | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/torch/_inductor/lowering.py b/torch/_inductor/lowering.py
+index 56a180b624ba5..a6d9efbeddb24 100644
+--- a/torch/_inductor/lowering.py
++++ b/torch/_inductor/lowering.py
+@@ -6049,7 +6049,10 @@ def fill_(x, fill_value):
+ @register_lowering(prims.fill)
+ def prims_fill(x, fill_value):
+     return Pointwise.create(
+-            device=x.get_device(), dtype=x.get_dtype(), inner_fn=lambda _: ops.constant(fill_value, x.get_dtype()), ranges=list(x.get_size())
++        device=x.get_device(),
++        dtype=x.get_dtype(),
++        inner_fn=lambda _: ops.constant(fill_value, x.get_dtype()),
++        ranges=list(x.get_size()),
+     )
+ 
+ 
+
+From b0b32375d9cbcdd7b882989ebd946578203e443f Mon Sep 17 00:00:00 2001
+From: Isuru Fernando <ifernando@quansight.com>
+Date: Wed, 2 Apr 2025 21:33:49 +0000
+Subject: [PATCH 11/27] Update
+
+[ghstack-poisoned]
+---
+ test/distributed/test_inductor_collectives.py        |  6 +++---
+ test/inductor/test_aot_inductor.py                   |  2 +-
+ torch/_inductor/lowering.py                          | 12 ++++--------
+ torch/_refs/__init__.py                              |  4 +++-
+ .../testing/_internal/common_methods_invocations.py  |  4 ++++
+ 5 files changed, 15 insertions(+), 13 deletions(-)
+
+diff --git a/test/distributed/test_inductor_collectives.py b/test/distributed/test_inductor_collectives.py
+index 049e780ff079e..af1c2b22b8c17 100644
+--- a/test/distributed/test_inductor_collectives.py
++++ b/test/distributed/test_inductor_collectives.py
+@@ -1344,10 +1344,10 @@ def func(inp, *, tag, ranks, group_size):
+             .check("buf2 = buf1[0]")
+             .check("buf3 = buf1[1]")
+             .check("torch.ops._c10d_functional.wait_tensor.default(buf2")
+-            .check("buf7 = buf0; del buf0  # reuse")
+-            .check(".run(buf7, 16")
++            .check("buf8 = buf0; del buf0  # reuse")
++            .check(".run(buf8, 16")
+             .check("torch.ops._c10d_functional.wait_tensor.default(buf3")
+-            .check("return (buf2, buf6, buf7, buf3")
++            .check("return (buf2, buf6, buf8, buf3")
+             .run(code)
+         )
+         out = compiled(inputs, **self.get_world_trs())
+diff --git a/test/inductor/test_aot_inductor.py b/test/inductor/test_aot_inductor.py
+index 12443a3bee894..f645b3fd242e4 100644
+--- a/test/inductor/test_aot_inductor.py
++++ b/test/inductor/test_aot_inductor.py
+@@ -4114,7 +4114,7 @@ def forward(self, x):
+         expected_scalar_args = [
+             "buf3, u0",
+             "buf4, u0",
+-            "buf3, buf4, buf2, u0",
++            "buf4, buf5, buf3, u0",
+         ]
+         # check the new behavior of codegen is expected
+         result, code = run_and_get_cpp_code(
+diff --git a/torch/_inductor/lowering.py b/torch/_inductor/lowering.py
+index a6d9efbeddb24..266a97bcf9654 100644
+--- a/torch/_inductor/lowering.py
++++ b/torch/_inductor/lowering.py
+@@ -3158,11 +3158,6 @@ def inner_fn(index):
+     )
+ 
+ 
+-@register_lowering(aten.full_like, type_promotion_kind=None)
+-def full_like(x, fill_value, **kwargs):
+-    return create_tensor_like(tensor_constructor(fill_value))(x, **kwargs)
+-
+-
+ def tensor_constructor(fill_value):
+     # torch.zeros, torch.ones, etc
+     def inner(
+@@ -6046,12 +6041,13 @@ def fill_(x, fill_value):
+     return mutate_to(x, full_like(x, fill_value))
+ 
+ 
+-@register_lowering(prims.fill)
++@register_lowering(prims.fill, type_promotion_kind=None)
+ def prims_fill(x, fill_value):
++    dtype = x.get_dtype()
+     return Pointwise.create(
+         device=x.get_device(),
+-        dtype=x.get_dtype(),
+-        inner_fn=lambda _: ops.constant(fill_value, x.get_dtype()),
++        dtype=dtype,
++        inner_fn=lambda _: ops.constant(fill_value, dtype),
+         ranges=list(x.get_size()),
+     )
+ 
+diff --git a/torch/_refs/__init__.py b/torch/_refs/__init__.py
+index 7bff944f098c0..d86ae30a0f8b3 100644
+--- a/torch/_refs/__init__.py
++++ b/torch/_refs/__init__.py
+@@ -5561,6 +5561,7 @@ def full(
+ 
+ 
+ @register_decomposition(aten.full_like)
++@out_wrapper()
+ def full_like(
+     a: TensorLikeType,
+     fill_value: NumberType,
+@@ -5572,6 +5573,7 @@ def full_like(
+     requires_grad: bool = False,
+     memory_format: torch.memory_format = torch.preserve_format,
+ ) -> TensorLikeType:
++    dtype = dtype or a.dtype
+     e = torch.empty_like(
+         a,
+         dtype=dtype,
+@@ -5581,7 +5583,7 @@ def full_like(
+         requires_grad=requires_grad,
+         memory_format=memory_format,
+     )
+-    return prims.fill(e, fill_value)
++    return prims.fill(e, fill_value).to(dtype)
+ 
+ 
+ @register_decomposition(aten.zeros_like)
+diff --git a/torch/testing/_internal/common_methods_invocations.py b/torch/testing/_internal/common_methods_invocations.py
+index 24f651020d758..ee379293b559a 100644
+--- a/torch/testing/_internal/common_methods_invocations.py
++++ b/torch/testing/_internal/common_methods_invocations.py
+@@ -24463,6 +24463,10 @@ def sample_inputs_alias_copy(op_info, device, dtype, requires_grad, **kwargs):
+             DecorateInfo(unittest.skip('output is non-deterministic'), 'TestCommon', 'test_compare_cpu'),
+         ),
+     ),
++    PythonRefInfo(
++        "_refs.full_like",
++        torch_opinfo_name="full_like",
++    ),
+     PythonRefInfo(
+         "_refs.randn",
+         torch_opinfo_name="randn",
+
+From 483c2b66f573622258f5d9d092a2dc6d971a7169 Mon Sep 17 00:00:00 2001
+From: Isuru Fernando <ifernando@quansight.com>
+Date: Tue, 8 Apr 2025 14:42:31 +0000
+Subject: [PATCH 12/27] Update
+
+[ghstack-poisoned]
+---
+ torch/_inductor/lowering.py | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/torch/_inductor/lowering.py b/torch/_inductor/lowering.py
+index 266a97bcf9654..d6f41e570b515 100644
+--- a/torch/_inductor/lowering.py
++++ b/torch/_inductor/lowering.py
+@@ -3158,6 +3158,10 @@ def inner_fn(index):
+     )
+ 
+ 
++def full_like(x, fill_value, **kwargs):
++    return create_tensor_like(tensor_constructor(fill_value))(x, **kwargs)
++
++
+ def tensor_constructor(fill_value):
+     # torch.zeros, torch.ones, etc
+     def inner(
+
+From 04faf9fbd52431e94443424aaac70bcf68bdcb4f Mon Sep 17 00:00:00 2001
+From: Isuru Fernando <ifernando@quansight.com>
+Date: Tue, 8 Apr 2025 15:02:09 +0000
+Subject: [PATCH 13/27] Update
+
+[ghstack-poisoned]
+---
+ torch/_refs/__init__.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/torch/_refs/__init__.py b/torch/_refs/__init__.py
+index d86ae30a0f8b3..f9e8e7142ebaa 100644
+--- a/torch/_refs/__init__.py
++++ b/torch/_refs/__init__.py
+@@ -5583,7 +5583,7 @@ def full_like(
+         requires_grad=requires_grad,
+         memory_format=memory_format,
+     )
+-    return prims.fill(e, fill_value).to(dtype)
++    return prims.fill(e, fill_value)
+ 
+ 
+ @register_decomposition(aten.zeros_like)
+
+From 291cbb2b0ef2fbb668283811a2f987449eaddd42 Mon Sep 17 00:00:00 2001
+From: Isuru Fernando <ifernando@quansight.com>
+Date: Tue, 27 May 2025 23:22:54 +0000
+Subject: [PATCH 14/27] Update
+
+[ghstack-poisoned]
+---
+ torch/_refs/__init__.py | 13 +++++--------
+ 1 file changed, 5 insertions(+), 8 deletions(-)
+
+diff --git a/torch/_refs/__init__.py b/torch/_refs/__init__.py
+index 60d2842f45c11..8494a4dc2b352 100644
+--- a/torch/_refs/__init__.py
++++ b/torch/_refs/__init__.py
+@@ -5722,18 +5722,14 @@ def full(
+ 
+ 
+ def _get_shape_stride_like(
+-    a: TensorLikeType,
+-    layout: torch.layout,
+-    memory_format: torch.memory_format
++    a: TensorLikeType, layout: torch.layout, memory_format: torch.memory_format
+ ) -> tuple[ShapeType, StrideType]:
+     assert layout == torch.strided
+ 
+     if memory_format != torch.preserve_format:
+         return (a.shape, strides())
+ 
+-    physical_layout = (
+-        utils.compute_elementwise_output_logical_to_physical_perm(a)
+-    )
++    physical_layout = utils.compute_elementwise_output_logical_to_physical_perm(a)
+     shape = a.shape
+ 
+     p_strides = utils.make_contiguous_strides_for([shape[l] for l in physical_layout])
+@@ -5745,7 +5741,6 @@ def _get_shape_stride_like(
+     return (a.shape, strides)
+ 
+ 
+-
+ @register_decomposition(aten.full_like)
+ @out_wrapper()
+ def full_like(
+@@ -5763,7 +5758,9 @@ def full_like(
+     layout = a.layout if layout is None else layout
+     device = a.device if device is None else device
+     shape, stride = _get_shape_stride_like(a, layout, memory_format)
+-    return prims.full(a.shape, fill_value, dtype=dtype, device=device, requires_grad=requires_grad).as_strided(shape, stride)
++    return prims.full(
++        a.shape, fill_value, dtype=dtype, device=device, requires_grad=requires_grad
++    ).as_strided(shape, stride)
+ 
+ 
+ @register_decomposition(aten.zeros_like)
+
+From d4d5f24944f9708479193e439fd88f7616241a2e Mon Sep 17 00:00:00 2001
+From: Isuru Fernando <ifernando@quansight.com>
+Date: Wed, 28 May 2025 15:03:19 +0000
+Subject: [PATCH 15/27] Update
+
+[ghstack-poisoned]
+---
+ test/distributed/test_inductor_collectives.py | 14 ++++++--------
+ torch/_refs/__init__.py                       | 18 +++++++++++++-----
+ 2 files changed, 19 insertions(+), 13 deletions(-)
+
+diff --git a/test/distributed/test_inductor_collectives.py b/test/distributed/test_inductor_collectives.py
+index b76d938320477..6c33a6031d287 100644
+--- a/test/distributed/test_inductor_collectives.py
++++ b/test/distributed/test_inductor_collectives.py
+@@ -899,8 +899,8 @@ def func(inp, *, tag, ranks, group_size):
+             .check("torch.ops._c10d_functional.all_reduce_.default(buf1")
+             .check("torch.ops._c10d_functional.wait_tensor.default(buf1")
+             .check("buf7 = empty_strided")
+-            .check(".run(buf8, 16")
+-            .check("return (buf1, buf6, buf8")
++            .check(".run(buf7, 16")
++            .check("return (buf1, buf6, buf7")
+             .run(code)
+         )
+         out = compiled(inputs, **self.get_world_trs())
+@@ -1367,10 +1367,9 @@ def func(inp, *, tag, ranks, group_size):
+             .check("buf3 = buf1[1]")
+             .check("torch.ops._c10d_functional.wait_tensor.default(buf2")
+             .check("buf7 = buf0; del buf0  # reuse")
+-            .check("buf8 = buf7; del buf7  # reuse")
+-            .check(".run(buf8, 16")
++            .check(".run(buf7, 16")
+             .check("torch.ops._c10d_functional.wait_tensor.default(buf3")
+-            .check("return (buf2, buf6, buf8, buf3")
++            .check("return (buf2, buf6, buf7, buf3")
+             .run(code)
+         )
+         out = compiled(inputs, **self.get_world_trs())
+@@ -1414,10 +1413,9 @@ def func(inp, *, tag, ranks, group_size):
+             .check("buf3 = buf1[1]")
+             .check("torch.ops._c10d_functional.wait_tensor.default(buf2")
+             .check("buf7 = buf0; del buf0  # reuse")
+-            .check("buf8 = buf7; del buf7  # reuse")
+-            .check(".run(buf8, 16")
++            .check(".run(buf7, 16")
+             .check("torch.ops._c10d_functional.wait_tensor.default(buf3")
+-            .check("return (buf2, buf6, buf8, buf3")
++            .check("return (buf2, buf6, buf7, buf3")
+             .run(code)
+         )
+         out = compiled(inputs, **self.get_world_trs())
+diff --git a/torch/_refs/__init__.py b/torch/_refs/__init__.py
+index 8494a4dc2b352..c650d11d13141 100644
+--- a/torch/_refs/__init__.py
++++ b/torch/_refs/__init__.py
+@@ -5722,13 +5722,10 @@ def full(
+ 
+ 
+ def _get_shape_stride_like(
+-    a: TensorLikeType, layout: torch.layout, memory_format: torch.memory_format
++    a: TensorLikeType, layout: torch.layout
+ ) -> tuple[ShapeType, StrideType]:
+     assert layout == torch.strided
+ 
+-    if memory_format != torch.preserve_format:
+-        return (a.shape, strides())
+-
+     physical_layout = utils.compute_elementwise_output_logical_to_physical_perm(a)
+     shape = a.shape
+ 
+@@ -5757,7 +5754,18 @@ def full_like(
+     dtype = a.dtype if dtype is None else dtype
+     layout = a.layout if layout is None else layout
+     device = a.device if device is None else device
+-    shape, stride = _get_shape_stride_like(a, layout, memory_format)
++
++    if memory_format == torch.preserve_format:
++        return torch.full(
++            a.shape,
++            fill_value,
++            dtype=dtype,
++            layout=layout,
++            device=device,
++            requires_grad=requires_grad,
++        ).to(memory_format=memory_format)
++
++    shape, stride = _get_shape_stride_like(a, layout)
+     return prims.full(
+         a.shape, fill_value, dtype=dtype, device=device, requires_grad=requires_grad
+     ).as_strided(shape, stride)
+
+From a61854dd8b63ab65d7e69c1ce799d968dda879dd Mon Sep 17 00:00:00 2001
+From: Isuru Fernando <ifernando@quansight.com>
+Date: Wed, 28 May 2025 15:27:52 +0000
+Subject: [PATCH 16/27] Update
+
+[ghstack-poisoned]
+---
+ torch/_refs/__init__.py | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/torch/_refs/__init__.py b/torch/_refs/__init__.py
+index c650d11d13141..0ce14ccba66b4 100644
+--- a/torch/_refs/__init__.py
++++ b/torch/_refs/__init__.py
+@@ -5730,7 +5730,6 @@ def _get_shape_stride_like(
+     shape = a.shape
+ 
+     p_strides = utils.make_contiguous_strides_for([shape[l] for l in physical_layout])
+-    dim = len(shape)
+     strides = [0] * len(shape)
+     for p, l in enumerate(physical_layout):
+         strides[l] = p_strides[p]
+
+From fd28773ff7f50eaf108ddc58a59eda882514e395 Mon Sep 17 00:00:00 2001
+From: Isuru Fernando <ifernando@quansight.com>
+Date: Wed, 28 May 2025 17:11:29 +0000
+Subject: [PATCH 17/27] Update
+
+[ghstack-poisoned]
+---
+ torch/_refs/__init__.py | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/torch/_refs/__init__.py b/torch/_refs/__init__.py
+index 0ce14ccba66b4..3ed723d9da853 100644
+--- a/torch/_refs/__init__.py
++++ b/torch/_refs/__init__.py
+@@ -5718,7 +5718,7 @@ def full(
+         pin_memory=pin_memory,
+         requires_grad=requires_grad,
+     )
+-    return torch.fill(e, fill_value)  # type: ignore[arg-type]
++    return prims.fill(e, fill_value)  # type: ignore[arg-type]
+ 
+ 
+ def _get_shape_stride_like(
+@@ -5754,7 +5754,7 @@ def full_like(
+     layout = a.layout if layout is None else layout
+     device = a.device if device is None else device
+ 
+-    if memory_format == torch.preserve_format:
++    if memory_format != torch.preserve_format:
+         return torch.full(
+             a.shape,
+             fill_value,
+
+From 118f244bfbb68389664aef13c77e0bd1d83b4e35 Mon Sep 17 00:00:00 2001
+From: Isuru Fernando <ifernando@quansight.com>
+Date: Wed, 28 May 2025 18:46:05 +0000
+Subject: [PATCH 18/27] Update
+
+[ghstack-poisoned]
+---
+ test/distributed/test_inductor_collectives.py | 23 +++++++++++--------
+ torch/_refs/__init__.py                       |  8 +++++--
+ 2 files changed, 19 insertions(+), 12 deletions(-)
+
+diff --git a/test/distributed/test_inductor_collectives.py b/test/distributed/test_inductor_collectives.py
+index 6c33a6031d287..ca8a1d31e1aad 100644
+--- a/test/distributed/test_inductor_collectives.py
++++ b/test/distributed/test_inductor_collectives.py
+@@ -898,9 +898,10 @@ def func(inp, *, tag, ranks, group_size):
+             .check(".run(buf1, arg0_1, buf6, 16")
+             .check("torch.ops._c10d_functional.all_reduce_.default(buf1")
+             .check("torch.ops._c10d_functional.wait_tensor.default(buf1")
+-            .check("buf7 = empty_strided")
+-            .check(".run(buf7, 16")
+-            .check("return (buf1, buf6, buf7")
++            .check("buf8 = empty_strided")
++            .check("buf9 = buf8; del buf8  # reuse")
++            .check(".run(buf9, 16")
++            .check("return (buf1, buf6, buf9")
+             .run(code)
+         )
+         out = compiled(inputs, **self.get_world_trs())
+@@ -1366,10 +1367,11 @@ def func(inp, *, tag, ranks, group_size):
+             .check("buf2 = buf1[0]")
+             .check("buf3 = buf1[1]")
+             .check("torch.ops._c10d_functional.wait_tensor.default(buf2")
+-            .check("buf7 = buf0; del buf0  # reuse")
+-            .check(".run(buf7, 16")
++            .check("buf8 = buf0; del buf0  # reuse")
++            .check("buf9 = buf8; del buf8  # reuse")
++            .check(".run(buf9, 16")
+             .check("torch.ops._c10d_functional.wait_tensor.default(buf3")
+-            .check("return (buf2, buf6, buf7, buf3")
++            .check("return (buf2, buf6, buf9, buf3")
+             .run(code)
+         )
+         out = compiled(inputs, **self.get_world_trs())
+@@ -1412,10 +1414,11 @@ def func(inp, *, tag, ranks, group_size):
+             .check("buf2 = buf1[0]")
+             .check("buf3 = buf1[1]")
+             .check("torch.ops._c10d_functional.wait_tensor.default(buf2")
+-            .check("buf7 = buf0; del buf0  # reuse")
+-            .check(".run(buf7, 16")
++            .check("buf8 = buf0; del buf0  # reuse")
++            .check("buf9 = buf8; del buf8  # reuse")
++            .check(".run(buf9, 16")
+             .check("torch.ops._c10d_functional.wait_tensor.default(buf3")
+-            .check("return (buf2, buf6, buf7, buf3")
++            .check("return (buf2, buf6, buf9, buf3")
+             .run(code)
+         )
+         out = compiled(inputs, **self.get_world_trs())
+@@ -1486,7 +1489,7 @@ def _reorder_communication_preserving_peak_memory(
+             # .check("buf7 = buf0; del buf0  # reuse")
+             # .check(".run(buf7, 16")
+             .check("torch.ops._c10d_functional.wait_tensor.default(buf3")
+-            .check("return (buf2, buf6, buf7, buf3")
++            .check("return (buf2, buf6, buf9, buf3")
+             .run(code)
+         )
+         out = compiled(inputs, **self.get_world_trs())
+diff --git a/torch/_refs/__init__.py b/torch/_refs/__init__.py
+index 3ed723d9da853..ffc94ebed7f08 100644
+--- a/torch/_refs/__init__.py
++++ b/torch/_refs/__init__.py
+@@ -5765,9 +5765,13 @@ def full_like(
+         ).to(memory_format=memory_format)
+ 
+     shape, stride = _get_shape_stride_like(a, layout)
+-    return prims.full(
++    result = full(
+         a.shape, fill_value, dtype=dtype, device=device, requires_grad=requires_grad
+-    ).as_strided(shape, stride)
++    )
++    if stride:
++        return result.as_strided(shape, stride).clone()
++    else:
++        return result
+ 
+ 
+ @register_decomposition(aten.zeros_like)
+
+From ed54581baad86dd2af3343827f3e7ecf73da1eaa Mon Sep 17 00:00:00 2001
+From: Isuru Fernando <ifernando@quansight.com>
+Date: Fri, 30 May 2025 15:25:49 +0000
+Subject: [PATCH 19/27] Update
+
+[ghstack-poisoned]
+---
+ torch/_refs/__init__.py | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/torch/_refs/__init__.py b/torch/_refs/__init__.py
+index ffc94ebed7f08..57cbd041c250c 100644
+--- a/torch/_refs/__init__.py
++++ b/torch/_refs/__init__.py
+@@ -5754,6 +5754,12 @@ def full_like(
+     layout = a.layout if layout is None else layout
+     device = a.device if device is None else device
+ 
++    if memory_format == torch.preserve_format:
++        for m in (torch.contiguous_format, torch.channels_last, torch.channels_last_3d):
++            if a.is_contiguous(memory_format=m):
++                memory_format = m
++                break
++
+     if memory_format != torch.preserve_format:
+         return torch.full(
+             a.shape,
+
+From c174a90c67036dbe3bbf12434de1df76a8b27a35 Mon Sep 17 00:00:00 2001
+From: Isuru Fernando <ifernando@quansight.com>
+Date: Tue, 3 Jun 2025 18:06:41 +0000
+Subject: [PATCH 20/27] Update
+
+[ghstack-poisoned]
+---
+ test/distributed/test_inductor_collectives.py | 23 ++++++++-----------
+ test/test_decomp.py                           |  5 ++++
+ torch/_refs/__init__.py                       | 21 ++++++++---------
+ 3 files changed, 25 insertions(+), 24 deletions(-)
+
+diff --git a/test/distributed/test_inductor_collectives.py b/test/distributed/test_inductor_collectives.py
+index ca8a1d31e1aad..6c33a6031d287 100644
+--- a/test/distributed/test_inductor_collectives.py
++++ b/test/distributed/test_inductor_collectives.py
+@@ -898,10 +898,9 @@ def func(inp, *, tag, ranks, group_size):
+             .check(".run(buf1, arg0_1, buf6, 16")
+             .check("torch.ops._c10d_functional.all_reduce_.default(buf1")
+             .check("torch.ops._c10d_functional.wait_tensor.default(buf1")
+-            .check("buf8 = empty_strided")
+-            .check("buf9 = buf8; del buf8  # reuse")
+-            .check(".run(buf9, 16")
+-            .check("return (buf1, buf6, buf9")
++            .check("buf7 = empty_strided")
++            .check(".run(buf7, 16")
++            .check("return (buf1, buf6, buf7")
+             .run(code)
+         )
+         out = compiled(inputs, **self.get_world_trs())
+@@ -1367,11 +1366,10 @@ def func(inp, *, tag, ranks, group_size):
+             .check("buf2 = buf1[0]")
+             .check("buf3 = buf1[1]")
+             .check("torch.ops._c10d_functional.wait_tensor.default(buf2")
+-            .check("buf8 = buf0; del buf0  # reuse")
+-            .check("buf9 = buf8; del buf8  # reuse")
+-            .check(".run(buf9, 16")
++            .check("buf7 = buf0; del buf0  # reuse")
++            .check(".run(buf7, 16")
+             .check("torch.ops._c10d_functional.wait_tensor.default(buf3")
+-            .check("return (buf2, buf6, buf9, buf3")
++            .check("return (buf2, buf6, buf7, buf3")
+             .run(code)
+         )
+         out = compiled(inputs, **self.get_world_trs())
+@@ -1414,11 +1412,10 @@ def func(inp, *, tag, ranks, group_size):
+             .check("buf2 = buf1[0]")
+             .check("buf3 = buf1[1]")
+             .check("torch.ops._c10d_functional.wait_tensor.default(buf2")
+-            .check("buf8 = buf0; del buf0  # reuse")
+-            .check("buf9 = buf8; del buf8  # reuse")
+-            .check(".run(buf9, 16")
++            .check("buf7 = buf0; del buf0  # reuse")
++            .check(".run(buf7, 16")
+             .check("torch.ops._c10d_functional.wait_tensor.default(buf3")
+-            .check("return (buf2, buf6, buf9, buf3")
++            .check("return (buf2, buf6, buf7, buf3")
+             .run(code)
+         )
+         out = compiled(inputs, **self.get_world_trs())
+@@ -1489,7 +1486,7 @@ def _reorder_communication_preserving_peak_memory(
+             # .check("buf7 = buf0; del buf0  # reuse")
+             # .check(".run(buf7, 16")
+             .check("torch.ops._c10d_functional.wait_tensor.default(buf3")
+-            .check("return (buf2, buf6, buf9, buf3")
++            .check("return (buf2, buf6, buf7, buf3")
+             .run(code)
+         )
+         out = compiled(inputs, **self.get_world_trs())
+diff --git a/test/test_decomp.py b/test/test_decomp.py
+index 07dcd8252c5b5..f3e52f592971f 100644
+--- a/test/test_decomp.py
++++ b/test/test_decomp.py
+@@ -545,6 +545,11 @@ def test_unsupported(t):
+     xfail(
+         "nn.functional.upsample_bilinear", "", dtypes=(torch.uint8,)
+     ),  # off by one error
++    skip(
++        "nn.functional.nll_loss",
++        "",
++        dtypes=(torch.float64, torch.float32, torch.bfloat16, torch.float16),
++    ),  # non-deterministic
+ }
+ 
+ 
+diff --git a/torch/_refs/__init__.py b/torch/_refs/__init__.py
+index 57cbd041c250c..8f12b2f253686 100644
+--- a/torch/_refs/__init__.py
++++ b/torch/_refs/__init__.py
+@@ -5760,20 +5760,19 @@ def full_like(
+                 memory_format = m
+                 break
+ 
++    result = torch.full(
++        a.shape,
++        fill_value,
++        dtype=dtype,
++        layout=layout,
++        device=device,
++        requires_grad=requires_grad,
++    )
++
+     if memory_format != torch.preserve_format:
+-        return torch.full(
+-            a.shape,
+-            fill_value,
+-            dtype=dtype,
+-            layout=layout,
+-            device=device,
+-            requires_grad=requires_grad,
+-        ).to(memory_format=memory_format)
++        return result.to(memory_format=memory_format)
+ 
+     shape, stride = _get_shape_stride_like(a, layout)
+-    result = full(
+-        a.shape, fill_value, dtype=dtype, device=device, requires_grad=requires_grad
+-    )
+     if stride:
+         return result.as_strided(shape, stride).clone()
+     else:
+
+From ded47fcf128f1c81f70f91d8710a3e8fd10982e1 Mon Sep 17 00:00:00 2001
+From: Isuru Fernando <ifernando@quansight.com>
+Date: Tue, 3 Jun 2025 20:31:25 +0000
+Subject: [PATCH 21/27] Update
+
+[ghstack-poisoned]
+---
+ torch/_refs/__init__.py | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/torch/_refs/__init__.py b/torch/_refs/__init__.py
+index 8f12b2f253686..18866c8cfeec9 100644
+--- a/torch/_refs/__init__.py
++++ b/torch/_refs/__init__.py
+@@ -5766,6 +5766,7 @@ def full_like(
+         dtype=dtype,
+         layout=layout,
+         device=device,
++        pin_memory=pin_memory,
+         requires_grad=requires_grad,
+     )
+ 
+
+From c7ce76d9c9735b464ed6d514bf4607c81e1fc444 Mon Sep 17 00:00:00 2001
+From: Isuru Fernando <ifernando@quansight.com>
+Date: Wed, 4 Jun 2025 16:51:22 +0000
+Subject: [PATCH 22/27] Update
+
+[ghstack-poisoned]
+---
+ torch/_refs/__init__.py | 64 ++++++++++++++++++++++++-----------------
+ 1 file changed, 38 insertions(+), 26 deletions(-)
+
+diff --git a/torch/_refs/__init__.py b/torch/_refs/__init__.py
+index 18866c8cfeec9..aed3e305ed709 100644
+--- a/torch/_refs/__init__.py
++++ b/torch/_refs/__init__.py
+@@ -5721,20 +5721,19 @@ def full(
+     return prims.fill(e, fill_value)  # type: ignore[arg-type]
+ 
+ 
+-def _get_shape_stride_like(
++def _get_shape_permutation_like(
+     a: TensorLikeType, layout: torch.layout
+ ) -> tuple[ShapeType, StrideType]:
+     assert layout == torch.strided
+ 
+     physical_layout = utils.compute_elementwise_output_logical_to_physical_perm(a)
+-    shape = a.shape
++    shape = [a.shape[l] for l in physical_layout]
+ 
+-    p_strides = utils.make_contiguous_strides_for([shape[l] for l in physical_layout])
+-    strides = [0] * len(shape)
++    permutation = [0] * len(shape)
+     for p, l in enumerate(physical_layout):
+-        strides[l] = p_strides[p]
++        permutation[l] = p
+ 
+-    return (a.shape, strides)
++    return (shape, permutation)
+ 
+ 
+ @register_decomposition(aten.full_like)
+@@ -5754,30 +5753,43 @@ def full_like(
+     layout = a.layout if layout is None else layout
+     device = a.device if device is None else device
+ 
+-    if memory_format == torch.preserve_format:
+-        for m in (torch.contiguous_format, torch.channels_last, torch.channels_last_3d):
+-            if a.is_contiguous(memory_format=m):
+-                memory_format = m
+-                break
+-
+-    result = torch.full(
+-        a.shape,
+-        fill_value,
+-        dtype=dtype,
+-        layout=layout,
+-        device=device,
+-        pin_memory=pin_memory,
+-        requires_grad=requires_grad,
+-    )
+-
+     if memory_format != torch.preserve_format:
++        result = torch.full(
++            a.shape,
++            fill_value,
++            dtype=dtype,
++            layout=layout,
++            device=device,
++            pin_memory=pin_memory,
++            requires_grad=requires_grad,
++        )
+         return result.to(memory_format=memory_format)
+ 
+-    shape, stride = _get_shape_stride_like(a, layout)
+-    if stride:
+-        return result.as_strided(shape, stride).clone()
++    elif not utils.is_non_overlapping_and_dense(a):
++        return torch.full(
++            a.shape,
++            fill_value,
++            dtype=dtype,
++            layout=layout,
++            device=device,
++            pin_memory=pin_memory,
++            requires_grad=requires_grad,
++        )
++
+     else:
+-        return result
++        shape, permutation = _get_shape_permutation_like(a, layout)
++        result = torch.full(
++            shape,
++            fill_value,
++            dtype=dtype,
++            layout=layout,
++            device=device,
++            pin_memory=pin_memory,
++            requires_grad=requires_grad,
++        )
++        if permutation == list(range(len(permutation))):
++            return result
++        return result.permute(permutation).clone()
+ 
+ 
+ @register_decomposition(aten.zeros_like)
+
+From 326e75a5422e6baddcb0b7128f4ad8dc9a34f25a Mon Sep 17 00:00:00 2001
+From: Isuru Fernando <ifernando@quansight.com>
+Date: Wed, 4 Jun 2025 20:10:10 +0000
+Subject: [PATCH 23/27] Update
+
+[ghstack-poisoned]
+---
+ torch/_refs/__init__.py | 11 -----------
+ 1 file changed, 11 deletions(-)
+
+diff --git a/torch/_refs/__init__.py b/torch/_refs/__init__.py
+index 0bd31225140d1..cf6123ba1e9a3 100644
+--- a/torch/_refs/__init__.py
++++ b/torch/_refs/__init__.py
+@@ -5766,17 +5766,6 @@ def full_like(
+         )
+         return result.to(memory_format=memory_format)
+ 
+-    elif not utils.is_non_overlapping_and_dense(a):
+-        return torch.full(
+-            a.shape,
+-            fill_value,
+-            dtype=dtype,
+-            layout=layout,
+-            device=device,
+-            pin_memory=pin_memory,
+-            requires_grad=requires_grad,
+-        )
+-
+     else:
+         shape, permutation = _get_shape_permutation_like(a, layout)
+         result = torch.full(
+
+From 09daee5d1695761e991452f7d0349bbd93bb0923 Mon Sep 17 00:00:00 2001
+From: Isuru Fernando <ifernando@quansight.com>
+Date: Wed, 4 Jun 2025 21:38:11 +0000
+Subject: [PATCH 24/27] Update
+
+[ghstack-poisoned]
+---
+ test/inductor/test_torchinductor.py | 13 ++++++++++++-
+ torch/_inductor/lowering.py         | 10 ----------
+ 2 files changed, 12 insertions(+), 11 deletions(-)
+
+diff --git a/test/inductor/test_torchinductor.py b/test/inductor/test_torchinductor.py
+index 21853b385ef71..38a6c2f3ca8cd 100644
+--- a/test/inductor/test_torchinductor.py
++++ b/test/inductor/test_torchinductor.py
+@@ -431,6 +431,8 @@ def check_model(
+     check_gradient=False,
+     check_has_compiled=True,
+     output_process_fn_grad=lambda x: x,
++    # TODO: enable this for all tests
++    exact_stride=False,
+ ):
+     kwargs = kwargs or {}
+     torch._dynamo.reset()
+@@ -543,6 +545,7 @@ def reference_to_expect(actual_flat, correct_flat):
+             rtol=rtol,
+             equal_nan=True,
+             exact_dtype=exact_dtype,
++            exact_stride=exact_stride,
+         )
+         # In case of input mutations, check that inputs are the same
+         self.assertEqual(
+@@ -553,6 +556,7 @@ def reference_to_expect(actual_flat, correct_flat):
+             equal_nan=True,
+             # our testing sometimes uses higher precision inputs for the reference
+             exact_dtype=False,
++            exact_stride=exact_stride,
+         )
+     else:
+         for correct_val, actual_val in zip(correct_flat, actual_flat):
+@@ -566,6 +570,8 @@ def reference_to_expect(actual_flat, correct_flat):
+                 assert correct_val.layout == actual_val.layout
+                 if exact_dtype:
+                     assert correct_val.dtype == actual_val.dtype
++                if exact_stride:
++                    assert correct_val.stride() == actual_val.stride()
+ 
+     if check_gradient:
+         actual = output_process_fn_grad(actual)
+@@ -619,6 +625,7 @@ def reference_to_expect(actual_flat, correct_flat):
+                 rtol=grad_rtol or rtol,
+                 equal_nan=True,
+                 exact_dtype=exact_dtype,
++                exact_stride=exact_stride,
+             )
+ 
+     torch._dynamo.reset()
+@@ -644,6 +651,8 @@ def check_model_gpu(
+     check_gradient=False,
+     check_has_compiled=True,
+     output_process_fn_grad=lambda x: x,
++    # TODO: enable this for all tests
++    exact_stride=False,
+ ):
+     kwargs = kwargs or {}
+     if hasattr(model, "to"):
+@@ -670,6 +679,7 @@ def check_model_gpu(
+         check_gradient=check_gradient,
+         check_has_compiled=check_has_compiled,
+         output_process_fn_grad=output_process_fn_grad,
++        exact_stride=exact_stride,
+     )
+ 
+     if check_lowp:
+@@ -702,6 +712,7 @@ def downcast_fn(x):
+             check_gradient=check_gradient,
+             check_has_compiled=check_has_compiled,
+             output_process_fn_grad=output_process_fn_grad,
++            exact_stride=exact_stride,
+         )
+ 
+ 
+@@ -6975,7 +6986,7 @@ def test_full_like_stride(self):
+         def fn(a):
+             return torch.full_like(a, 3)
+ 
+-        self.common(fn, (torch.randn(4, 5, 6).transpose(1, -1),))
++        self.common(fn, (torch.randn(4, 5, 6).transpose(1, -1),), exact_stride=True)
+ 
+     def test_full_truncation(self):
+         def fn(a):
+diff --git a/torch/_inductor/lowering.py b/torch/_inductor/lowering.py
+index d197962b8b799..e7dd1bfa9e769 100644
+--- a/torch/_inductor/lowering.py
++++ b/torch/_inductor/lowering.py
+@@ -6109,16 +6109,6 @@ def prims_fill(x, fill_value):
+     )
+ 
+ 
+-@register_lowering(prims.full, type_promotion_kind=None)
+-def prims_full(shape, fill_value, *, dtype, device, requires_grad):
+-    return Pointwise.create(
+-        device=device,
+-        dtype=dtype,
+-        inner_fn=lambda _: ops.constant(fill_value, dtype),
+-        ranges=list(shape),
+-    )
+-
+-
+ @register_lowering(aten.copy_, type_promotion_kind=None)
+ def copy_(dst, src, non_blocking=False):
+     if dst is src:
+
+From ad4da65f9c5ab63c4be2694380c580a595e8207d Mon Sep 17 00:00:00 2001
+From: Isuru Fernando <ifernando@quansight.com>
+Date: Tue, 24 Jun 2025 23:52:10 +0000
+Subject: [PATCH 25/27] Update
+
+[ghstack-poisoned]
+---
+ test/test_nestedtensor.py                             | 8 --------
+ torch/testing/_internal/common_methods_invocations.py | 2 +-
+ 2 files changed, 1 insertion(+), 9 deletions(-)
+
+diff --git a/test/test_nestedtensor.py b/test/test_nestedtensor.py
+index f53268cb24d38..7cb7e3864323d 100644
+--- a/test/test_nestedtensor.py
++++ b/test/test_nestedtensor.py
+@@ -8530,14 +8530,6 @@ def f(values, offsets):
+ 
+ COMPILE_FORWARD_SKIPS_AND_XFAILS = [
+     *FORWARD_SKIPS_AND_XFAILS,
+-    # Needs investigation in AOTAutograd: len(unwrapped_args) == num_args_tallied assertion fails
+-    # e.g. Expected 5 == 4
+-    XFailRule(
+-        error_type=AssertionError,
+-        op_match_fn=lambda device, op: (op.full_name == "fill"),
+-        sample_match_fn=lambda device, sample: ("noncontig_transposed" in sample.name),
+-        name="fill_aot_autograd_bug_with_transposed_input",
+-    ),
+     # Bug: cross-device conversions with to() result in new nested ints within compile only
+     XFailRule(
+         error_type=AssertionError,
+diff --git a/torch/testing/_internal/common_methods_invocations.py b/torch/testing/_internal/common_methods_invocations.py
+index b82b4b379f868..e465fd5b5b0ae 100644
+--- a/torch/testing/_internal/common_methods_invocations.py
++++ b/torch/testing/_internal/common_methods_invocations.py
+@@ -1923,7 +1923,7 @@ def sample_inputs_full_like(self, device, dtype, requires_grad, **kwargs):
+     def get_val(dtype):
+         return make_tensor([], dtype=dtype, device="cpu").item()
+ 
+-    double_dtype = torch.double if device != "mps:0" else torch.float
++    double_dtype = torch.double if torch.device(device).type != "mps" else torch.float
+     inputs = [
+         ((), get_val(dtype), {}),
+         ((S, S), get_val(dtype), {}),
+
+From b1385304e1905a375a81ee3306a36146c23ae600 Mon Sep 17 00:00:00 2001
+From: Isuru Fernando <ifernando@quansight.com>
+Date: Tue, 1 Jul 2025 02:08:41 +0000
+Subject: [PATCH 26/27] Update
+
+[ghstack-poisoned]
+---
+ test/test_nestedtensor.py | 6 ------
+ 1 file changed, 6 deletions(-)
+
+diff --git a/test/test_nestedtensor.py b/test/test_nestedtensor.py
+index 7cb7e3864323d..f3ea420c814c4 100644
+--- a/test/test_nestedtensor.py
++++ b/test/test_nestedtensor.py
+@@ -8573,12 +8573,6 @@ def f(values, offsets):
+         sample_match_fn=lambda device, sample: ("noncontig_transposed" in sample.name),
+         name="crazy_aot_autograd_bug1",
+     ),
+-    # Bug: also no idea what's going on here: needs investigation within AOTAutograd
+-    XFailRule(
+-        op_match_fn=lambda device, op: (op.full_name == "isreal"),
+-        sample_match_fn=lambda device, sample: ("noncontig_transposed" in sample.name),
+-        name="crazy_aot_autograd_bug2",
+-    ),
+ ]
+ 
+ COMPILE_BACKWARD_SKIPS_AND_XFAILS = [
+
+From 3ee64a8bbb584d4db8be1c5a9ee1d51062726215 Mon Sep 17 00:00:00 2001
+From: Isuru Fernando <ifernando@quansight.com>
+Date: Tue, 1 Jul 2025 03:53:08 +0000
+Subject: [PATCH 27/27] Update
+
+[ghstack-poisoned]
+---
+ test/test_decomp.py | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/test/test_decomp.py b/test/test_decomp.py
+index f3e52f592971f..53ef92dba61d7 100644
+--- a/test/test_decomp.py
++++ b/test/test_decomp.py
+@@ -866,7 +866,16 @@ def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+             assert len(real_out) == len(decomp_out)
+ 
+             if do_relative_check:
+-                upcast = partial(upcast_tensor, dtype=torch.float64)
++                device_arg = kwargs.get("device", None)
++
++                def upcast(x):
++                    if (isinstance(x, Tensor) and x.device.type == "mps") or (
++                        device_arg and torch.device(device_arg).type == "mps"
++                    ):
++                        return upcast_tensor(x, dtype=torch.float32)
++                    else:
++                        return upcast_tensor(x, dtype=torch.float64)
++
+                 real_out_double, _ = tree_flatten(
+                     func(*tree_map(upcast, args), **tree_map(upcast, kwargs))
+                 )

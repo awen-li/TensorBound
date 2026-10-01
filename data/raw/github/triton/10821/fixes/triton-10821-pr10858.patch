@@ -1,0 +1,1065 @@
+From c6a5d29483915ddbd240312fb1b7d28971906a09 Mon Sep 17 00:00:00 2001
+From: Masahiro Masuda <mmasuda@nvidia.com>
+Date: Sun, 12 Jul 2026 21:18:55 +0000
+Subject: [PATCH 01/11] fix
+
+---
+ .../Pipeliner/MMAv5PipelineUtility.cpp           | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/lib/Dialect/TritonGPU/Transforms/Pipeliner/MMAv5PipelineUtility.cpp b/lib/Dialect/TritonGPU/Transforms/Pipeliner/MMAv5PipelineUtility.cpp
+index 2ea562fea6d1..57a6b5f264ec 100644
+--- a/lib/Dialect/TritonGPU/Transforms/Pipeliner/MMAv5PipelineUtility.cpp
++++ b/lib/Dialect/TritonGPU/Transforms/Pipeliner/MMAv5PipelineUtility.cpp
+@@ -255,6 +255,22 @@ static bool accOverwrittenInLoop(ttng::MMAv5OpInterface mma, scf::ForOp forOp) {
+ 
+ bool ttng::isAccMultibufferingPossible(ttng::MMAv5OpInterface mma,
+                                        scf::ForOp forOp) {
++  auto tmemAlloc = mma.getAccumulator().getDefiningOp<ttng::TMEMAllocOp>();
++  if (tmemAlloc) {
++    for (auto user : tmemAlloc->getUsers()) {
++      auto load = dyn_cast<ttng::TMEMLoadOp>(user);
++      if (!load || !forOp->isAncestor(load->getParentOp()))
++        continue;
++      for (Operation *loadUser : load->getUsers()) {
++        auto store = dyn_cast<ttng::TMEMStoreOp>(loadUser);
++        if (!store || !forOp->isAncestor(store->getParentOp()))
++          continue;
++        auto dstAlloc = store.getDst().getDefiningOp<ttng::TMEMAllocOp>();
++        if (dstAlloc && dstAlloc != tmemAlloc)
++          return false;
++      }
++    }
++  }
+   // If the accumulator is never overwritten in the loop, we can't multibuffer
+   // it, as the overwrite point is the only place where we can swap the
+   // buffer.
+
+From 1d7130810c269406169d4585e1a897ba452fe28c Mon Sep 17 00:00:00 2001
+From: Masahiro Masuda <mmasuda@nvidia.com>
+Date: Sun, 12 Jul 2026 23:10:57 +0000
+Subject: [PATCH 02/11] wip
+
+---
+ .../TritonGPU/Transforms/AccelerateMatmul.cpp | 29 +++++++++++++++++++
+ .../Transforms/OptimizeAccumulatorInit.cpp    |  7 +++++
+ .../Pipeliner/MMAv5PipelineUtility.cpp        | 16 ----------
+ 3 files changed, 36 insertions(+), 16 deletions(-)
+
+diff --git a/lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp b/lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp
+index 3d52de01f5ef..b2f72516023f 100644
+--- a/lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp
++++ b/lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp
+@@ -706,6 +706,34 @@ class BlockedToMMAv5 : public mlir::OpRewritePattern<DotOp> {
+   }
+ };
+ 
++static void forwardChainedMMAv5Accumulators(ModuleOp module) {
++  SmallVector<triton::nvidia_gpu::TMEMAllocOp> allocs;
++  module.walk(
++      [&](triton::nvidia_gpu::TMEMAllocOp alloc) { allocs.push_back(alloc); });
++  for (auto alloc : allocs) {
++    if (!alloc.getSrc() || !alloc.getToken() || !alloc.getToken().hasOneUse())
++      continue;
++    Value source = alloc.getSrc();
++    bool hasExclusiveChain = true;
++    while (auto cvt = source.getDefiningOp<ConvertLayoutOp>()) {
++      hasExclusiveChain &= source.hasOneUse();
++      source = cvt.getSrc();
++    }
++    auto load = source.getDefiningOp<triton::nvidia_gpu::TMEMLoadOp>();
++    if (!hasExclusiveChain || !source.hasOneUse() || !load || !load.getDep() ||
++        load.getSrc().getType() != alloc.getType())
++      continue;
++    auto mma = dyn_cast<triton::nvidia_gpu::MMAv5OpInterface>(
++        *alloc.getToken().getUsers().begin());
++    if (!mma || mma.getAccumulator() != alloc.getResult())
++      continue;
++    mma.setAccumulator(load.getSrc());
++    mma.getAccDepMutable().assign(load.getDep());
++    alloc.getResult().replaceAllUsesWith(load.getSrc());
++    alloc.erase();
++  }
++}
++
+ class ScaledBlockedToMMA : public mlir::OpRewritePattern<triton::DotScaledOp> {
+   int computeCapability;
+ 
+@@ -1054,6 +1082,7 @@ class TritonGPUAccelerateMatmulPass
+ 
+     if (applyPatternsGreedily(m, std::move(patterns)).failed())
+       return signalPassFailure();
++    forwardChainedMMAv5Accumulators(m);
+     // Now that we have picked the mma type, decompose dot that are not natively
+     // supported.
+     decomposeMixedModeDotOp(m, computeCapability);
+diff --git a/lib/Dialect/TritonGPU/Transforms/OptimizeAccumulatorInit.cpp b/lib/Dialect/TritonGPU/Transforms/OptimizeAccumulatorInit.cpp
+index cac30c0dfec6..509f6641c714 100644
+--- a/lib/Dialect/TritonGPU/Transforms/OptimizeAccumulatorInit.cpp
++++ b/lib/Dialect/TritonGPU/Transforms/OptimizeAccumulatorInit.cpp
+@@ -82,6 +82,13 @@ std::pair<Value, Operation *> getAccumulatorUseAndDef(Operation *op) {
+     if (!tmemAlloc ||
+         tmemAlloc->getParentRegion() != tc05MmaOp->getParentRegion())
+       return std::make_pair(nullptr, nullptr);
++    for (Operation *user : tmemAlloc.getResult().getUsers()) {
++      auto otherMma = dyn_cast<triton::nvidia_gpu::MMAv5OpInterface>(user);
++      if (otherMma && otherMma != tc05MmaOp &&
++          otherMma->getBlock() == tc05MmaOp->getBlock() &&
++          otherMma->isBeforeInBlock(tc05MmaOp))
++        return std::make_pair(nullptr, nullptr);
++    }
+     triton::nvidia_gpu::TMEMLoadOp tmemLoad = nullptr;
+     for (auto user : tmemAlloc.getResult().getUsers()) {
+       if (auto load = dyn_cast<triton::nvidia_gpu::TMEMLoadOp>(user)) {
+diff --git a/lib/Dialect/TritonGPU/Transforms/Pipeliner/MMAv5PipelineUtility.cpp b/lib/Dialect/TritonGPU/Transforms/Pipeliner/MMAv5PipelineUtility.cpp
+index 57a6b5f264ec..2ea562fea6d1 100644
+--- a/lib/Dialect/TritonGPU/Transforms/Pipeliner/MMAv5PipelineUtility.cpp
++++ b/lib/Dialect/TritonGPU/Transforms/Pipeliner/MMAv5PipelineUtility.cpp
+@@ -255,22 +255,6 @@ static bool accOverwrittenInLoop(ttng::MMAv5OpInterface mma, scf::ForOp forOp) {
+ 
+ bool ttng::isAccMultibufferingPossible(ttng::MMAv5OpInterface mma,
+                                        scf::ForOp forOp) {
+-  auto tmemAlloc = mma.getAccumulator().getDefiningOp<ttng::TMEMAllocOp>();
+-  if (tmemAlloc) {
+-    for (auto user : tmemAlloc->getUsers()) {
+-      auto load = dyn_cast<ttng::TMEMLoadOp>(user);
+-      if (!load || !forOp->isAncestor(load->getParentOp()))
+-        continue;
+-      for (Operation *loadUser : load->getUsers()) {
+-        auto store = dyn_cast<ttng::TMEMStoreOp>(loadUser);
+-        if (!store || !forOp->isAncestor(store->getParentOp()))
+-          continue;
+-        auto dstAlloc = store.getDst().getDefiningOp<ttng::TMEMAllocOp>();
+-        if (dstAlloc && dstAlloc != tmemAlloc)
+-          return false;
+-      }
+-    }
+-  }
+   // If the accumulator is never overwritten in the loop, we can't multibuffer
+   // it, as the overwrite point is the only place where we can swap the
+   // buffer.
+
+From 77d3905748ae135773987a8dabe67d3713722486 Mon Sep 17 00:00:00 2001
+From: Masahiro Masuda <mmasuda@nvidia.com>
+Date: Sun, 12 Jul 2026 23:29:37 +0000
+Subject: [PATCH 03/11] add lit test
+
+---
+ .../TritonGPU/Transforms/AccelerateMatmul.cpp | 11 ++++++++
+ .../Transforms/OptimizeAccumulatorInit.cpp    |  2 ++
+ test/TritonGPU/accelerate-matmul.mlir         | 22 +++++++++++++++
+ test/TritonGPU/accumulator-init.mlir          | 27 +++++++++++++++++++
+ 4 files changed, 62 insertions(+)
+
+diff --git a/lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp b/lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp
+index b2f72516023f..f71f1440b4c5 100644
+--- a/lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp
++++ b/lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp
+@@ -706,6 +706,17 @@ class BlockedToMMAv5 : public mlir::OpRewritePattern<DotOp> {
+   }
+ };
+ 
++// Turn
++//
++// MMA1 -> acc0
++// load acc0
++// alloc acc1
++// MMA2 -> acc1
++//
++// into
++//
++// MMA1 -> acc
++// MMA2 -> acc
+ static void forwardChainedMMAv5Accumulators(ModuleOp module) {
+   SmallVector<triton::nvidia_gpu::TMEMAllocOp> allocs;
+   module.walk(
+diff --git a/lib/Dialect/TritonGPU/Transforms/OptimizeAccumulatorInit.cpp b/lib/Dialect/TritonGPU/Transforms/OptimizeAccumulatorInit.cpp
+index 509f6641c714..34ac29cd26b1 100644
+--- a/lib/Dialect/TritonGPU/Transforms/OptimizeAccumulatorInit.cpp
++++ b/lib/Dialect/TritonGPU/Transforms/OptimizeAccumulatorInit.cpp
+@@ -82,6 +82,8 @@ std::pair<Value, Operation *> getAccumulatorUseAndDef(Operation *op) {
+     if (!tmemAlloc ||
+         tmemAlloc->getParentRegion() != tc05MmaOp->getParentRegion())
+       return std::make_pair(nullptr, nullptr);
++    // when multiple MMAs share the allocation, only the first may use
++    // useD=false
+     for (Operation *user : tmemAlloc.getResult().getUsers()) {
+       auto otherMma = dyn_cast<triton::nvidia_gpu::MMAv5OpInterface>(user);
+       if (otherMma && otherMma != tc05MmaOp &&
+diff --git a/test/TritonGPU/accelerate-matmul.mlir b/test/TritonGPU/accelerate-matmul.mlir
+index 28e464e91578..310dd9367c0b 100644
+--- a/test/TritonGPU/accelerate-matmul.mlir
++++ b/test/TritonGPU/accelerate-matmul.mlir
+@@ -1064,3 +1064,25 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
+     tt.return %d : tensor<64x8xf32, #blocked_fp16_n8>
+   }
+ }
++
++// -----
++
++#chain_blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
++module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
++  // CHECK-LABEL: mmav5_chained_accumulator
++  // CHECK: %[[ACC:.+]], %[[ALLOC_TOK:.+]] = ttng.tmem_alloc
++  // CHECK-NOT: ttng.tmem_alloc
++  // CHECK: %[[MMA0:.+]] = ttng.tc_gen5_mma {{.*}}, %[[ACC]][%[[ALLOC_TOK]]]
++  // CHECK: %[[MMA1:.+]] = ttng.tc_gen5_mma {{.*}}, %[[ACC]][%[[MMA0]]]
++  // CHECK: ttng.tmem_load %[[ACC]][%[[MMA1]]]
++  tt.func @mmav5_chained_accumulator(
++      %a: tensor<128x64xf16, #chain_blocked>,
++      %b: tensor<64x256xf16, #chain_blocked>,
++      %c: tensor<128x256xf32, #chain_blocked>) -> tensor<128x256xf32, #chain_blocked> {
++    %ad = ttg.convert_layout %a : tensor<128x64xf16, #chain_blocked> -> tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #chain_blocked}>>
++    %bd = ttg.convert_layout %b : tensor<64x256xf16, #chain_blocked> -> tensor<64x256xf16, #ttg.dot_op<{opIdx = 1, parent = #chain_blocked}>>
++    %d0 = tt.dot %ad, %bd, %c, inputPrecision = tf32 : tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #chain_blocked}>> * tensor<64x256xf16, #ttg.dot_op<{opIdx = 1, parent = #chain_blocked}>> -> tensor<128x256xf32, #chain_blocked>
++    %d1 = tt.dot %ad, %bd, %d0, inputPrecision = tf32 : tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #chain_blocked}>> * tensor<64x256xf16, #ttg.dot_op<{opIdx = 1, parent = #chain_blocked}>> -> tensor<128x256xf32, #chain_blocked>
++    tt.return %d1 : tensor<128x256xf32, #chain_blocked>
++  }
++}
+diff --git a/test/TritonGPU/accumulator-init.mlir b/test/TritonGPU/accumulator-init.mlir
+index 3a412e51e36a..1694af7fc571 100644
+--- a/test/TritonGPU/accumulator-init.mlir
++++ b/test/TritonGPU/accumulator-init.mlir
+@@ -386,3 +386,30 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+     tt.return %17 : tensor<128x16xf32, #mma1>
+   }
+ }
++
++
++// -----
++
++#mmav5_blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
++#mmav5_shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
++#mmav5_tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
++#mmav5_smem = #ttg.shared_memory
++module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
++  // CHECK-LABEL: @shared_tmem_accumulator
++  // CHECK-DAG: %[[FALSE:.+]] = arith.constant false
++  // CHECK-DAG: %[[TRUE:.+]] = arith.constant true
++  // CHECK: ttng.tc_gen5_mma {{.*}}, %[[FALSE]], %[[TRUE]]
++  // CHECK: ttng.tc_gen5_mma {{.*}}, %[[TRUE]], %[[TRUE]]
++  tt.func @shared_tmem_accumulator(%lb: index, %ub: index, %step: index,
++      %a: !ttg.memdesc<128x128xf16, #mmav5_shared, #mmav5_smem>) {
++    %true = arith.constant true
++    %zero = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #mmav5_blocked>
++    scf.for %iv = %lb to %ub step %step : index {
++      %acc, %tok = ttng.tmem_alloc %zero : (tensor<128x128xf32, #mmav5_blocked>) -> (!ttg.memdesc<128x128xf32, #mmav5_tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
++      %mma0 = ttng.tc_gen5_mma %a, %a, %acc[%tok], %true, %true : !ttg.memdesc<128x128xf16, #mmav5_shared, #mmav5_smem>, !ttg.memdesc<128x128xf16, #mmav5_shared, #mmav5_smem>, !ttg.memdesc<128x128xf32, #mmav5_tmem, #ttng.tensor_memory, mutable>
++      %mma1 = ttng.tc_gen5_mma %a, %a, %acc[%mma0], %true, %true : !ttg.memdesc<128x128xf16, #mmav5_shared, #mmav5_smem>, !ttg.memdesc<128x128xf16, #mmav5_shared, #mmav5_smem>, !ttg.memdesc<128x128xf32, #mmav5_tmem, #ttng.tensor_memory, mutable>
++      %result, %load_tok = ttng.tmem_load %acc[%mma1] : !ttg.memdesc<128x128xf32, #mmav5_tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #mmav5_blocked>
++    }
++    tt.return
++  }
++}
+
+From 3c30925b75a518941e07a5f9d57cb6181a761db4 Mon Sep 17 00:00:00 2001
+From: Masahiro Masuda <mmasuda@nvidia.com>
+Date: Mon, 13 Jul 2026 02:20:27 +0000
+Subject: [PATCH 04/11] forbit accum multibuffering when there is no overlap
+ opportunity
+
+---
+ .../TritonGPU/Transforms/AccelerateMatmul.cpp |  3 +-
+ .../Pipeliner/MMAv5PipelineUtility.cpp        | 35 +++++++++++++++++++
+ test/TritonGPU/pipeline-assign-latencies.mlir | 33 +++++++++++++++++
+ 3 files changed, 70 insertions(+), 1 deletion(-)
+
+diff --git a/lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp b/lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp
+index f71f1440b4c5..539cad2f987a 100644
+--- a/lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp
++++ b/lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp
+@@ -736,7 +736,8 @@ static void forwardChainedMMAv5Accumulators(ModuleOp module) {
+       continue;
+     auto mma = dyn_cast<triton::nvidia_gpu::MMAv5OpInterface>(
+         *alloc.getToken().getUsers().begin());
+-    if (!mma || mma.getAccumulator() != alloc.getResult())
++    if (!mma || mma.getAccumulator() != alloc.getResult() ||
++        alloc->getParentRegion() != mma->getParentRegion())
+       continue;
+     mma.setAccumulator(load.getSrc());
+     mma.getAccDepMutable().assign(load.getDep());
+diff --git a/lib/Dialect/TritonGPU/Transforms/Pipeliner/MMAv5PipelineUtility.cpp b/lib/Dialect/TritonGPU/Transforms/Pipeliner/MMAv5PipelineUtility.cpp
+index 2ea562fea6d1..3c4a96febd6e 100644
+--- a/lib/Dialect/TritonGPU/Transforms/Pipeliner/MMAv5PipelineUtility.cpp
++++ b/lib/Dialect/TritonGPU/Transforms/Pipeliner/MMAv5PipelineUtility.cpp
+@@ -253,8 +253,43 @@ static bool accOverwrittenInLoop(ttng::MMAv5OpInterface mma, scf::ForOp forOp) {
+   return false;
+ }
+ 
++static bool hasLoopCarriedAccumulatorCycle(ttng::MMAv5OpInterface mma,
++                                           scf::ForOp forOp) {
++  auto start = mma.getAccumulator().getDefiningOp<ttng::TMEMAllocOp>();
++  if (!start)
++    return false;
++
++  SmallVector<ttng::TMEMAllocOp> worklist = {start};
++  DenseSet<Operation *> seen = {start};
++  while (!worklist.empty()) {
++    ttng::TMEMAllocOp current = worklist.pop_back_val();
++    for (Operation *user : current->getUsers()) {
++      auto load = dyn_cast<ttng::TMEMLoadOp>(user);
++      if (!load || !forOp->isAncestor(load->getParentOp()))
++        continue;
++      for (Operation *loadUser : load->getUsers()) {
++        auto store = dyn_cast<ttng::TMEMStoreOp>(loadUser);
++        if (!store || !forOp->isAncestor(store->getParentOp()))
++          continue;
++        auto dst = store.getDst().getDefiningOp<ttng::TMEMAllocOp>();
++        if (!dst || dst == current)
++          continue;
++        if (dst == start)
++          return true;
++        if (seen.insert(dst).second)
++          worklist.push_back(dst);
++      }
++    }
++  }
++  return false;
++}
++
+ bool ttng::isAccMultibufferingPossible(ttng::MMAv5OpInterface mma,
+                                        scf::ForOp forOp) {
++  // A transfer cycle is a loop-carried dependency. Multibuffering it would
++  // allow the next iteration to run before the previous one has completed.
++  if (hasLoopCarriedAccumulatorCycle(mma, forOp))
++    return false;
+   // If the accumulator is never overwritten in the loop, we can't multibuffer
+   // it, as the overwrite point is the only place where we can swap the
+   // buffer.
+diff --git a/test/TritonGPU/pipeline-assign-latencies.mlir b/test/TritonGPU/pipeline-assign-latencies.mlir
+index 9477d3fed799..a7897c5aa671 100644
+--- a/test/TritonGPU/pipeline-assign-latencies.mlir
++++ b/test/TritonGPU/pipeline-assign-latencies.mlir
+@@ -1223,3 +1223,36 @@ tt.func @tc_gen5_mma_alloc_block_arg(%lb : index, %ub : index, %step : index,
+   tt.return
+ }
+ }
++
++
++// -----
++
++#cycle_blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
++#cycle_shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
++#cycle_tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
++module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
++  // CHECK-LABEL: @cyclic_accumulators
++  tt.func @cyclic_accumulators(%lb: index, %ub: index, %step: index,
++      %ptr_a: tensor<128x128x!tt.ptr<f16>, #cycle_blocked> {tt.divisibility = dense<[16, 16]> : tensor<2xi32>, tt.contiguity = dense<[1, 16]> : tensor<2xi32>},
++      %ptr_b: tensor<128x128x!tt.ptr<f16>, #cycle_blocked> {tt.divisibility = dense<[16, 16]> : tensor<2xi32>, tt.contiguity = dense<[1, 16]> : tensor<2xi32>}) {
++    %true = arith.constant true
++    %acc0 = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #cycle_tmem, #ttng.tensor_memory, mutable>
++    %acc1 = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #cycle_tmem, #ttng.tensor_memory, mutable>
++    scf.for %iv = %lb to %ub step %step : index {
++      // CHECK: tt.load {{.*}} {tt.latency = 2 : i32}
++      %a = tt.load %ptr_a : tensor<128x128x!tt.ptr<f16>, #cycle_blocked>
++      %a_sh = ttg.local_alloc %a : (tensor<128x128xf16, #cycle_blocked>) -> !ttg.memdesc<128x128xf16, #cycle_shared, #ttg.shared_memory>
++      %b = tt.load %ptr_b : tensor<128x128x!tt.ptr<f16>, #cycle_blocked>
++      %b_sh = ttg.local_alloc %b : (tensor<128x128xf16, #cycle_blocked>) -> !ttg.memdesc<128x128xf16, #cycle_shared, #ttg.shared_memory>
++      // CHECK: ttng.tc_gen5_mma {{.*}} {tt.self_latency = 1 : i32}
++      ttng.tc_gen5_mma %a_sh, %b_sh, %acc0, %true, %true : !ttg.memdesc<128x128xf16, #cycle_shared, #ttg.shared_memory>, !ttg.memdesc<128x128xf16, #cycle_shared, #ttg.shared_memory>, !ttg.memdesc<128x128xf32, #cycle_tmem, #ttng.tensor_memory, mutable>
++      %v0 = ttng.tmem_load %acc0 : !ttg.memdesc<128x128xf32, #cycle_tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #cycle_blocked>
++      ttng.tmem_store %v0, %acc1, %true : tensor<128x128xf32, #cycle_blocked> -> !ttg.memdesc<128x128xf32, #cycle_tmem, #ttng.tensor_memory, mutable>
++      // CHECK: ttng.tc_gen5_mma {{.*}} {tt.self_latency = 1 : i32}
++      ttng.tc_gen5_mma %a_sh, %b_sh, %acc1, %true, %true : !ttg.memdesc<128x128xf16, #cycle_shared, #ttg.shared_memory>, !ttg.memdesc<128x128xf16, #cycle_shared, #ttg.shared_memory>, !ttg.memdesc<128x128xf32, #cycle_tmem, #ttng.tensor_memory, mutable>
++      %v1 = ttng.tmem_load %acc1 : !ttg.memdesc<128x128xf32, #cycle_tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #cycle_blocked>
++      ttng.tmem_store %v1, %acc0, %true : tensor<128x128xf32, #cycle_blocked> -> !ttg.memdesc<128x128xf32, #cycle_tmem, #ttng.tensor_memory, mutable>
++    }
++    tt.return
++  }
++}
+
+From dae06c827491705be8a96424d9c4002e7e6bf433 Mon Sep 17 00:00:00 2001
+From: Masahiro Masuda <mmasuda@nvidia.com>
+Date: Mon, 13 Jul 2026 02:50:28 +0000
+Subject: [PATCH 05/11] forbid MMA pipelining for chained accum
+
+---
+ .../Transforms/Pipeliner/AssignLatencies.cpp  | 39 ++++++++++++++++++-
+ .../Pipeliner/MMAv5PipelineUtility.cpp        | 36 -----------------
+ 2 files changed, 37 insertions(+), 38 deletions(-)
+
+diff --git a/lib/Dialect/TritonGPU/Transforms/Pipeliner/AssignLatencies.cpp b/lib/Dialect/TritonGPU/Transforms/Pipeliner/AssignLatencies.cpp
+index b86ab070192d..5736c4f7d628 100644
+--- a/lib/Dialect/TritonGPU/Transforms/Pipeliner/AssignLatencies.cpp
++++ b/lib/Dialect/TritonGPU/Transforms/Pipeliner/AssignLatencies.cpp
+@@ -25,6 +25,37 @@ namespace {
+ // assignLatencies
+ //===----------------------------------------------------------------------===//
+ 
++bool hasLoopCarriedAccumulatorCycle(ttng::MMAv5OpInterface mma,
++                                    scf::ForOp forOp) {
++  auto start = mma.getAccumulator().getDefiningOp<ttng::TMEMAllocOp>();
++  if (!start)
++    return false;
++
++  SmallVector<ttng::TMEMAllocOp> worklist = {start};
++  DenseSet<Operation *> seen = {start};
++  while (!worklist.empty()) {
++    ttng::TMEMAllocOp current = worklist.pop_back_val();
++    for (Operation *user : current->getUsers()) {
++      auto load = dyn_cast<ttng::TMEMLoadOp>(user);
++      if (!load || !forOp->isAncestor(load->getParentOp()))
++        continue;
++      for (Operation *loadUser : load->getUsers()) {
++        auto store = dyn_cast<ttng::TMEMStoreOp>(loadUser);
++        if (!store || !forOp->isAncestor(store->getParentOp()))
++          continue;
++        auto dst = store.getDst().getDefiningOp<ttng::TMEMAllocOp>();
++        if (!dst || dst == current)
++          continue;
++        if (dst == start)
++          return true;
++        if (seen.insert(dst).second)
++          worklist.push_back(dst);
++      }
++    }
++  }
++  return false;
++}
++
+ // Return true if the preconditions for pipelining the loop are met.
+ bool preCondition(scf::ForOp forOp) {
+   // Skip loop with distance > 1 for now.
+@@ -60,7 +91,7 @@ class AssignLoadLatencies {
+ public:
+   AssignLoadLatencies(scf::ForOp forOp, int numStages,
+                       DenseMap<Operation *, int> &opLatency)
+-      : forOp(forOp), numStages(numStages), opLatency(opLatency) {};
++      : forOp(forOp), numStages(numStages), opLatency(opLatency){};
+ 
+   void run() {
+     bool pipelineWithoutDot = forOp->hasAttr(mlir::triton::kNumStagesAttrName);
+@@ -159,7 +190,7 @@ class AssignLoadLatencies {
+ class AssignMMALatencies {
+ public:
+   AssignMMALatencies(scf::ForOp forOp, DenseMap<Operation *, int> &opLatency)
+-      : forOp(forOp), opLatency(opLatency) {};
++      : forOp(forOp), opLatency(opLatency){};
+ 
+   void run() {
+     DenseMap<Operation *, int> mmaSelfLatency;
+@@ -220,6 +251,10 @@ class AssignMMALatencies {
+                                cantWarpSpec)))
+               mmaSelfLatency[mma] = 0;
+           }
++          // Moving users across a loop-carried accumulator recurrence can
++          // schedule the next iteration before the previous MMA completes.
++          if (hasLoopCarriedAccumulatorCycle(mma, forOp))
++            opLatency.erase(&op);
+         }
+       }
+     }
+diff --git a/lib/Dialect/TritonGPU/Transforms/Pipeliner/MMAv5PipelineUtility.cpp b/lib/Dialect/TritonGPU/Transforms/Pipeliner/MMAv5PipelineUtility.cpp
+index 3c4a96febd6e..f0c1bbca5193 100644
+--- a/lib/Dialect/TritonGPU/Transforms/Pipeliner/MMAv5PipelineUtility.cpp
++++ b/lib/Dialect/TritonGPU/Transforms/Pipeliner/MMAv5PipelineUtility.cpp
+@@ -252,44 +252,8 @@ static bool accOverwrittenInLoop(ttng::MMAv5OpInterface mma, scf::ForOp forOp) {
+   }
+   return false;
+ }
+-
+-static bool hasLoopCarriedAccumulatorCycle(ttng::MMAv5OpInterface mma,
+-                                           scf::ForOp forOp) {
+-  auto start = mma.getAccumulator().getDefiningOp<ttng::TMEMAllocOp>();
+-  if (!start)
+-    return false;
+-
+-  SmallVector<ttng::TMEMAllocOp> worklist = {start};
+-  DenseSet<Operation *> seen = {start};
+-  while (!worklist.empty()) {
+-    ttng::TMEMAllocOp current = worklist.pop_back_val();
+-    for (Operation *user : current->getUsers()) {
+-      auto load = dyn_cast<ttng::TMEMLoadOp>(user);
+-      if (!load || !forOp->isAncestor(load->getParentOp()))
+-        continue;
+-      for (Operation *loadUser : load->getUsers()) {
+-        auto store = dyn_cast<ttng::TMEMStoreOp>(loadUser);
+-        if (!store || !forOp->isAncestor(store->getParentOp()))
+-          continue;
+-        auto dst = store.getDst().getDefiningOp<ttng::TMEMAllocOp>();
+-        if (!dst || dst == current)
+-          continue;
+-        if (dst == start)
+-          return true;
+-        if (seen.insert(dst).second)
+-          worklist.push_back(dst);
+-      }
+-    }
+-  }
+-  return false;
+-}
+-
+ bool ttng::isAccMultibufferingPossible(ttng::MMAv5OpInterface mma,
+                                        scf::ForOp forOp) {
+-  // A transfer cycle is a loop-carried dependency. Multibuffering it would
+-  // allow the next iteration to run before the previous one has completed.
+-  if (hasLoopCarriedAccumulatorCycle(mma, forOp))
+-    return false;
+   // If the accumulator is never overwritten in the loop, we can't multibuffer
+   // it, as the overwrite point is the only place where we can swap the
+   // buffer.
+
+From 919ca1f1b7d453c208536a44da31bcbe62af6f3a Mon Sep 17 00:00:00 2001
+From: Masahiro Masuda <mmasuda@nvidia.com>
+Date: Mon, 13 Jul 2026 02:51:26 +0000
+Subject: [PATCH 06/11] format
+
+---
+ .../TritonGPU/Transforms/Pipeliner/AssignLatencies.cpp      | 6 ++----
+ .../TritonGPU/Transforms/Pipeliner/MMAv5PipelineUtility.cpp | 1 +
+ 2 files changed, 3 insertions(+), 4 deletions(-)
+
+diff --git a/lib/Dialect/TritonGPU/Transforms/Pipeliner/AssignLatencies.cpp b/lib/Dialect/TritonGPU/Transforms/Pipeliner/AssignLatencies.cpp
+index 5736c4f7d628..850b37b100aa 100644
+--- a/lib/Dialect/TritonGPU/Transforms/Pipeliner/AssignLatencies.cpp
++++ b/lib/Dialect/TritonGPU/Transforms/Pipeliner/AssignLatencies.cpp
+@@ -91,7 +91,7 @@ class AssignLoadLatencies {
+ public:
+   AssignLoadLatencies(scf::ForOp forOp, int numStages,
+                       DenseMap<Operation *, int> &opLatency)
+-      : forOp(forOp), numStages(numStages), opLatency(opLatency){};
++      : forOp(forOp), numStages(numStages), opLatency(opLatency) {};
+ 
+   void run() {
+     bool pipelineWithoutDot = forOp->hasAttr(mlir::triton::kNumStagesAttrName);
+@@ -190,7 +190,7 @@ class AssignLoadLatencies {
+ class AssignMMALatencies {
+ public:
+   AssignMMALatencies(scf::ForOp forOp, DenseMap<Operation *, int> &opLatency)
+-      : forOp(forOp), opLatency(opLatency){};
++      : forOp(forOp), opLatency(opLatency) {};
+ 
+   void run() {
+     DenseMap<Operation *, int> mmaSelfLatency;
+@@ -251,8 +251,6 @@ class AssignMMALatencies {
+                                cantWarpSpec)))
+               mmaSelfLatency[mma] = 0;
+           }
+-          // Moving users across a loop-carried accumulator recurrence can
+-          // schedule the next iteration before the previous MMA completes.
+           if (hasLoopCarriedAccumulatorCycle(mma, forOp))
+             opLatency.erase(&op);
+         }
+diff --git a/lib/Dialect/TritonGPU/Transforms/Pipeliner/MMAv5PipelineUtility.cpp b/lib/Dialect/TritonGPU/Transforms/Pipeliner/MMAv5PipelineUtility.cpp
+index f0c1bbca5193..2ea562fea6d1 100644
+--- a/lib/Dialect/TritonGPU/Transforms/Pipeliner/MMAv5PipelineUtility.cpp
++++ b/lib/Dialect/TritonGPU/Transforms/Pipeliner/MMAv5PipelineUtility.cpp
+@@ -252,6 +252,7 @@ static bool accOverwrittenInLoop(ttng::MMAv5OpInterface mma, scf::ForOp forOp) {
+   }
+   return false;
+ }
++
+ bool ttng::isAccMultibufferingPossible(ttng::MMAv5OpInterface mma,
+                                        scf::ForOp forOp) {
+   // If the accumulator is never overwritten in the loop, we can't multibuffer
+
+From fe618d91bd5d1710ba95e58ce896282fb4b7a6e0 Mon Sep 17 00:00:00 2001
+From: Masahiro Masuda <mmasuda@nvidia.com>
+Date: Tue, 14 Jul 2026 06:54:22 +0000
+Subject: [PATCH 07/11] Run TMEMLoadForwarding pre pipeline
+
+---
+ .../TritonGPU/Transforms/AccelerateMatmul.cpp | 41 ------------------
+ .../TritonGPU/Transforms/HoistTMEMAlloc.cpp   | 15 +++++++
+ test/TritonGPU/accelerate-matmul.mlir         | 22 ----------
+ test/TritonGPU/hoist-tmem-alloc.mlir          | 42 +++++++++++++++----
+ 4 files changed, 48 insertions(+), 72 deletions(-)
+
+diff --git a/lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp b/lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp
+index 539cad2f987a..3d52de01f5ef 100644
+--- a/lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp
++++ b/lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp
+@@ -706,46 +706,6 @@ class BlockedToMMAv5 : public mlir::OpRewritePattern<DotOp> {
+   }
+ };
+ 
+-// Turn
+-//
+-// MMA1 -> acc0
+-// load acc0
+-// alloc acc1
+-// MMA2 -> acc1
+-//
+-// into
+-//
+-// MMA1 -> acc
+-// MMA2 -> acc
+-static void forwardChainedMMAv5Accumulators(ModuleOp module) {
+-  SmallVector<triton::nvidia_gpu::TMEMAllocOp> allocs;
+-  module.walk(
+-      [&](triton::nvidia_gpu::TMEMAllocOp alloc) { allocs.push_back(alloc); });
+-  for (auto alloc : allocs) {
+-    if (!alloc.getSrc() || !alloc.getToken() || !alloc.getToken().hasOneUse())
+-      continue;
+-    Value source = alloc.getSrc();
+-    bool hasExclusiveChain = true;
+-    while (auto cvt = source.getDefiningOp<ConvertLayoutOp>()) {
+-      hasExclusiveChain &= source.hasOneUse();
+-      source = cvt.getSrc();
+-    }
+-    auto load = source.getDefiningOp<triton::nvidia_gpu::TMEMLoadOp>();
+-    if (!hasExclusiveChain || !source.hasOneUse() || !load || !load.getDep() ||
+-        load.getSrc().getType() != alloc.getType())
+-      continue;
+-    auto mma = dyn_cast<triton::nvidia_gpu::MMAv5OpInterface>(
+-        *alloc.getToken().getUsers().begin());
+-    if (!mma || mma.getAccumulator() != alloc.getResult() ||
+-        alloc->getParentRegion() != mma->getParentRegion())
+-      continue;
+-    mma.setAccumulator(load.getSrc());
+-    mma.getAccDepMutable().assign(load.getDep());
+-    alloc.getResult().replaceAllUsesWith(load.getSrc());
+-    alloc.erase();
+-  }
+-}
+-
+ class ScaledBlockedToMMA : public mlir::OpRewritePattern<triton::DotScaledOp> {
+   int computeCapability;
+ 
+@@ -1094,7 +1054,6 @@ class TritonGPUAccelerateMatmulPass
+ 
+     if (applyPatternsGreedily(m, std::move(patterns)).failed())
+       return signalPassFailure();
+-    forwardChainedMMAv5Accumulators(m);
+     // Now that we have picked the mma type, decompose dot that are not natively
+     // supported.
+     decomposeMixedModeDotOp(m, computeCapability);
+diff --git a/lib/Dialect/TritonGPU/Transforms/HoistTMEMAlloc.cpp b/lib/Dialect/TritonGPU/Transforms/HoistTMEMAlloc.cpp
+index 458bfc794935..81ae91b9e6bb 100644
+--- a/lib/Dialect/TritonGPU/Transforms/HoistTMEMAlloc.cpp
++++ b/lib/Dialect/TritonGPU/Transforms/HoistTMEMAlloc.cpp
+@@ -274,6 +274,11 @@ class TMEMLoadForwarding : public OpRewritePattern<ttng::TMEMAllocOp> {
+     Value init = alloc.getSrc();
+     if (!init)
+       return failure();
++    while (auto cvt = init.getDefiningOp<ConvertLayoutOp>()) {
++      if (!init.hasOneUse())
++        return failure();
++      init = cvt.getSrc();
++    }
+     auto load = init.getDefiningOp<TMEMTokenLoadOp>();
+     if (!load || !load->hasOneUse() || !load.getDep().hasOneUse())
+       return failure();
+@@ -634,6 +639,16 @@ struct HoistTMEMAlloc
+   void runOnOperation() override {
+     ModuleOp m = getOperation();
+     if (!postPipeline) {
++      // Forward TMEM loads before hoisting turns allocation initializers into
++      // explicit stores.
++      mlir::RewritePatternSet forwardingPatterns(&getContext());
++      forwardingPatterns.add<TMEMLoadForwarding>(&getContext());
++      if (failed(applyPatternsGreedily(getOperation(),
++                                       std::move(forwardingPatterns)))) {
++        signalPassFailure();
++        return;
++      }
++
+       SmallVector<ttng::MMAv5OpInterface> mmaOps;
+       m.walk([&](ttng::MMAv5OpInterface mmaOp) { mmaOps.push_back(mmaOp); });
+       for (auto mmaOp : mmaOps) {
+diff --git a/test/TritonGPU/accelerate-matmul.mlir b/test/TritonGPU/accelerate-matmul.mlir
+index 310dd9367c0b..28e464e91578 100644
+--- a/test/TritonGPU/accelerate-matmul.mlir
++++ b/test/TritonGPU/accelerate-matmul.mlir
+@@ -1064,25 +1064,3 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
+     tt.return %d : tensor<64x8xf32, #blocked_fp16_n8>
+   }
+ }
+-
+-// -----
+-
+-#chain_blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
+-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+-  // CHECK-LABEL: mmav5_chained_accumulator
+-  // CHECK: %[[ACC:.+]], %[[ALLOC_TOK:.+]] = ttng.tmem_alloc
+-  // CHECK-NOT: ttng.tmem_alloc
+-  // CHECK: %[[MMA0:.+]] = ttng.tc_gen5_mma {{.*}}, %[[ACC]][%[[ALLOC_TOK]]]
+-  // CHECK: %[[MMA1:.+]] = ttng.tc_gen5_mma {{.*}}, %[[ACC]][%[[MMA0]]]
+-  // CHECK: ttng.tmem_load %[[ACC]][%[[MMA1]]]
+-  tt.func @mmav5_chained_accumulator(
+-      %a: tensor<128x64xf16, #chain_blocked>,
+-      %b: tensor<64x256xf16, #chain_blocked>,
+-      %c: tensor<128x256xf32, #chain_blocked>) -> tensor<128x256xf32, #chain_blocked> {
+-    %ad = ttg.convert_layout %a : tensor<128x64xf16, #chain_blocked> -> tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #chain_blocked}>>
+-    %bd = ttg.convert_layout %b : tensor<64x256xf16, #chain_blocked> -> tensor<64x256xf16, #ttg.dot_op<{opIdx = 1, parent = #chain_blocked}>>
+-    %d0 = tt.dot %ad, %bd, %c, inputPrecision = tf32 : tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #chain_blocked}>> * tensor<64x256xf16, #ttg.dot_op<{opIdx = 1, parent = #chain_blocked}>> -> tensor<128x256xf32, #chain_blocked>
+-    %d1 = tt.dot %ad, %bd, %d0, inputPrecision = tf32 : tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #chain_blocked}>> * tensor<64x256xf16, #ttg.dot_op<{opIdx = 1, parent = #chain_blocked}>> -> tensor<128x256xf32, #chain_blocked>
+-    tt.return %d1 : tensor<128x256xf32, #chain_blocked>
+-  }
+-}
+diff --git a/test/TritonGPU/hoist-tmem-alloc.mlir b/test/TritonGPU/hoist-tmem-alloc.mlir
+index 030dc47fc7a1..74eebc1ce0ca 100644
+--- a/test/TritonGPU/hoist-tmem-alloc.mlir
++++ b/test/TritonGPU/hoist-tmem-alloc.mlir
+@@ -268,15 +268,15 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
+ 
+ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+   // CHECK-LABEL: @two_dots
+-  // CHECK: %[[ACC_TM1:.*]] = ttng.tmem_alloc : ()
+-  // CHECK: %[[ACC_TM2:.*]] = ttng.tmem_alloc : ()
+-  // CHECK: scf.for
+-  // CHECK:   ttng.tmem_store
+-  // CHECK:   ttng.tc_gen5_mma
+-  // CHECK:   ttng.tmem_load
+-  // CHECK:   ttng.tmem_store
+-  // CHECK:   ttng.tc_gen5_mma
+-  // CHECK:   ttng.tmem_load
++  // CHECK: %[[ACC_TM:.*]], %[[ALLOC_TOK:.*]] = ttng.tmem_alloc : ()
++  // CHECK-NOT: ttng.tmem_alloc
++  // CHECK: scf.for {{.*}} iter_args(%[[TOK:.*]] = %[[ALLOC_TOK]])
++  // CHECK:   %[[INIT_TOK:.*]] = ttng.tmem_store {{.*}}, %[[ACC_TM]][%[[TOK]]]
++  // CHECK:   %[[MMA0:.*]] = ttng.tc_gen5_mma {{.*}}, %[[ACC_TM]][%[[INIT_TOK]]]
++  // CHECK-NOT: ttng.tmem_load
++  // CHECK-NOT: ttng.tmem_store
++  // CHECK:   %[[MMA1:.*]] = ttng.tc_gen5_mma {{.*}}, %[[ACC_TM]][%[[MMA0]]]
++  // CHECK:   ttng.tmem_load %[[ACC_TM]][%[[MMA1]]]
+   tt.func public @two_dots(%A_ptr: tensor<128x128x!tt.ptr<f16>, #blocked> {tt.contiguity = 16 : i32, tt.divisibility = 16 : i32}, %B_ptr: tensor<128x128x!tt.ptr<f16>, #blocked> {tt.contiguity = 16 : i32, tt.divisibility = 16 : i32}, %acc_ptr: tensor<128x128x!tt.ptr<f32>, #blocked> {tt.contiguity = 16 : i32, tt.divisibility = 16 : i32}, %res_ptr: tensor<128x128x!tt.ptr<f32>, #blocked> {tt.contiguity = 16 : i32, tt.divisibility = 16 : i32}, %arg3: i32) {
+     %true = arith.constant true
+     %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
+@@ -437,6 +437,30 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
+ 
+ // -----
+ 
++#blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
++#blocked1 = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
++#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
++module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
++  // CHECK-LABEL: @forward_tmem_load_through_convert_layout
++  // CHECK-SAME: %[[MEMDESC:.+]]: !ttg.memdesc
++  // CHECK-SAME: %[[TOKEN:.+]]: !ttg.async.token
++  // CHECK-NEXT: tt.return %[[MEMDESC]], %[[TOKEN]]
++  // POST-PIPELINE-LABEL: @forward_tmem_load_through_convert_layout
++  // POST-PIPELINE-SAME: %[[POST_MEMDESC:.+]]: !ttg.memdesc
++  // POST-PIPELINE-SAME: %[[POST_TOKEN:.+]]: !ttg.async.token
++  // POST-PIPELINE-NEXT: tt.return %[[POST_MEMDESC]], %[[POST_TOKEN]]
++  tt.func public @forward_tmem_load_through_convert_layout(
++      %m: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
++      %t: !ttg.async.token) -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token) {
++    %result, %load_token = ttng.tmem_load %m[%t] : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
++    %converted = ttg.convert_layout %result : tensor<128x128xf32, #blocked> -> tensor<128x128xf32, #blocked1>
++    %next, %next_token = ttng.tmem_alloc %converted : (tensor<128x128xf32, #blocked1>) -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
++    tt.return %next, %next_token : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token
++  }
++}
++
++// -----
++
+ #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [1, 0]}>
+ #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+
+From 58ecbd287f1e5dd234976db8f4453d97280a71e2 Mon Sep 17 00:00:00 2001
+From: Masahiro Masuda <mmasuda@nvidia.com>
+Date: Tue, 14 Jul 2026 07:15:31 +0000
+Subject: [PATCH 08/11] Reject any intervening write between accum init and MMA
+ in useD opt
+
+---
+ .../Transforms/OptimizeAccumulatorInit.cpp    | 35 ++++++++++++------
+ test/TritonGPU/accumulator-init.mlir          | 36 +++++++++++++++++++
+ 2 files changed, 61 insertions(+), 10 deletions(-)
+
+diff --git a/lib/Dialect/TritonGPU/Transforms/OptimizeAccumulatorInit.cpp b/lib/Dialect/TritonGPU/Transforms/OptimizeAccumulatorInit.cpp
+index 34ac29cd26b1..c934f64193df 100644
+--- a/lib/Dialect/TritonGPU/Transforms/OptimizeAccumulatorInit.cpp
++++ b/lib/Dialect/TritonGPU/Transforms/OptimizeAccumulatorInit.cpp
+@@ -69,6 +69,29 @@ bool dotSupportsAccInitFlag(Operation *op) {
+   return false;
+ }
+ 
++// Return true if the allocation's initial contents reach the MMA unchanged.
++// Any intervening write invalidates useD=false.
++bool accumulatorInitReachesMMA(triton::nvidia_gpu::MMAv5OpInterface mma,
++                               triton::nvidia_gpu::TMEMAllocOp alloc) {
++  Value token = mma.getAccDep();
++  Value allocToken = alloc.getToken();
++  if (!token || !allocToken)
++    return false;
++
++  DenseSet<Value> seen;
++  while (token != allocToken) {
++    if (!seen.insert(token).second)
++      return false;
++    // TMEM loads advance the token without modifying the accumulator.
++    auto load = token.getDefiningOp<triton::nvidia_gpu::TMEMLoadOp>();
++    if (!load || token != load.getToken() ||
++        load.getSrc() != alloc.getResult() || !load.getDep())
++      return false;
++    token = load.getDep();
++  }
++  return true;
++}
++
+ std::pair<Value, Operation *> getAccumulatorUseAndDef(Operation *op) {
+   assert(isa<DotOpInterface>(op) &&
+          "Expected an op which implements a DotOpInterface");
+@@ -80,17 +103,9 @@ std::pair<Value, Operation *> getAccumulatorUseAndDef(Operation *op) {
+     auto accVal = tc05MmaOp.getAccumulator();
+     auto tmemAlloc = accVal.getDefiningOp<triton::nvidia_gpu::TMEMAllocOp>();
+     if (!tmemAlloc ||
+-        tmemAlloc->getParentRegion() != tc05MmaOp->getParentRegion())
++        tmemAlloc->getParentRegion() != tc05MmaOp->getParentRegion() ||
++        !accumulatorInitReachesMMA(tc05MmaOp, tmemAlloc))
+       return std::make_pair(nullptr, nullptr);
+-    // when multiple MMAs share the allocation, only the first may use
+-    // useD=false
+-    for (Operation *user : tmemAlloc.getResult().getUsers()) {
+-      auto otherMma = dyn_cast<triton::nvidia_gpu::MMAv5OpInterface>(user);
+-      if (otherMma && otherMma != tc05MmaOp &&
+-          otherMma->getBlock() == tc05MmaOp->getBlock() &&
+-          otherMma->isBeforeInBlock(tc05MmaOp))
+-        return std::make_pair(nullptr, nullptr);
+-    }
+     triton::nvidia_gpu::TMEMLoadOp tmemLoad = nullptr;
+     for (auto user : tmemAlloc.getResult().getUsers()) {
+       if (auto load = dyn_cast<triton::nvidia_gpu::TMEMLoadOp>(user)) {
+diff --git a/test/TritonGPU/accumulator-init.mlir b/test/TritonGPU/accumulator-init.mlir
+index 1694af7fc571..8f1ed1ca61c9 100644
+--- a/test/TritonGPU/accumulator-init.mlir
++++ b/test/TritonGPU/accumulator-init.mlir
+@@ -412,4 +412,40 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+     }
+     tt.return
+   }
++
++  // CHECK-LABEL: @tmem_store_before_mma
++  // CHECK: %[[TRUE:.+]] = arith.constant true
++  // CHECK: ttng.tmem_store
++  // CHECK: ttng.tc_gen5_mma {{.*}}, %[[TRUE]], %[[TRUE]]
++  tt.func @tmem_store_before_mma(%lb: index, %ub: index, %step: index,
++      %a: !ttg.memdesc<128x128xf16, #mmav5_shared, #mmav5_smem>) {
++    %true = arith.constant true
++    %zero = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #mmav5_blocked>
++    %one = arith.constant dense<1.000000e+00> : tensor<128x128xf32, #mmav5_blocked>
++    scf.for %iv = %lb to %ub step %step : index {
++      %acc, %tok = ttng.tmem_alloc %zero : (tensor<128x128xf32, #mmav5_blocked>) -> (!ttg.memdesc<128x128xf32, #mmav5_tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
++      %store_tok = ttng.tmem_store %one, %acc[%tok], %true : tensor<128x128xf32, #mmav5_blocked> -> !ttg.memdesc<128x128xf32, #mmav5_tmem, #ttng.tensor_memory, mutable>
++      %mma = ttng.tc_gen5_mma %a, %a, %acc[%store_tok], %true, %true : !ttg.memdesc<128x128xf16, #mmav5_shared, #mmav5_smem>, !ttg.memdesc<128x128xf16, #mmav5_shared, #mmav5_smem>, !ttg.memdesc<128x128xf32, #mmav5_tmem, #ttng.tensor_memory, mutable>
++      %result, %load_tok = ttng.tmem_load %acc[%mma] : !ttg.memdesc<128x128xf32, #mmav5_tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #mmav5_blocked>
++    }
++    tt.return
++  }
++
++  // CHECK-LABEL: @tmem_load_before_mma
++  // CHECK-DAG: %[[FALSE:.+]] = arith.constant false
++  // CHECK-DAG: %[[TRUE:.+]] = arith.constant true
++  // CHECK: ttng.tmem_load
++  // CHECK: ttng.tc_gen5_mma {{.*}}, %[[FALSE]], %[[TRUE]]
++  tt.func @tmem_load_before_mma(%lb: index, %ub: index, %step: index,
++      %a: !ttg.memdesc<128x128xf16, #mmav5_shared, #mmav5_smem>) {
++    %true = arith.constant true
++    %zero = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #mmav5_blocked>
++    scf.for %iv = %lb to %ub step %step : index {
++      %acc, %tok = ttng.tmem_alloc %zero : (tensor<128x128xf32, #mmav5_blocked>) -> (!ttg.memdesc<128x128xf32, #mmav5_tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
++      %initial, %initial_tok = ttng.tmem_load %acc[%tok] : !ttg.memdesc<128x128xf32, #mmav5_tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #mmav5_blocked>
++      %mma = ttng.tc_gen5_mma %a, %a, %acc[%initial_tok], %true, %true : !ttg.memdesc<128x128xf16, #mmav5_shared, #mmav5_smem>, !ttg.memdesc<128x128xf16, #mmav5_shared, #mmav5_smem>, !ttg.memdesc<128x128xf32, #mmav5_tmem, #ttng.tensor_memory, mutable>
++      %result, %load_tok = ttng.tmem_load %acc[%mma] : !ttg.memdesc<128x128xf32, #mmav5_tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #mmav5_blocked>
++    }
++    tt.return
++  }
+ }
+
+From 5524ca0650e9183108d7d902c36c81508079214a Mon Sep 17 00:00:00 2001
+From: Masahiro Masuda <mmasuda@nvidia.com>
+Date: Tue, 14 Jul 2026 10:24:05 +0000
+Subject: [PATCH 09/11] more robust worklist impl tracking tokens across loop
+
+---
+ .../Transforms/Pipeliner/AssignLatencies.cpp  | 58 ++++++++++++-------
+ test/TritonGPU/pipeline-assign-latencies.mlir | 19 +++---
+ 2 files changed, 47 insertions(+), 30 deletions(-)
+
+diff --git a/lib/Dialect/TritonGPU/Transforms/Pipeliner/AssignLatencies.cpp b/lib/Dialect/TritonGPU/Transforms/Pipeliner/AssignLatencies.cpp
+index 850b37b100aa..79921e0c44a2 100644
+--- a/lib/Dialect/TritonGPU/Transforms/Pipeliner/AssignLatencies.cpp
++++ b/lib/Dialect/TritonGPU/Transforms/Pipeliner/AssignLatencies.cpp
+@@ -27,31 +27,47 @@ namespace {
+ 
+ bool hasLoopCarriedAccumulatorCycle(ttng::MMAv5OpInterface mma,
+                                     scf::ForOp forOp) {
+-  auto start = mma.getAccumulator().getDefiningOp<ttng::TMEMAllocOp>();
+-  if (!start)
++  Value start = mma.getAccDep();
++  Value target = mma.getToken();
++  if (!start || !target)
+     return false;
+ 
+-  SmallVector<ttng::TMEMAllocOp> worklist = {start};
+-  DenseSet<Operation *> seen = {start};
++  // Follow the accumulator dependency backwards, mapping loop block arguments
++  // to their yielded values. A cross-MMA cycle is found when the recurrence
++  // returns to this MMA through another MMA.
++  SmallVector<std::pair<Value, bool>> worklist = {{start, false}};
++  // Following all operands may reach the same value along paths that differ in
++  // whether another MMA was crossed. Track those states separately so that a
++  // visit before crossing another MMA does not suppress a visit after crossing
++  // one.
++  DenseSet<Value> seenBeforeAnotherMMA;
++  DenseSet<Value> seenAfterAnotherMMA;
+   while (!worklist.empty()) {
+-    ttng::TMEMAllocOp current = worklist.pop_back_val();
+-    for (Operation *user : current->getUsers()) {
+-      auto load = dyn_cast<ttng::TMEMLoadOp>(user);
+-      if (!load || !forOp->isAncestor(load->getParentOp()))
+-        continue;
+-      for (Operation *loadUser : load->getUsers()) {
+-        auto store = dyn_cast<ttng::TMEMStoreOp>(loadUser);
+-        if (!store || !forOp->isAncestor(store->getParentOp()))
+-          continue;
+-        auto dst = store.getDst().getDefiningOp<ttng::TMEMAllocOp>();
+-        if (!dst || dst == current)
+-          continue;
+-        if (dst == start)
+-          return true;
+-        if (seen.insert(dst).second)
+-          worklist.push_back(dst);
+-      }
++    auto [current, crossedAnotherMMA] = worklist.pop_back_val();
++    DenseSet<Value> &seen =
++        crossedAnotherMMA ? seenAfterAnotherMMA : seenBeforeAnotherMMA;
++    if (!seen.insert(current).second)
++      continue;
++    if (current == target) {
++      if (crossedAnotherMMA)
++        return true;
++      continue;
+     }
++
++    if (auto arg = dyn_cast<BlockArgument>(current)) {
++      if (arg.getOwner() == forOp.getBody() && arg.getArgNumber() > 0)
++        worklist.emplace_back(forOp.getYieldedValues()[arg.getArgNumber() - 1],
++                              crossedAnotherMMA);
++      continue;
++    }
++
++    Operation *def = current.getDefiningOp();
++    if (!def || !forOp->isAncestor(def))
++      continue;
++    crossedAnotherMMA |=
++        isa<ttng::MMAv5OpInterface>(def) && def != mma.getOperation();
++    for (Value operand : getNestedOperands(def))
++      worklist.emplace_back(operand, crossedAnotherMMA);
+   }
+   return false;
+ }
+diff --git a/test/TritonGPU/pipeline-assign-latencies.mlir b/test/TritonGPU/pipeline-assign-latencies.mlir
+index a7897c5aa671..fa54e940e952 100644
+--- a/test/TritonGPU/pipeline-assign-latencies.mlir
++++ b/test/TritonGPU/pipeline-assign-latencies.mlir
+@@ -1236,22 +1236,23 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
+       %ptr_a: tensor<128x128x!tt.ptr<f16>, #cycle_blocked> {tt.divisibility = dense<[16, 16]> : tensor<2xi32>, tt.contiguity = dense<[1, 16]> : tensor<2xi32>},
+       %ptr_b: tensor<128x128x!tt.ptr<f16>, #cycle_blocked> {tt.divisibility = dense<[16, 16]> : tensor<2xi32>, tt.contiguity = dense<[1, 16]> : tensor<2xi32>}) {
+     %true = arith.constant true
+-    %acc0 = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #cycle_tmem, #ttng.tensor_memory, mutable>
+-    %acc1 = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #cycle_tmem, #ttng.tensor_memory, mutable>
+-    scf.for %iv = %lb to %ub step %step : index {
++    %acc0, %init0 = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #cycle_tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
++    %acc1, %init1 = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #cycle_tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
++    %last:2 = scf.for %iv = %lb to %ub step %step iter_args(%tok0 = %init0, %tok1 = %init1) -> (!ttg.async.token, !ttg.async.token) : index {
+       // CHECK: tt.load {{.*}} {tt.latency = 2 : i32}
+       %a = tt.load %ptr_a : tensor<128x128x!tt.ptr<f16>, #cycle_blocked>
+       %a_sh = ttg.local_alloc %a : (tensor<128x128xf16, #cycle_blocked>) -> !ttg.memdesc<128x128xf16, #cycle_shared, #ttg.shared_memory>
+       %b = tt.load %ptr_b : tensor<128x128x!tt.ptr<f16>, #cycle_blocked>
+       %b_sh = ttg.local_alloc %b : (tensor<128x128xf16, #cycle_blocked>) -> !ttg.memdesc<128x128xf16, #cycle_shared, #ttg.shared_memory>
+       // CHECK: ttng.tc_gen5_mma {{.*}} {tt.self_latency = 1 : i32}
+-      ttng.tc_gen5_mma %a_sh, %b_sh, %acc0, %true, %true : !ttg.memdesc<128x128xf16, #cycle_shared, #ttg.shared_memory>, !ttg.memdesc<128x128xf16, #cycle_shared, #ttg.shared_memory>, !ttg.memdesc<128x128xf32, #cycle_tmem, #ttng.tensor_memory, mutable>
+-      %v0 = ttng.tmem_load %acc0 : !ttg.memdesc<128x128xf32, #cycle_tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #cycle_blocked>
+-      ttng.tmem_store %v0, %acc1, %true : tensor<128x128xf32, #cycle_blocked> -> !ttg.memdesc<128x128xf32, #cycle_tmem, #ttng.tensor_memory, mutable>
++      %mma0 = ttng.tc_gen5_mma %a_sh, %b_sh, %acc0[%tok0], %true, %true : !ttg.memdesc<128x128xf16, #cycle_shared, #ttg.shared_memory>, !ttg.memdesc<128x128xf16, #cycle_shared, #ttg.shared_memory>, !ttg.memdesc<128x128xf32, #cycle_tmem, #ttng.tensor_memory, mutable>
++      %v0, %load0 = ttng.tmem_load %acc0[%mma0] : !ttg.memdesc<128x128xf32, #cycle_tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #cycle_blocked>
++      %store1 = ttng.tmem_store %v0, %acc1[%tok1], %true : tensor<128x128xf32, #cycle_blocked> -> !ttg.memdesc<128x128xf32, #cycle_tmem, #ttng.tensor_memory, mutable>
+       // CHECK: ttng.tc_gen5_mma {{.*}} {tt.self_latency = 1 : i32}
+-      ttng.tc_gen5_mma %a_sh, %b_sh, %acc1, %true, %true : !ttg.memdesc<128x128xf16, #cycle_shared, #ttg.shared_memory>, !ttg.memdesc<128x128xf16, #cycle_shared, #ttg.shared_memory>, !ttg.memdesc<128x128xf32, #cycle_tmem, #ttng.tensor_memory, mutable>
+-      %v1 = ttng.tmem_load %acc1 : !ttg.memdesc<128x128xf32, #cycle_tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #cycle_blocked>
+-      ttng.tmem_store %v1, %acc0, %true : tensor<128x128xf32, #cycle_blocked> -> !ttg.memdesc<128x128xf32, #cycle_tmem, #ttng.tensor_memory, mutable>
++      %mma1 = ttng.tc_gen5_mma %a_sh, %b_sh, %acc1[%store1], %true, %true : !ttg.memdesc<128x128xf16, #cycle_shared, #ttg.shared_memory>, !ttg.memdesc<128x128xf16, #cycle_shared, #ttg.shared_memory>, !ttg.memdesc<128x128xf32, #cycle_tmem, #ttng.tensor_memory, mutable>
++      %v1, %load1 = ttng.tmem_load %acc1[%mma1] : !ttg.memdesc<128x128xf32, #cycle_tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #cycle_blocked>
++      %store0 = ttng.tmem_store %v1, %acc0[%load0], %true : tensor<128x128xf32, #cycle_blocked> -> !ttg.memdesc<128x128xf32, #cycle_tmem, #ttng.tensor_memory, mutable>
++      scf.yield %store0, %load1 : !ttg.async.token, !ttg.async.token
+     }
+     tt.return
+   }
+
+From 5d2e0a28f6fad6860dd8779b8f014bfddc1aef31 Mon Sep 17 00:00:00 2001
+From: Masahiro Masuda <mmasuda@nvidia.com>
+Date: Thu, 16 Jul 2026 06:44:56 +0000
+Subject: [PATCH 10/11] simplify and refactor useD opt
+
+---
+ .../Transforms/OptimizeAccumulatorInit.cpp     | 18 +++++++++++-------
+ 1 file changed, 11 insertions(+), 7 deletions(-)
+
+diff --git a/lib/Dialect/TritonGPU/Transforms/OptimizeAccumulatorInit.cpp b/lib/Dialect/TritonGPU/Transforms/OptimizeAccumulatorInit.cpp
+index c934f64193df..71bab8dedc8c 100644
+--- a/lib/Dialect/TritonGPU/Transforms/OptimizeAccumulatorInit.cpp
++++ b/lib/Dialect/TritonGPU/Transforms/OptimizeAccumulatorInit.cpp
+@@ -71,17 +71,17 @@ bool dotSupportsAccInitFlag(Operation *op) {
+ 
+ // Return true if the allocation's initial contents reach the MMA unchanged.
+ // Any intervening write invalidates useD=false.
+-bool accumulatorInitReachesMMA(triton::nvidia_gpu::MMAv5OpInterface mma,
+-                               triton::nvidia_gpu::TMEMAllocOp alloc) {
++bool accumulatorInitReachesMMA(triton::nvidia_gpu::MMAv5OpInterface mma) {
++  auto alloc = mma.getAccumulator()
++                   .getDefiningOp<triton::nvidia_gpu::TMEMAllocOp>();
++  if (!alloc)
++    return false;
+   Value token = mma.getAccDep();
+   Value allocToken = alloc.getToken();
+   if (!token || !allocToken)
+     return false;
+ 
+-  DenseSet<Value> seen;
+   while (token != allocToken) {
+-    if (!seen.insert(token).second)
+-      return false;
+     // TMEM loads advance the token without modifying the accumulator.
+     auto load = token.getDefiningOp<triton::nvidia_gpu::TMEMLoadOp>();
+     if (!load || token != load.getToken() ||
+@@ -103,8 +103,7 @@ std::pair<Value, Operation *> getAccumulatorUseAndDef(Operation *op) {
+     auto accVal = tc05MmaOp.getAccumulator();
+     auto tmemAlloc = accVal.getDefiningOp<triton::nvidia_gpu::TMEMAllocOp>();
+     if (!tmemAlloc ||
+-        tmemAlloc->getParentRegion() != tc05MmaOp->getParentRegion() ||
+-        !accumulatorInitReachesMMA(tc05MmaOp, tmemAlloc))
++        tmemAlloc->getParentRegion() != tc05MmaOp->getParentRegion())
+       return std::make_pair(nullptr, nullptr);
+     triton::nvidia_gpu::TMEMLoadOp tmemLoad = nullptr;
+     for (auto user : tmemAlloc.getResult().getUsers()) {
+@@ -234,6 +233,11 @@ class OptimizeAccumulatorInitPass
+       if (!accUse || !accDef) {
+         continue;
+       }
++      if (auto tc05MmaOp =
++              dyn_cast<triton::nvidia_gpu::MMAv5OpInterface>(mmaOp);
++          tc05MmaOp && !accumulatorInitReachesMMA(tc05MmaOp)) {
++        continue;
++      }
+       if (isConstantZeroTensor(accUse)) {
+         setUseAccFlag(mmaOp, vFalse);
+         continue;
+
+From 848cb4a300b79e572fcac2c3ccf21a1bdace7023 Mon Sep 17 00:00:00 2001
+From: Masahiro Masuda <masahi129@gmail.com>
+Date: Sat, 18 Jul 2026 04:54:46 +0900
+Subject: [PATCH 11/11] precommit fix
+
+---
+ lib/Dialect/TritonGPU/Transforms/OptimizeAccumulatorInit.cpp | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/lib/Dialect/TritonGPU/Transforms/OptimizeAccumulatorInit.cpp b/lib/Dialect/TritonGPU/Transforms/OptimizeAccumulatorInit.cpp
+index 71bab8dedc8c..3fcb5b3e14d8 100644
+--- a/lib/Dialect/TritonGPU/Transforms/OptimizeAccumulatorInit.cpp
++++ b/lib/Dialect/TritonGPU/Transforms/OptimizeAccumulatorInit.cpp
+@@ -72,8 +72,8 @@ bool dotSupportsAccInitFlag(Operation *op) {
+ // Return true if the allocation's initial contents reach the MMA unchanged.
+ // Any intervening write invalidates useD=false.
+ bool accumulatorInitReachesMMA(triton::nvidia_gpu::MMAv5OpInterface mma) {
+-  auto alloc = mma.getAccumulator()
+-                   .getDefiningOp<triton::nvidia_gpu::TMEMAllocOp>();
++  auto alloc =
++      mma.getAccumulator().getDefiningOp<triton::nvidia_gpu::TMEMAllocOp>();
+   if (!alloc)
+     return false;
+   Value token = mma.getAccDep();

@@ -1,0 +1,242 @@
+From a59867a6dc0f09d50af3b9caf3c236ca3a610210 Mon Sep 17 00:00:00 2001
+From: Stanislav Bardyuk <sbardyuk@google.com>
+Date: Thu, 13 Aug 2026 12:58:36 -0700
+Subject: [PATCH] PR #47149: [XLA] Fix bitcast-convert of literals to and from
+ sub-byte types
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Imported from GitHub PR https://github.com/openxla/xla/pull/47149
+
+## 📝 Summary of Changes
+
+`LiteralBase::BitcastConvert` assumed literal buffers hold the packed device representation, but literals store sub-byte types (S4/U4/S2/U2) unpacked, one element per byte. Two things were broken:
+
+- The size check compared `ShapeUtil::ByteSizeOf` of the two shapes, which depends on the layout's `element_size_in_bits`. Literals always strip that field from their own shape, while the destination shape may carry it (after layout assignment) or not (before). Depending on the pipeline stage, a valid sub-byte bitcast-convert was either rejected with `InvalidArgument` or let through with mismatched buffer sizes.
+- The data copy was a raw `memcpy`, which garbles values whenever the packing boundary changes (e.g. `u8[1] -> s4[1,2]` copies one unpacked byte into a two-byte unpacked buffer).
+
+The fix makes the size check bit-accurate and layout-independent (`ElementsIn * StorageBitWidth` on both sides, mirroring shape inference), and converts through the packed representation using the same `PackIntN`/`UnpackIntN` helpers the transfer manager uses for host-device copies, so folded constants match what the device computes. Bitcasts not involving sub-byte types keep the single-memcpy fast path unchanged.
+
+## 🎯 Justification
+
+Fixes #38964. `bitcast_convert` from `u8` to `s4` returned different results for a constant than for a parameter holding the same value: `0xE1` as a parameter bitcasts to `[1, -2]` (correct), but as a constant it folded to `[1, 0]` because `HloEvaluator::HandleBitcastConvert` delegates to the broken literal function. The same defect makes the interpreter backend reject valid sub-byte bitcast-converts outright with "Can not bitcast-convert from shape u8[1] to a shape of different size s4[1,2]".
+
+Note on current main: commit 0e6508a60e (2026-08-11) added a guard to HloConstantFolding that skips width-changing sub-byte `kBitcast`/`kBitcastConvert` folding, which hides the wrong-value symptom on compiled backends by not folding at all. This change fixes the underlying function, which also fixes the interpreter (the guard does not help there) and any other evaluator user. With `LiteralBase::BitcastConvert` correct, the `kBitcastConvert` half of that guard could be relaxed to re-enable folding; happy to do that here or in a follow-up, whichever you prefer (the `kBitcast` half must stay: `HloEvaluator::HandleBitcast` is still a raw memcpy).
+
+## 🚀 Kind of Contribution
+
+🐛 Bug Fix
+
+## 🧪 Unit Tests:
+
+Added to `xla/literal_test.cc` next to the existing bitcast-convert tests: `u8 -> s4` (the reported case), `s4 -> u8` (previously rejected), `u8 -> s2`, `u16 -> u4` (byte-boundary crossing), `u4 -> s4` (same-width, guards existing behavior), a `u16 -> u4 -> u16` round trip, an odd element count (`s4[3] -> u4[3]`, partially-filled final packed byte), a sub-byte size mismatch still rejected, and a destination shape carrying `element_size_in_bits=4` (the post-layout-assignment case). Existing literal, hlo_evaluator, and hlo_constant_folding suites pass. Additionally verified locally with a randomized brute-force round-trip check (800 conversions across all sub-byte types against an independent bit-level reference; not committed).
+
+## 🧪 Execution Tests:
+
+Verified end to end with `run_hlo_module` on CPU and the interpreter: the reported constant module (`u8[1] {225}` -> `s4[1,2]` -> `s8`) evaluates to `{1, -2}` matching the parameter path, and the interpreter accepts it instead of erroring. (On a pre-0e6508a60e build, the CPU constant path reproduced the reported wrong `{1, 0}`; at current head the guard masks that by skipping the fold.)
+Copybara import of the project:
+
+--
+abbc6d4e41024d84a4cd344f55031ad34ef43118 by Stanislav Bardyuk <sbardyuk@google.com>:
+
+Fix bitcast-convert of literals to and from sub-byte types
+
+LiteralBase::BitcastConvert assumed literal buffers hold the packed
+device representation, but literals store sub-byte types unpacked (one
+element per byte). The ByteSizeOf-based size check was layout-dependent
+(rejecting valid sub-byte bitcasts before layout assignment, passing
+with mismatched buffer sizes after), and the raw memcpy garbled values
+whenever the packing boundary changed, so a u8 constant bitcast to
+s4[2] folded to different values than the same bytes fed as a
+parameter.
+
+Make the size check bit-accurate and layout-independent (mirroring
+shape inference's StorageBitWidth accounting) and convert through the
+packed representation with the same PackIntN/UnpackIntN helpers the
+transfer manager uses, so folded constants match device results.
+Non-sub-byte bitcasts keep the single-memcpy fast path.
+
+Fixes #38964.
+
+Merging this change closes #47149
+
+COPYBARA_INTEGRATE_REVIEW=https://github.com/openxla/xla/pull/47149 from kodlan:fix/issue-38964-literal-bitcast-subbyte abbc6d4e41024d84a4cd344f55031ad34ef43118
+PiperOrigin-RevId: 964245029
+---
+ xla/literal.cc      | 54 ++++++++++++++++++++++++++----
+ xla/literal_test.cc | 80 +++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 127 insertions(+), 7 deletions(-)
+
+diff --git a/xla/literal.cc b/xla/literal.cc
+index 8c68548c93c1c..942517da85f2e 100644
+--- a/xla/literal.cc
++++ b/xla/literal.cc
+@@ -16,6 +16,7 @@ limitations under the License.
+ #include "xla/literal.h"
+ 
+ #include <algorithm>
++#include <climits>
+ #include <complex>
+ #include <cstdint>
+ #include <cstring>
+@@ -1861,11 +1862,6 @@ absl::StatusOr<Literal> LiteralBase::Convert(
+ 
+ absl::StatusOr<Literal> LiteralBase::BitcastConvert(
+     const Shape& dest_shape) const {
+-  if (ShapeUtil::ByteSizeOf(dest_shape) != ShapeUtil::ByteSizeOf(shape())) {
+-    return InvalidArgument(
+-        "Can not bitcast-convert from shape %s to a shape of different size %s",
+-        shape().ToString(), dest_shape.ToString());
+-  }
+   if (dest_shape.IsTuple() || shape().IsTuple()) {
+     return InvalidArgument(
+         "bitcast-convert is not valid for tuple shapes %s->%s",
+@@ -1876,10 +1872,54 @@ absl::StatusOr<Literal> LiteralBase::BitcastConvert(
+         "bitcast-convert is not valid for dynamic shape %s->%s",
+         shape().ToString(), dest_shape.ToString());
+   }
++  if (!shape().IsArray() || !dest_shape.IsArray()) {
++    return InvalidArgument(
++        "bitcast-convert is only valid for array shapes %s->%s",
++        shape().ToString(), dest_shape.ToString());
++  }
++  // Compare storage bits rather than ShapeUtil::ByteSizeOf: byte sizes depend
++  // on the layout's element_size_in_bits, which literals always strip.
++  const PrimitiveType src_type = shape().element_type();
++  const PrimitiveType dest_type = dest_shape.element_type();
++  const int64_t src_bits = ShapeUtil::ElementsIn(shape()) *
++                           primitive_util::StorageBitWidth(src_type);
++  const int64_t dest_bits = ShapeUtil::ElementsIn(dest_shape) *
++                            primitive_util::StorageBitWidth(dest_type);
++  if (src_bits != dest_bits) {
++    return InvalidArgument(
++        "Can not bitcast-convert from shape %s to a shape of different size %s",
++        shape().ToString(), dest_shape.ToString());
++  }
+ 
+   Literal out(dest_shape);
+-  std::memcpy(out.root_piece_.buffer(), root_piece().buffer(),
+-              root_piece().size_bytes_dense());
++  const bool src_sub_byte = primitive_util::IsSubByteNonPredType(src_type);
++  const bool dest_sub_byte = primitive_util::IsSubByteNonPredType(dest_type);
++  if (src_sub_byte || dest_sub_byte) {
++    // Literal stores sub-byte types unpacked (one element per byte), while
++    // bitcast-convert semantics are defined on the packed representation.
++    std::vector<char> packed(CeilOfRatio<int64_t>(src_bits, CHAR_BIT));
++    absl::Span<const char> packed_view = packed;
++    if (src_sub_byte) {
++      PackIntN(primitive_util::BitWidth(src_type),
++               absl::MakeConstSpan(root_piece().buffer(),
++                                   root_piece().size_bytes_dense()),
++               absl::MakeSpan(packed));
++    } else {
++      packed_view = absl::MakeConstSpan(root_piece().buffer(),
++                                        root_piece().size_bytes_dense());
++    }
++    if (dest_sub_byte) {
++      UnpackIntN(primitive_util::BitWidth(dest_type), packed_view,
++                 absl::MakeSpan(out.root_piece_.buffer(),
++                                out.root_piece_.size_bytes_dense()));
++    } else if (!packed_view.empty()) {
++      std::memcpy(out.root_piece_.buffer(), packed_view.data(),
++                  packed_view.size());
++    }
++  } else {
++    std::memcpy(out.root_piece_.buffer(), root_piece().buffer(),
++                root_piece().size_bytes_dense());
++  }
+ 
+   // Perform the reshape on little endian encoding even on big endian machines.
+   if constexpr (!kLittleEndian) {
+diff --git a/xla/literal_test.cc b/xla/literal_test.cc
+index b5385804d85e6..ce22b70a5b529 100644
+--- a/xla/literal_test.cc
++++ b/xla/literal_test.cc
+@@ -2195,6 +2195,86 @@ TEST_F(LiteralUtilTest, BitcastConvertBetweenInvalidTypes) {
+       absl::StrContains(status.message(), "to a shape of different size"));
+ }
+ 
++// Sub-byte types are stored unpacked in literals (one element per byte), but
++// bitcast-convert semantics are defined on the packed representation, with
++// element 0 in the low-order bits of each byte.
++TEST_F(LiteralUtilTest, BitcastConvertU8ToS4) {
++  Literal original = LiteralUtil::CreateR1<uint8_t>({0xE1});
++  ASSERT_OK_AND_ASSIGN(
++      Literal converted,
++      original.BitcastConvert(ShapeUtil::MakeShape(S4, {1, 2})));
++  EXPECT_EQ(converted, LiteralUtil::CreateR2<s4>({{s4(1), s4(-2)}}));
++}
++
++TEST_F(LiteralUtilTest, BitcastConvertS4ToU8) {
++  Literal original = LiteralUtil::CreateR2<s4>({{s4(1), s4(-2)}});
++  ASSERT_OK_AND_ASSIGN(Literal converted,
++                       original.BitcastConvert(ShapeUtil::MakeShape(U8, {1})));
++  EXPECT_EQ(converted, LiteralUtil::CreateR1<uint8_t>({0xE1}));
++}
++
++TEST_F(LiteralUtilTest, BitcastConvertU8ToS2) {
++  Literal original = LiteralUtil::CreateR1<uint8_t>({0xE1});
++  ASSERT_OK_AND_ASSIGN(
++      Literal converted,
++      original.BitcastConvert(ShapeUtil::MakeShape(S2, {1, 4})));
++  EXPECT_EQ(converted,
++            LiteralUtil::CreateR2<s2>({{s2(1), s2(0), s2(-2), s2(-1)}}));
++}
++
++TEST_F(LiteralUtilTest, BitcastConvertU16ToU4) {
++  Literal original = LiteralUtil::CreateR1<uint16_t>({0x4321});
++  ASSERT_OK_AND_ASSIGN(
++      Literal converted,
++      original.BitcastConvert(ShapeUtil::MakeShape(U4, {1, 4})));
++  EXPECT_EQ(converted,
++            LiteralUtil::CreateR2<u4>({{u4(1), u4(2), u4(3), u4(4)}}));
++}
++
++TEST_F(LiteralUtilTest, BitcastConvertU4ToS4) {
++  Literal original = LiteralUtil::CreateR1<u4>({u4(1), u4(14)});
++  ASSERT_OK_AND_ASSIGN(Literal converted,
++                       original.BitcastConvert(ShapeUtil::MakeShape(S4, {2})));
++  EXPECT_EQ(converted, LiteralUtil::CreateR1<s4>({s4(1), s4(-2)}));
++}
++
++TEST_F(LiteralUtilTest, BitcastConvertSubByteRoundTrip) {
++  Literal original = LiteralUtil::CreateR1<uint16_t>({0xE1F0, 0x1234});
++  ASSERT_OK_AND_ASSIGN(
++      Literal as_u4, original.BitcastConvert(ShapeUtil::MakeShape(U4, {2, 4})));
++  ASSERT_OK_AND_ASSIGN(Literal round_tripped,
++                       as_u4.BitcastConvert(ShapeUtil::MakeShape(U16, {2})));
++  EXPECT_EQ(round_tripped, original);
++}
++
++// Odd element counts exercise the partially-filled final packed byte.
++TEST_F(LiteralUtilTest, BitcastConvertSubByteOddElementCount) {
++  Literal original = LiteralUtil::CreateR1<s4>({s4(1), s4(-2), s4(7)});
++  ASSERT_OK_AND_ASSIGN(Literal converted,
++                       original.BitcastConvert(ShapeUtil::MakeShape(U4, {3})));
++  EXPECT_EQ(converted, LiteralUtil::CreateR1<u4>({u4(1), u4(14), u4(7)}));
++}
++
++TEST_F(LiteralUtilTest, BitcastConvertSubByteSizeMismatchRejected) {
++  Literal literal = LiteralUtil::CreateR1<uint8_t>({0xE1});
++  absl::Status status =
++      literal.BitcastConvert(ShapeUtil::MakeShape(S4, {3})).status();
++  EXPECT_NE(absl::OkStatus(), status);
++  EXPECT_TRUE(
++      absl::StrContains(status.message(), "to a shape of different size"));
++}
++
++// The result must not depend on whether the destination shape's layout
++// carries element_size_in_bits (set after layout assignment, stripped inside
++// literals).
++TEST_F(LiteralUtilTest, BitcastConvertToS4WithElementSizeInBitsLayout) {
++  Literal original = LiteralUtil::CreateR1<uint8_t>({0xE1});
++  Shape dest_shape = ShapeUtil::MakeShape(S4, {1, 2});
++  dest_shape.mutable_layout()->set_element_size_in_bits(4);
++  ASSERT_OK_AND_ASSIGN(Literal converted, original.BitcastConvert(dest_shape));
++  EXPECT_EQ(converted, LiteralUtil::CreateR2<s4>({{s4(1), s4(-2)}}));
++}
++
+ // Sets the layout of the given ShapeProto to the default.
+ void SetDefaultLayoutOnProto(ShapeProto* shape_proto) {
+   CHECK(primitive_util::IsArrayType(shape_proto->element_type()));

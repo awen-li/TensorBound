@@ -1,0 +1,443 @@
+From bc99b5ec7cae6ccea848b8fb975d055f9e8bc031 Mon Sep 17 00:00:00 2001
+From: Boian Petkantchin <boian.petkantchin@amd.com>
+Date: Thu, 29 Feb 2024 09:53:25 -0800
+Subject: [PATCH 1/7] [runtime][cuda] Fix concurrency issues
+
+* Fix concurrency issue between the worker thread and CUDA host callbacks,
+where the worker thread may exit before the callback is done.
+
+* Fix a concurrency issue where the worker thread may wait forever if
+`iree_hal_cuda_worker_process_ready_list` finishes before the CUDA callback
+`iree_hal_cuda_execution_device_signal_host_callback`.
+
+* Fix an issue where we access an action after
+`iree_hal_cuda_pending_queue_actions_issue_cleanup` has deleted it.
+---
+ .../hal/drivers/cuda/pending_queue_actions.c  | 34 +++++++++++++++++--
+ 1 file changed, 32 insertions(+), 2 deletions(-)
+
+diff --git a/runtime/src/iree/hal/drivers/cuda/pending_queue_actions.c b/runtime/src/iree/hal/drivers/cuda/pending_queue_actions.c
+index 211056285b88..e27beb6092bf 100644
+--- a/runtime/src/iree/hal/drivers/cuda/pending_queue_actions.c
++++ b/runtime/src/iree/hal/drivers/cuda/pending_queue_actions.c
+@@ -13,6 +13,7 @@
+ #include "iree/base/internal/arena.h"
+ #include "iree/base/internal/atomic_slist.h"
+ #include "iree/base/internal/atomics.h"
++#include "iree/base/internal/atomics_clang.h"
+ #include "iree/base/internal/synchronization.h"
+ #include "iree/base/internal/threading.h"
+ #include "iree/hal/api.h"
+@@ -218,6 +219,10 @@ typedef struct iree_hal_cuda_working_area_t {
+   iree_notification_t exit_notification;
+   iree_hal_cuda_ready_action_slist_t ready_worklist;  // atomic
+   iree_atomic_int32_t worker_state;                   // atomic
++  // Count the number of work items that have started but are not done yet.
++  // We don't need this to be atomic since it is modified only from the worker
++  // thread.
++  iree_atomic_int32_t pending_work_items_count;
+   iree_atomic_intptr_t error_code;                    // atomic
+   iree_allocator_t host_allocator;                    // const
+ } iree_hal_cuda_working_area_t;
+@@ -547,6 +552,17 @@ static void iree_hal_cuda_execution_device_signal_host_callback(
+   iree_hal_cuda_queue_action_list_push_back(&actions->action_list, action);
+   iree_slim_mutex_unlock(&actions->action_mutex);
+ 
++  // Notify the worker thread that we have more actions enqueued.
++  iree_hal_cuda_worker_state_t prev_state =
++      IREE_HAL_CUDA_WORKER_STATE_IDLE_WAITING;
++  iree_atomic_compare_exchange_strong_int32(
++      &actions->working_area.worker_state, /*expected=*/&prev_state,
++      /*desired=*/IREE_HAL_CUDA_WORKER_STATE_WORKLOAD_PENDING,
++      /*order_succ=*/iree_memory_order_acq_rel,
++      /*order_fail=*/iree_memory_order_acquire);
++  iree_notification_post(&actions->working_area.state_notification,
++                         IREE_ALL_WAITERS);
++
+   // Advance semaphore timelines by calling into the host signaling function.
+   // This will internally try to release more workload to the GPU.
+   IREE_IGNORE_ERROR(
+@@ -627,6 +643,9 @@ static iree_status_t iree_hal_cuda_pending_queue_actions_issue_execution(
+         "cuStreamWaitEvent");
+   }
+ 
++  // This counter will be decremented once the work item is complete.
++  ++action->owning_actions->working_area.pending_work_items_count;
++
+   // Now launch a host function on the callback stream to advance the semaphore
+   // timeline.
+   IREE_CUDA_RETURN_AND_END_ZONE_IF_ERROR(
+@@ -664,6 +683,8 @@ static iree_status_t iree_hal_cuda_pending_queue_actions_issue_cleanup(
+ 
+   iree_allocator_free(host_allocator, action);
+ 
++  --actions->working_area.pending_work_items_count;
++
+   IREE_TRACE_ZONE_END(z0);
+   return iree_ok_status();
+ }
+@@ -850,13 +871,15 @@ static iree_status_t iree_hal_cuda_worker_process_ready_list(
+       switch (action->state) {
+         case IREE_HAL_cuda_QUEUE_ACTION_STATE_ALIVE:
+           status = iree_hal_cuda_pending_queue_actions_issue_execution(action);
++          if (iree_status_is_ok(status)) {
++            action->event_count = 0;
++          }
+           break;
+         case IREE_HAL_cuda_QUEUE_ACTION_STATE_ZOMBIE:
+           status = iree_hal_cuda_pending_queue_actions_issue_cleanup(action);
+           break;
+       }
+       if (!iree_status_is_ok(status)) break;
+-      action->event_count = 0;
+ 
+       action = next_action;
+     }
+@@ -868,6 +891,13 @@ static iree_status_t iree_hal_cuda_worker_process_ready_list(
+   return status;
+ }
+ 
++static bool iree_hal_cuda_worker_has_no_more_pending_work_items(
++    iree_hal_cuda_working_area_t* working_area) {
++  int32_t value = iree_atomic_load_int32(
++      &working_area->pending_work_items_count, iree_memory_order_acquire);
++  return value == 0;
++}
++
+ // The main function for the ready-list processing worker thread.
+ static int iree_hal_cuda_worker_execute(
+     iree_hal_cuda_working_area_t* working_area) {
+@@ -916,7 +946,7 @@ static int iree_hal_cuda_worker_execute(
+       return -1;
+     }
+ 
+-    if (should_exit) {
++    if (should_exit && !working_area->pending_work_items_count) {
+       // Signal that this thread is committed to exit. This state has a priority
+       // that is only lower than error exit. And we just checked error exit in
+       // the above. So also just overwrite.
+
+From 9325fc24e5552e42d78e593a773b106f422dcd6b Mon Sep 17 00:00:00 2001
+From: Boian Petkantchin <boian.petkantchin@amd.com>
+Date: Thu, 29 Feb 2024 10:51:36 -0800
+Subject: [PATCH 2/7] Remove unused header include
+
+---
+ runtime/src/iree/hal/drivers/cuda/pending_queue_actions.c | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/runtime/src/iree/hal/drivers/cuda/pending_queue_actions.c b/runtime/src/iree/hal/drivers/cuda/pending_queue_actions.c
+index e27beb6092bf..3390d2418136 100644
+--- a/runtime/src/iree/hal/drivers/cuda/pending_queue_actions.c
++++ b/runtime/src/iree/hal/drivers/cuda/pending_queue_actions.c
+@@ -13,7 +13,6 @@
+ #include "iree/base/internal/arena.h"
+ #include "iree/base/internal/atomic_slist.h"
+ #include "iree/base/internal/atomics.h"
+-#include "iree/base/internal/atomics_clang.h"
+ #include "iree/base/internal/synchronization.h"
+ #include "iree/base/internal/threading.h"
+ #include "iree/hal/api.h"
+
+From 1484fd5d7fd44f2a11b53d5c59494a8f7f18a916 Mon Sep 17 00:00:00 2001
+From: Boian Petkantchin <boian.petkantchin@amd.com>
+Date: Thu, 29 Feb 2024 10:54:01 -0800
+Subject: [PATCH 3/7] Remove unused function
+
+---
+ runtime/src/iree/hal/drivers/cuda/pending_queue_actions.c | 7 -------
+ 1 file changed, 7 deletions(-)
+
+diff --git a/runtime/src/iree/hal/drivers/cuda/pending_queue_actions.c b/runtime/src/iree/hal/drivers/cuda/pending_queue_actions.c
+index 3390d2418136..b071b1b4e1c9 100644
+--- a/runtime/src/iree/hal/drivers/cuda/pending_queue_actions.c
++++ b/runtime/src/iree/hal/drivers/cuda/pending_queue_actions.c
+@@ -890,13 +890,6 @@ static iree_status_t iree_hal_cuda_worker_process_ready_list(
+   return status;
+ }
+ 
+-static bool iree_hal_cuda_worker_has_no_more_pending_work_items(
+-    iree_hal_cuda_working_area_t* working_area) {
+-  int32_t value = iree_atomic_load_int32(
+-      &working_area->pending_work_items_count, iree_memory_order_acquire);
+-  return value == 0;
+-}
+-
+ // The main function for the ready-list processing worker thread.
+ static int iree_hal_cuda_worker_execute(
+     iree_hal_cuda_working_area_t* working_area) {
+
+From ae383b22055d66c53f18c765fdae926feb0c3e3d Mon Sep 17 00:00:00 2001
+From: Boian Petkantchin <boian.petkantchin@amd.com>
+Date: Thu, 29 Feb 2024 11:21:18 -0800
+Subject: [PATCH 4/7] Make pending_work_items_count not atomic
+
+---
+ runtime/src/iree/hal/drivers/cuda/pending_queue_actions.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/runtime/src/iree/hal/drivers/cuda/pending_queue_actions.c b/runtime/src/iree/hal/drivers/cuda/pending_queue_actions.c
+index b071b1b4e1c9..08b59e14f53f 100644
+--- a/runtime/src/iree/hal/drivers/cuda/pending_queue_actions.c
++++ b/runtime/src/iree/hal/drivers/cuda/pending_queue_actions.c
+@@ -221,7 +221,7 @@ typedef struct iree_hal_cuda_working_area_t {
+   // Count the number of work items that have started but are not done yet.
+   // We don't need this to be atomic since it is modified only from the worker
+   // thread.
+-  iree_atomic_int32_t pending_work_items_count;
++  int32_t pending_work_items_count;
+   iree_atomic_intptr_t error_code;                    // atomic
+   iree_allocator_t host_allocator;                    // const
+ } iree_hal_cuda_working_area_t;
+
+From 97130a5c71ccd85e9abf5f255cf05fc615603b24 Mon Sep 17 00:00:00 2001
+From: Lei Zhang <antiagainst@gmail.com>
+Date: Sat, 2 Mar 2024 13:45:00 -0800
+Subject: [PATCH 5/7] Refine comments
+
+---
+ .../hal/drivers/cuda/pending_queue_actions.c  | 28 +++++++++----------
+ 1 file changed, 14 insertions(+), 14 deletions(-)
+
+diff --git a/runtime/src/iree/hal/drivers/cuda/pending_queue_actions.c b/runtime/src/iree/hal/drivers/cuda/pending_queue_actions.c
+index 08b59e14f53f..5b7c6006be83 100644
+--- a/runtime/src/iree/hal/drivers/cuda/pending_queue_actions.c
++++ b/runtime/src/iree/hal/drivers/cuda/pending_queue_actions.c
+@@ -96,8 +96,8 @@ typedef struct iree_hal_cuda_queue_action_t {
+   // Scratch fields for analyzing whether actions are ready to issue.
+   CUevent events[IREE_HAL_CUDA_MAX_WAIT_EVENT_COUNT];
+   iree_host_size_t event_count;
+-  bool is_pending;
+   // Whether the current action is still not ready for releasing to the GPU.
++  bool is_pending;
+ } iree_hal_cuda_queue_action_t;
+ 
+ //===----------------------------------------------------------------------===//
+@@ -218,12 +218,12 @@ typedef struct iree_hal_cuda_working_area_t {
+   iree_notification_t exit_notification;
+   iree_hal_cuda_ready_action_slist_t ready_worklist;  // atomic
+   iree_atomic_int32_t worker_state;                   // atomic
+-  // Count the number of work items that have started but are not done yet.
+-  // We don't need this to be atomic since it is modified only from the worker
+-  // thread.
+-  int32_t pending_work_items_count;
+   iree_atomic_intptr_t error_code;                    // atomic
+-  iree_allocator_t host_allocator;                    // const
++  // The number of actions that have been issued to the GPU but not yet fully
++  // completed both execution and cleanup. We don't need this field to be atomic
++  // given it is modified only from the worker thread.
++  int32_t pending_action_count;
++  iree_allocator_t host_allocator;  // const
+ } iree_hal_cuda_working_area_t;
+ 
+ static void iree_hal_cuda_working_area_initialize(
+@@ -551,7 +551,8 @@ static void iree_hal_cuda_execution_device_signal_host_callback(
+   iree_hal_cuda_queue_action_list_push_back(&actions->action_list, action);
+   iree_slim_mutex_unlock(&actions->action_mutex);
+ 
+-  // Notify the worker thread that we have more actions enqueued.
++  // Notify the worker thread again that we have the cleanup action enqueued.
++  // Only overwrite the idle waiting state, which has lower priority.
+   iree_hal_cuda_worker_state_t prev_state =
+       IREE_HAL_CUDA_WORKER_STATE_IDLE_WAITING;
+   iree_atomic_compare_exchange_strong_int32(
+@@ -642,8 +643,9 @@ static iree_status_t iree_hal_cuda_pending_queue_actions_issue_execution(
+         "cuStreamWaitEvent");
+   }
+ 
+-  // This counter will be decremented once the work item is complete.
+-  ++action->owning_actions->working_area.pending_work_items_count;
++  // Increase the pending action counter. We decrease it once it fully
++  // compeletes and gets cleaned up.
++  ++action->owning_actions->working_area.pending_action_count;
+ 
+   // Now launch a host function on the callback stream to advance the semaphore
+   // timeline.
+@@ -682,7 +684,7 @@ static iree_status_t iree_hal_cuda_pending_queue_actions_issue_cleanup(
+ 
+   iree_allocator_free(host_allocator, action);
+ 
+-  --actions->working_area.pending_work_items_count;
++  --actions->working_area.pending_action_count;
+ 
+   IREE_TRACE_ZONE_END(z0);
+   return iree_ok_status();
+@@ -870,9 +872,7 @@ static iree_status_t iree_hal_cuda_worker_process_ready_list(
+       switch (action->state) {
+         case IREE_HAL_cuda_QUEUE_ACTION_STATE_ALIVE:
+           status = iree_hal_cuda_pending_queue_actions_issue_execution(action);
+-          if (iree_status_is_ok(status)) {
+-            action->event_count = 0;
+-          }
++          if (iree_status_is_ok(status)) action->event_count = 0;
+           break;
+         case IREE_HAL_cuda_QUEUE_ACTION_STATE_ZOMBIE:
+           status = iree_hal_cuda_pending_queue_actions_issue_cleanup(action);
+@@ -938,7 +938,7 @@ static int iree_hal_cuda_worker_execute(
+       return -1;
+     }
+ 
+-    if (should_exit && !working_area->pending_work_items_count) {
++    if (should_exit && !working_area->pending_action_count) {
+       // Signal that this thread is committed to exit. This state has a priority
+       // that is only lower than error exit. And we just checked error exit in
+       // the above. So also just overwrite.
+
+From dac7317ec59da4f68c4d75c5d6448ccedba8d925 Mon Sep 17 00:00:00 2001
+From: Lei Zhang <antiagainst@gmail.com>
+Date: Sat, 2 Mar 2024 13:59:32 -0800
+Subject: [PATCH 6/7] Mirror the change to HIP
+
+---
+ experimental/hip/pending_queue_actions.c      | 30 +++++++++++++++++--
+ .../hal/drivers/cuda/pending_queue_actions.c  |  2 ++
+ 2 files changed, 29 insertions(+), 3 deletions(-)
+
+diff --git a/experimental/hip/pending_queue_actions.c b/experimental/hip/pending_queue_actions.c
+index 7f346a3d334f..64a1dbaf84e9 100644
+--- a/experimental/hip/pending_queue_actions.c
++++ b/experimental/hip/pending_queue_actions.c
+@@ -219,7 +219,11 @@ typedef struct iree_hal_hip_working_area_t {
+   iree_hal_hip_ready_action_slist_t ready_worklist;  // atomic
+   iree_atomic_int32_t worker_state;                  // atomic
+   iree_atomic_intptr_t error_code;                   // atomic
+-  iree_allocator_t host_allocator;                   // const
++  // The number of actions that have been issued to the GPU but not yet fully
++  // completed both execution and cleanup. We don't need this field to be atomic
++  // given it is modified only from the worker thread.
++  int32_t pending_action_count;
++  iree_allocator_t host_allocator;  // const
+ } iree_hal_hip_working_area_t;
+ 
+ static void iree_hal_hip_working_area_initialize(
+@@ -546,6 +550,18 @@ static void iree_hal_hip_execution_device_signal_host_callback(
+   iree_hal_hip_queue_action_list_push_back(&actions->action_list, action);
+   iree_slim_mutex_unlock(&actions->action_mutex);
+ 
++  // Notify the worker thread again that we have the cleanup action enqueued.
++  // Only overwrite the idle waiting state, which has lower priority.
++  iree_hal_hip_worker_state_t prev_state =
++      IREE_HAL_HIP_WORKER_STATE_IDLE_WAITING;
++  iree_atomic_compare_exchange_strong_int32(
++      &actions->working_area.worker_state, /*expected=*/&prev_state,
++      /*desired=*/IREE_HAL_HIP_WORKER_STATE_WORKLOAD_PENDING,
++      /*order_succ=*/iree_memory_order_acq_rel,
++      /*order_fail=*/iree_memory_order_acquire);
++  iree_notification_post(&actions->working_area.state_notification,
++                         IREE_ALL_WAITERS);
++
+   // Advance semaphore timelines by calling into the host signaling function.
+   // This will internally try to release more workload to the GPU.
+   IREE_IGNORE_ERROR(
+@@ -625,6 +641,10 @@ static iree_status_t iree_hal_hip_pending_queue_actions_issue_execution(
+         "hipStreamWaitEvent");
+   }
+ 
++  // Increase the pending action counter. We decrease it once it fully
++  // compeletes and gets cleaned up.
++  ++action->owning_actions->working_area.pending_action_count;
++
+   // Now launch a host function on the callback stream to advance the semaphore
+   // timeline.
+   IREE_HIP_RETURN_AND_END_ZONE_IF_ERROR(
+@@ -662,6 +682,10 @@ static iree_status_t iree_hal_hip_pending_queue_actions_issue_cleanup(
+ 
+   iree_allocator_free(host_allocator, action);
+ 
++  // Now we fully executed and cleaned up this action. Decrease the pending
++  // action counter.
++  --actions->working_area.pending_action_count;
++
+   IREE_TRACE_ZONE_END(z0);
+   return iree_ok_status();
+ }
+@@ -848,13 +872,13 @@ static iree_status_t iree_hal_hip_worker_process_ready_list(
+       switch (action->state) {
+         case IREE_HAL_HIP_QUEUE_ACTION_STATE_ALIVE:
+           status = iree_hal_hip_pending_queue_actions_issue_execution(action);
++          if (iree_status_is_ok(status)) action->event_count = 0;
+           break;
+         case IREE_HAL_HIP_QUEUE_ACTION_STATE_ZOMBIE:
+           status = iree_hal_hip_pending_queue_actions_issue_cleanup(action);
+           break;
+       }
+       if (!iree_status_is_ok(status)) break;
+-      action->event_count = 0;
+ 
+       action = next_action;
+     }
+@@ -914,7 +938,7 @@ static int iree_hal_hip_worker_execute(
+       return -1;
+     }
+ 
+-    if (should_exit) {
++    if (should_exit && !working_area->pending_action_count) {
+       // Signal that this thread is committed to exit. This state has a priority
+       // that is only lower than error exit. And we just checked error exit in
+       // the above. So also just overwrite.
+diff --git a/runtime/src/iree/hal/drivers/cuda/pending_queue_actions.c b/runtime/src/iree/hal/drivers/cuda/pending_queue_actions.c
+index 5b7c6006be83..fd6397ed94c4 100644
+--- a/runtime/src/iree/hal/drivers/cuda/pending_queue_actions.c
++++ b/runtime/src/iree/hal/drivers/cuda/pending_queue_actions.c
+@@ -684,6 +684,8 @@ static iree_status_t iree_hal_cuda_pending_queue_actions_issue_cleanup(
+ 
+   iree_allocator_free(host_allocator, action);
+ 
++  // Now we fully executed and cleaned up this action. Decrease the pending
++  // action counter.
+   --actions->working_area.pending_action_count;
+ 
+   IREE_TRACE_ZONE_END(z0);
+
+From 579e3965e1383d1fad7b1be3175bb5c326cf1195 Mon Sep 17 00:00:00 2001
+From: Lei Zhang <antiagainst@gmail.com>
+Date: Sat, 2 Mar 2024 14:03:05 -0800
+Subject: [PATCH 7/7] Properly initialize the pending_action_count
+
+---
+ experimental/hip/pending_queue_actions.c                  | 3 ++-
+ runtime/src/iree/hal/drivers/cuda/pending_queue_actions.c | 3 ++-
+ 2 files changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/experimental/hip/pending_queue_actions.c b/experimental/hip/pending_queue_actions.c
+index 64a1dbaf84e9..f7bbce183a50 100644
+--- a/experimental/hip/pending_queue_actions.c
++++ b/experimental/hip/pending_queue_actions.c
+@@ -237,6 +237,7 @@ static void iree_hal_hip_working_area_initialize(
+                           iree_memory_order_release);
+   iree_atomic_store_int32(&working_area->error_code, IREE_STATUS_OK,
+                           iree_memory_order_release);
++  working_area->pending_action_count = 0;
+   working_area->host_allocator = host_allocator;
+ }
+ 
+@@ -938,7 +939,7 @@ static int iree_hal_hip_worker_execute(
+       return -1;
+     }
+ 
+-    if (should_exit && !working_area->pending_action_count) {
++    if (should_exit && working_area->pending_action_count == 0) {
+       // Signal that this thread is committed to exit. This state has a priority
+       // that is only lower than error exit. And we just checked error exit in
+       // the above. So also just overwrite.
+diff --git a/runtime/src/iree/hal/drivers/cuda/pending_queue_actions.c b/runtime/src/iree/hal/drivers/cuda/pending_queue_actions.c
+index fd6397ed94c4..ec9ed157e5bb 100644
+--- a/runtime/src/iree/hal/drivers/cuda/pending_queue_actions.c
++++ b/runtime/src/iree/hal/drivers/cuda/pending_queue_actions.c
+@@ -237,6 +237,7 @@ static void iree_hal_cuda_working_area_initialize(
+                           iree_memory_order_release);
+   iree_atomic_store_int32(&working_area->error_code, IREE_STATUS_OK,
+                           iree_memory_order_release);
++  working_area->pending_action_count = 0;
+   working_area->host_allocator = host_allocator;
+ }
+ 
+@@ -940,7 +941,7 @@ static int iree_hal_cuda_worker_execute(
+       return -1;
+     }
+ 
+-    if (should_exit && !working_area->pending_action_count) {
++    if (should_exit && working_area->pending_action_count == 0) {
+       // Signal that this thread is committed to exit. This state has a priority
+       // that is only lower than error exit. And we just checked error exit in
+       // the above. So also just overwrite.

@@ -1,0 +1,682 @@
+From 164a4b3bb104e32c7f6b3455f49e18dfa090a7b4 Mon Sep 17 00:00:00 2001
+From: drisspg <drisspguessous@gmail.com>
+Date: Tue, 30 Jun 2026 04:27:10 +0000
+Subject: [PATCH] Fix flex/flash bug with blocksparse (#188484)
+
+## Human Note
+I noticed this when adding vsa support in the attn_gym. Bascailly if we have realy blocksparse iinfo but noop mask mod we were incrrectly not using sparse info. So we were visting to many blocks / not producing corret output. This fixes our istrivial check
+
+## Agent Report
+# PTQ Report: pytorch/pytorch#188322
+
+## Summary
+
+Fixed the FlexAttention FLASH lowering so sparse `BlockMask` metadata is honored even when `mask_mod` is trivial. The original repro now passes for:
+
+- FLASH with `full_kv_*` metadata only,
+- FLASH with `kv_*` metadata only, and
+- FLASH with `full_kv_*` metadata plus an equivalent nontrivial `mask_mod`.
+
+The initial investigation was blocked because `flash-attn-4` was not installed in the PTQ job venv. The user installed it with the explicit job interpreter after we found that bare `pip` in this job has a stale shebang pointing at `/home/drisspg/.ptq_workspace/.venv/bin/python`.
+
+## Root cause analysis
+
+The forward FLASH lowering used the triviality of the `mask_mod` graph as the only signal for whether FA4 needed block-sparse metadata:
+
+```python
+mask_graph_is_trivial = is_trivial_mask_graph(mask_graph.graph_module)
+needs_block_mask = not mask_graph_is_trivial
+```
+
+For metadata-only sparse `BlockMask`s, `mask_mod` is trivial but `kv_*` and/or `full_kv_*` still describe a sparse block layout. Because `needs_block_mask` was false, the template did not pass `BlockSparseTensorsTorch` to FA4, so FA4 computed dense attention and ignored the sparse metadata.
+
+Two related lowering/template assumptions also needed tightening:
+
+- `NEEDS_BLOCK_MASK` was coupled to generating a `mask_mod`; metadata-only block sparsity needs block-sparse tensors but no `mask_mod`.
+- The template only accepted full-block metadata when emitting block-sparse tensors. Metadata represented only in `kv_*` needs zero `full_kv_*` tensors for FA4.
+
+In the local `flash-attn-4==4.0.0b19` package on SM100, sparse KV metadata must be expressed at the FA4 KV tile size of 128. The issue repro uses a Flex `BlockMask` KV block size of 256. A previous local PyTorch-side workaround split KV metadata before calling FA4, but that normalization belongs in FA4 and was removed in the latest patch.
+
+## What the fix does
+
+Changed `torch/_inductor/kernel/flex/flex_flash_attention.py` and `torch/_inductor/kernel/flex/templates/flash_attention.py.jinja` to:
+
+- skip FA4 block-sparse tensors only when the BlockMask is FlexAttention's synthetic dense no-op (`BLOCK_SIZE=(1 << 30, 1 << 30)` with no full-block metadata) **and** `mask_mod` is trivial; the no-op check uses `V.graph.sizevars.statically_known_true(...)` so unbacked/unknown block sizes conservatively fall through to the block-sparse path,
+- otherwise pass block-sparse metadata to FA4 for every real `BlockMask`, regardless of whether `mask_mod` is trivial,
+- separate `HAS_MASK_MOD` from `NEEDS_BLOCK_MASK` so metadata-only sparsity can run without a generated CuTe `mask_mod`,
+- build `BlockSparseTensorsTorch` inline in the template using `KV_NUM_BLKS.new_zeros(...)` / `KV_IDX.new_zeros(...)` when `full_kv_*` metadata is absent, and
+- let FA4 own KV block-size normalization (the prior PyTorch-side KV expansion helpers were removed).
+
+Added a CUDA regression test covering both `full_kv_*` metadata-only and `kv_*` metadata-only `BlockMask`s with `BACKEND="FLASH"`. The local regression test uses `BLOCK_SIZE=(256, 128)` because `flash-attn-4==4.0.0b19` rejects KV sparse block sizes larger than `tile_n`; newer FA4 versions that normalize KV block sizes can exercise the original `(256, 256)` repro directly.
+
+## Repro Script
+
+<details>
+<summary>Repro Script</summary>
+
+```python
+from functools import partial
+import math
+
+import torch
+from torch.nn.attention.flex_attention import BlockMask, flex_attention
+
+def run(name, fn, q, k, v, block_mask, ref):
+    try:
+        out = fn(q, k, v, block_mask=block_mask)
+        torch.cuda.synchronize()
+        diff = (out.float() - ref.float()).abs()
+        ok = torch.allclose(out, ref, atol=5e-2, rtol=5e-2)
+        print(f"{name}: ok={ok} max={diff.max().item():.6f} mean={diff.mean().item():.6f}")
+    except Exception as exc:
+        print(f"{name}: ERROR {type(exc).__name__}: {str(exc).splitlines()[0]}")
+
+def main():
+    print("torch", torch.__version__)
+    print("device", torch.cuda.get_device_name(), torch.cuda.get_device_capability())
+
+    torch.manual_seed(0)
+    batch, heads, q_blocks, kv_blocks, block_size, head_dim, top_k = 1, 2, 4, 4, 256, 128, 2
+    q = torch.randn(batch, heads, q_blocks * block_size, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch, heads, kv_blocks * block_size, head_dim, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(batch, heads, kv_blocks * block_size, head_dim, device="cuda", dtype=torch.bfloat16)
+
+    selected = torch.tensor(
+        [[[[0, 2], [1, 3], [0, 3], [2, 3]], [[0, 2], [1, 3], [0, 3], [2, 3]]]],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    num_blocks = torch.full(selected.shape[:-1], top_k, device="cuda", dtype=torch.int32)
+    zero_num_blocks = torch.zeros_like(num_blocks)
+    zero_indices = torch.zeros(*selected.shape[:-1], kv_blocks, device="cuda", dtype=torch.int32)
+    full_indices = torch.zeros_like(zero_indices)
+    full_indices[..., :top_k] = selected
+
+    block_map = torch.zeros(batch, heads, q_blocks, kv_blocks, device="cuda", dtype=torch.bool)
+    block_map.scatter_(-1, selected.long(), True)
+    dense_mask = block_map.repeat_interleave(block_size, -2).repeat_interleave(block_size, -1)
+    ref = torch.softmax((q @ k.transpose(-2, -1) / math.sqrt(head_dim)).masked_fill(~dense_mask, -float("inf")), dim=-1) @ v
+
+    full_metadata_only = BlockMask.from_kv_blocks(
+        kv_num_blocks=zero_num_blocks,
+        kv_indices=zero_indices,
+        full_kv_num_blocks=num_blocks,
+        full_kv_indices=full_indices,
+        BLOCK_SIZE=block_size,
+        seq_lengths=(q_blocks * block_size, kv_blocks * block_size),
+    )
+
+    partial_metadata_only = BlockMask.from_kv_blocks(
+        kv_num_blocks=num_blocks,
+        kv_indices=full_indices,
+        BLOCK_SIZE=block_size,
+        seq_lengths=(q_blocks * block_size, kv_blocks * block_size),
+    )
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        return block_map[b, h, q_idx // block_size, kv_idx // block_size]
+
+    full_metadata_with_mask_mod = BlockMask.from_kv_blocks(
+        kv_num_blocks=zero_num_blocks,
+        kv_indices=zero_indices,
+        full_kv_num_blocks=num_blocks,
+        full_kv_indices=full_indices,
+        BLOCK_SIZE=block_size,
+        seq_lengths=(q_blocks * block_size, kv_blocks * block_size),
+        mask_mod=mask_mod,
+    )
+
+    triton = torch.compile(partial(flex_attention, kernel_options={"BACKEND": "TRITON"}), dynamic=False)
+    flash = torch.compile(partial(flex_attention, kernel_options={"BACKEND": "FLASH"}), dynamic=False)
+
+    print("dense block mask")
+    print(full_metadata_only.to_dense().cpu())
+    run("TRITON full_kv metadata only", triton, q, k, v, full_metadata_only, ref)
+    run("FLASH full_kv metadata only", flash, q, k, v, full_metadata_only, ref)
+    run("TRITON partial kv metadata only", triton, q, k, v, partial_metadata_only, ref)
+    run("FLASH partial kv metadata only", flash, q, k, v, partial_metadata_only, ref)
+    run("TRITON full_kv metadata + mask_mod", triton, q, k, v, full_metadata_with_mask_mod, ref)
+    run("FLASH full_kv metadata + mask_mod", flash, q, k, v, full_metadata_with_mask_mod, ref)
+
+if __name__ == "__main__":
+    main()
+```
+
+Output after the fix:
+
+```text
+torch 2.14.0a0+git2f596e8
+device NVIDIA GB200 (10, 0)
+dense block mask
+tensor([[[[1, 0, 1, 0],
+          [0, 1, 0, 1],
+          [1, 0, 0, 1],
+          [0, 0, 1, 1]],
+
+         [[1, 0, 1, 0],
+          [0, 1, 0, 1],
+          [1, 0, 0, 1],
+          [0, 0, 1, 1]]]], dtype=torch.int32)
+TRITON full_kv metadata only: ok=True max=0.005859 mean=0.000308
+FLASH full_kv metadata only: ok=True max=0.005859 mean=0.000309
+TRITON partial kv metadata only: ok=True max=0.005859 mean=0.000308
+FLASH partial kv metadata only: ok=True max=0.005859 mean=0.000309
+TRITON full_kv metadata + mask_mod: ok=True max=0.005859 mean=0.000308
+FLASH full_kv metadata + mask_mod: ok=True max=0.005859 mean=0.000309
+```
+
+The FA4 package also prints repeated deprecation warnings from `nvidia_cutlass_dsl`; they do not affect correctness and are omitted above.
+
+</details>
+
+## Test results
+
+Behavioral validation:
+
+```bash
+TORCHINDUCTOR_COMPILE_THREADS=1 ~/.ptq_workspace/jobs/20260626-pytorch-188322/.venv/bin/python ~/.ptq_workspace/jobs/20260626-pytorch-188322/repro.py
+```
+
+Result: all TRITON and FLASH cases matched the dense masked reference.
+
+Dense no-block-mask smoke check:
+
+```bash
+~/.ptq_workspace/jobs/20260626-pytorch-188322/.venv/bin/python - <<'PY'
+from functools import partial
+import torch
+from torch.nn.attention.flex_attention import flex_attention
+
+q = torch.randn(1, 1, 128, 64, device="cuda", dtype=torch.bfloat16)
+k = torch.randn(1, 1, 128, 64, device="cuda", dtype=torch.bfloat16)
+v = torch.randn(1, 1, 128, 64, device="cuda", dtype=torch.bfloat16)
+fn = torch.compile(partial(flex_attention, kernel_options={"BACKEND": "FLASH"}), dynamic=False)
+out = fn(q, k, v)
+torch.cuda.synchronize()
+ref = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+print(torch.allclose(out, ref, atol=5e-2, rtol=5e-2), (out.float() - ref.float()).abs().max().item())
+PY
+```
+
+Result: passed (`True`, max difference `0.001953125`).
+
+```bash
+cd ~/.ptq_workspace/jobs/20260626-pytorch-188322/pytorch && TORCHINDUCTOR_COMPILE_THREADS=1 ~/.ptq_workspace/jobs/20260626-pytorch-188322/.venv/bin/python test/inductor/test_flex_attention.py -k test_flex_flash_honors_sparse_metadata_with_trivial_mask_cuda
+```
+
+Result: passed (`Ran 1 test ... OK`).
+
+Quick performance sanity using transformer-nuggets:
+
+```bash
+cd ~/.ptq_workspace/jobs/20260626-pytorch-188322/pytorch && TORCHINDUCTOR_COMPILE_THREADS=1 ~/.ptq_workspace/jobs/20260626-pytorch-188322/.venv/bin/python agent_space/flex_flash_perf.py
+```
+
+Measurement contract: steady-state `torch.compile` calls with compile excluded, `transformer_nuggets.utils.benchmark.benchmark_cuda_function_stats`, 50 measured iterations and 20 warmup iterations, B=1, H=2, Q=KV=1024, D=128, bf16, Flex sparse block size 256, 50% sparse. Median timings on GB200:
+
+```text
+triton_full_metadata: 97.47 us
+flash_full_metadata: 376.46 us
+flash_partial_metadata: 324.43 us
+flash_full_metadata_mask_mod: 392.61 us
+```
+
+All perf cases passed the dense-reference correctness check. For this small repro shape, FA4 block-sparse FLASH is slower than the Triton path.
+
+Follow-up FLASH-only overhead check for the likely regression surface:
+
+Measurement contract: current code, steady-state compiled FlexAttention FLASH, compile excluded, transformer-nuggets `benchmark_cuda_function_stats`, 40 measured iterations and 20 warmup iterations, B=1, H=2, Q=KV=1024, D=128, bf16, Flex sparse block size 256. Median timings on GB200:
+
+```text
+flash_no_block_mask: 191.84 us
+flash_explicit_dense_full_metadata: 441.31 us
+flash_explicit_dense_partial_metadata: 368.13 us
+flash_sparse_full_metadata: 407.55 us
+```
+
+The no-`block_mask` path still skips FA4 block-sparse tensors and should be unchanged by the patch. Explicit dense real `BlockMask` metadata now pays FA4 block-sparse overhead; before this fix, metadata-only cases would have run the dense FA4 path and ignored the metadata.
+
+Prerequisite checks:
+
+```bash
+cd ~/.ptq_workspace/jobs/20260626-pytorch-188322/pytorch && git diff --check
+```
+
+Result: passed.
+
+```bash
+cd ~/.ptq_workspace/jobs/20260626-pytorch-188322/pytorch && spin fixlint
+```
+
+Result: formatting patches were applied to the touched Python files and the Python linters reported no issues, but the overall command exited nonzero due to pre-existing shellcheck findings in unrelated CI shell scripts (`.circleci/scripts/binary_populate_env.sh` and `.ci/pytorch/test.sh`).
+
+Fixes #188322
+
+<details>
+<summary>Repro Script</summary>
+
+```python
+from functools import partial
+import math
+
+import torch
+from torch.nn.attention.flex_attention import BlockMask, flex_attention
+
+def run(name, fn, q, k, v, block_mask, ref):
+    try:
+        out = fn(q, k, v, block_mask=block_mask)
+        torch.cuda.synchronize()
+        diff = (out.float() - ref.float()).abs()
+        ok = torch.allclose(out, ref, atol=5e-2, rtol=5e-2)
+        print(f"{name}: ok={ok} max={diff.max().item():.6f} mean={diff.mean().item():.6f}")
+    except Exception as exc:
+        print(f"{name}: ERROR {type(exc).__name__}: {str(exc).splitlines()[0]}")
+
+def main():
+    print("torch", torch.__version__)
+    print("device", torch.cuda.get_device_name(), torch.cuda.get_device_capability())
+
+    torch.manual_seed(0)
+    batch, heads, q_blocks, kv_blocks, block_size, head_dim, top_k = 1, 2, 4, 4, 256, 128, 2
+    q = torch.randn(batch, heads, q_blocks * block_size, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch, heads, kv_blocks * block_size, head_dim, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(batch, heads, kv_blocks * block_size, head_dim, device="cuda", dtype=torch.bfloat16)
+
+    selected = torch.tensor(
+        [[[[0, 2], [1, 3], [0, 3], [2, 3]], [[0, 2], [1, 3], [0, 3], [2, 3]]]],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    num_blocks = torch.full(selected.shape[:-1], top_k, device="cuda", dtype=torch.int32)
+    zero_num_blocks = torch.zeros_like(num_blocks)
+    zero_indices = torch.zeros(*selected.shape[:-1], kv_blocks, device="cuda", dtype=torch.int32)
+    full_indices = torch.zeros_like(zero_indices)
+    full_indices[..., :top_k] = selected
+
+    block_map = torch.zeros(batch, heads, q_blocks, kv_blocks, device="cuda", dtype=torch.bool)
+    block_map.scatter_(-1, selected.long(), True)
+    dense_mask = block_map.repeat_interleave(block_size, -2).repeat_interleave(block_size, -1)
+    ref = torch.softmax((q @ k.transpose(-2, -1) / math.sqrt(head_dim)).masked_fill(~dense_mask, -float("inf")), dim=-1) @ v
+
+    full_metadata_only = BlockMask.from_kv_blocks(
+        kv_num_blocks=zero_num_blocks,
+        kv_indices=zero_indices,
+        full_kv_num_blocks=num_blocks,
+        full_kv_indices=full_indices,
+        BLOCK_SIZE=block_size,
+        seq_lengths=(q_blocks * block_size, kv_blocks * block_size),
+    )
+
+    partial_metadata_only = BlockMask.from_kv_blocks(
+        kv_num_blocks=num_blocks,
+        kv_indices=full_indices,
+        BLOCK_SIZE=block_size,
+        seq_lengths=(q_blocks * block_size, kv_blocks * block_size),
+    )
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        return block_map[b, h, q_idx // block_size, kv_idx // block_size]
+
+    full_metadata_with_mask_mod = BlockMask.from_kv_blocks(
+        kv_num_blocks=zero_num_blocks,
+        kv_indices=zero_indices,
+        full_kv_num_blocks=num_blocks,
+        full_kv_indices=full_indices,
+        BLOCK_SIZE=block_size,
+        seq_lengths=(q_blocks * block_size, kv_blocks * block_size),
+        mask_mod=mask_mod,
+    )
+
+    triton = torch.compile(partial(flex_attention, kernel_options={"BACKEND": "TRITON"}), dynamic=False)
+    flash = torch.compile(partial(flex_attention, kernel_options={"BACKEND": "FLASH"}), dynamic=False)
+
+    print("dense block mask")
+    print(full_metadata_only.to_dense().cpu())
+    run("TRITON full_kv metadata only", triton, q, k, v, full_metadata_only, ref)
+    run("FLASH full_kv metadata only", flash, q, k, v, full_metadata_only, ref)
+    run("TRITON partial kv metadata only", triton, q, k, v, partial_metadata_only, ref)
+    run("FLASH partial kv metadata only", flash, q, k, v, partial_metadata_only, ref)
+    run("TRITON full_kv metadata + mask_mod", triton, q, k, v, full_metadata_with_mask_mod, ref)
+    run("FLASH full_kv metadata + mask_mod", flash, q, k, v, full_metadata_with_mask_mod, ref)
+
+if __name__ == "__main__":
+    main()
+```
+
+</details>
+
+<details>
+<summary>Agent Worklog</summary>
+
+## Run 1
+
+### Repro blocked by missing CuTe FLASH package
+Ran `~/.ptq_workspace/jobs/20260626-pytorch-188322/.venv/bin/python ~/.ptq_workspace/jobs/20260626-pytorch-188322/repro.py`. TRITON cases matched the reference, but every `BACKEND="FLASH"` case failed before execution with `CUTE flash attention library is not available`. A follow-up import check found no `flash_attn`, `flash_attn_4`, or `cutlass` package in the job venv. Per the PTQ instructions, I did not attempt a source fix because the reported FLASH correctness failure cannot be reproduced in this environment.
+
+### Rechecked after external install attempt
+After the user reported installing `flash-attn-4`, reran the repro with the required job Python. FLASH still failed with `CUTE flash attention library is not available`. Checked package metadata from the same interpreter: `flash-attn-4`, `nvidia-cutlass-dsl`, `nvidia-cutlass-dsl-libs-cu13`, `cuda-python`, and `cuda-bindings` all report `NOT INSTALLED`, and imports for `flash_attn`, `flash_attn_4`, `flash_attn_interface`, `cutlass`, and `cuda` are unavailable. The install appears to have landed outside this job venv.
+
+### Diagnosed `bpython` environment confusion
+Checked activation from the job directory with `source .venv/bin/activate`. `python` resolves to `/home/drisspg/.ptq_workspace/jobs/20260626-pytorch-188322/.venv/bin/python`, but `bpython` resolves to `/home/drisspg/.venvs/nightly/bin/bpython` because the PTQ venv has no `.venv/bin/bpython`. That explains why importing `flash_attn.cute` in `bpython` can succeed while the required PTQ interpreter still cannot see it.
+
+### Diagnosed `pip` wrapper mismatch
+Checked activation and executable resolution from the job directory. `python` resolves to the job venv Python 3.12.13, and `command -v pip` resolves to `.venv/bin/pip`; however `.venv/bin/pip` has a shebang pointing at `/home/drisspg/.ptq_workspace/.venv/bin/python`. Therefore running bare `pip install` after activation installs through the parent PTQ workspace venv, not the job venv. The correct diagnostic/install target, if performed outside this agent, is the explicit job interpreter: `/home/drisspg/.ptq_workspace/jobs/20260626-pytorch-188322/.venv/bin/python -m pip ...`.
+
+### Reproduced FLASH correctness failure after job-venv install
+After the user installed `flash-attn-4` with the explicit job interpreter, verified the package is visible from `/home/drisspg/.ptq_workspace/jobs/20260626-pytorch-188322/.venv/bin/python`. Reran `repro.py`; TRITON cases passed, while FLASH metadata-only cases reproduced the reported wrong output (`ok=False max=0.258789 mean=0.040552`). The nontrivial mask_mod case initially hit FA4's sparse KV tile-size check because the BlockMask used 256-wide KV blocks while FA4's SM100 sparse tile is 128.
+
+### Patched Flex FLASH sparse metadata handling
+Updated `torch/_inductor/kernel/flex/flex_flash_attention.py` and the `flash_attention.py.jinja` template. The lowering now treats sparse BlockMask metadata as sufficient to enable FA4 block-sparse tensors even when `mask_mod` is trivial, separates `HAS_MASK_MOD` from `NEEDS_BLOCK_MASK`, supports metadata without `full_kv_*` by synthesizing zero full-block tensors, and splits larger Flex KV sparse blocks into FA4 tile-sized KV blocks on SM100/SM110. Reran the original repro with `TORCHINDUCTOR_COMPILE_THREADS=1`; all TRITON and FLASH cases now match the dense reference.
+
+### Added regression test and lint check
+Added `TestFlexAttention.test_flex_flash_honors_sparse_metadata_with_trivial_mask`, covering both `full_kv_*` metadata-only and `kv_*` metadata-only BlockMasks with 256-wide Flex sparse KV blocks on SM100+. The targeted CUDA test passes with the job Python. Ran `spin fixlint`; it applied formatting to the touched Python files and then failed on pre-existing shellcheck findings in unrelated CI shell scripts (`.circleci/scripts/binary_populate_env.sh`, `.ci/pytorch/test.sh`). `git diff --check` passes.
+
+### Simplified block-sparse decision
+Replaced the shape/symbolic sparse-metadata heuristic with the simpler rule discussed with the user: pass adapted FA4 block-sparse metadata for every real BlockMask, and skip it only for FlexAttention's synthetic dense no-op BlockMask (`BLOCK_SIZE=(1 << 30, 1 << 30)` with no full-block metadata). Reran the original repro, a dense FLASH no-block-mask smoke check, and the targeted regression test; all passed. Reran `spin fixlint`; it still fails only on the same unrelated pre-existing shellcheck findings, while Python lint reports no issues.
+
+### Quick transformer-nuggets perf sanity
+Used `transformer_nuggets.utils.benchmark.benchmark_cuda_function_stats` in `pytorch/agent_space/flex_flash_perf.py` on the repro shape (B=1, H=2, Q=KV=1024, D=128, bf16, sparse block 256, 50% sparse). Compile was excluded; timing measured steady-state compiled calls with 50 reps and 20 warmup iterations. All cases passed correctness. Median timings: TRITON full metadata 97.47 us, FLASH full metadata 376.46 us, FLASH partial metadata 324.43 us, FLASH full metadata + mask_mod 392.61 us. On this small shape, FA4 block-sparse FLASH is slower than the Triton path; the fix is correctness-oriented for this repro and does not show a small-shape speedup.
+
+### Checked dense/no-block-mask FLASH overhead
+Ran a focused transformer-nuggets timing for the possible regression surface: current FLASH no `block_mask` versus explicit dense `BlockMask` metadata on the same B=1,H=2,Q=KV=1024,D=128,bf16 shape. Compile was excluded, 40 reps/20 warmup. No-block-mask FLASH (synthetic no-op BlockMask, still skipped by the patch) was 191.84 us. Explicit dense full metadata was 441.31 us (2.30x latency), explicit dense partial metadata was 368.13 us (1.92x), and sparse full metadata was 407.55 us (2.12x). This means the patch should not slow ordinary `block_mask=None` FLASH, but explicit dense/real BlockMask metadata now pays FA4 block-sparse overhead where the old buggy lowering would have run dense and ignored metadata.
+
+### Removed PyTorch-side KV block splitting
+The user pointed out that KV block expansion/alignment belongs in FA4. Checked the installed package: this job has `flash-attn-4==4.0.0b19`. Its `block_sparsity.py` supports Q-side `q_subtile_factor` and broadcast shape expansion, but still rejects `sparse_block_size[1] != tile_n`; the original 256x256 repro now fails locally with `Block sparsity requires sparse_block_size[1]=128 to match tile_n` if PyTorch does not split KV metadata. Removed `_expand_flex_flash_kv_blocks` and the `FLASH_SPARSE_KV_BLOCK_SIZE` template plumbing anyway, so PyTorch only packages BlockMask metadata and leaves KV normalization to FA4. Adjusted the regression test to use `BLOCK_SIZE=(256, 128)`, which matches FA4 b19's SM100 requirements while still covering the metadata-only/trivial-mask bug. The targeted CUDA regression test passes in this local environment.
+
+### Collapsed helpers and tightened no-op detection
+Dropped the now-redundant `_create_flex_flash_block_sparse_tensors` and `_is_flex_flash_noop_block_mask` helpers. The template now builds `BlockSparseTensorsTorch` inline using `KV_NUM_BLKS.new_zeros(...)` / `KV_IDX.new_zeros(...)` to synthesize empty full-block tensors when needed. `is_noop_block_mask` is now `not has_full_blocks and V.graph.sizevars.statically_known_true(sympy.And(sympy.Eq(sparse_q_block_size, 1 << 30), sympy.Eq(sparse_kv_block_size, 1 << 30)))`, which conservatively returns False (i.e., assumes we need block-sparse metadata) when the block sizes are not statically known (unbacked symints). Moved `guard_int` for the sparse block sizes below the no-op check so it does not specialize symbolic values before they are checked. Reran the targeted regression test and a dense no-block-mask FLASH smoke check; both pass.
+
+</details>
+
+---
+*This PR was generated by [ptq](https://github.com/drisspg/pt_job_queue) with human review.*
+
+Pull Request resolved: https://github.com/pytorch/pytorch/pull/188484
+Approved by: https://github.com/liangel-02
+---
+ test/inductor/test_flex_attention.py          | 108 ++++++++++++++++++
+ .../kernel/flex/flex_flash_attention.py       |  50 +++++---
+ .../flex/templates/flash_attention.py.jinja   |  21 +++-
+ 3 files changed, 157 insertions(+), 22 deletions(-)
+
+diff --git a/test/inductor/test_flex_attention.py b/test/inductor/test_flex_attention.py
+index 93fe9594f40cd..9edf12c09386d 100644
+--- a/test/inductor/test_flex_attention.py
++++ b/test/inductor/test_flex_attention.py
+@@ -3,6 +3,7 @@
+ import functools
+ import gc
+ import json
++import math
+ import os
+ import random
+ import string
+@@ -4621,6 +4622,113 @@ def mask_mod(b, h, q, kv):
+                 },
+             )
+ 
++    @supported_platform
++    @skip_on_cpu
++    @skip_on_mps
++    @skip_on_xpu
++    def test_flex_flash_honors_sparse_metadata_with_trivial_mask(self, device):
++        """FLASH should honor BlockMask metadata without relying on mask_mod."""
++        from torch._inductor.kernel.flex.flex_flash_attention import (
++            ensure_flash_available,
++        )
++
++        if not ensure_flash_available():
++            self.skipTest("flash-attn-4 is not available")
++        if torch.cuda.get_device_capability(device)[0] not in (10, 11):
++            self.skipTest("FA4 sparse block path in this test targets SM100+")
++
++        torch.manual_seed(0)
++        batch = 1
++        heads = 1
++        q_blocks = 2
++        kv_blocks = 2
++        q_block_size = 256
++        kv_block_size = 128
++        head_dim = 128
++        top_k = 1
++        q = torch.randn(
++            batch,
++            heads,
++            q_blocks * q_block_size,
++            head_dim,
++            device=device,
++            dtype=torch.bfloat16,
++        )
++        k = torch.randn(
++            batch,
++            heads,
++            kv_blocks * kv_block_size,
++            head_dim,
++            device=device,
++            dtype=torch.bfloat16,
++        )
++        v = torch.randn(
++            batch,
++            heads,
++            kv_blocks * kv_block_size,
++            head_dim,
++            device=device,
++            dtype=torch.bfloat16,
++        )
++
++        selected = torch.tensor(
++            [[[[0], [1]]]],
++            device=device,
++            dtype=torch.int32,
++        )
++        num_blocks = torch.full(
++            selected.shape[:-1], top_k, device=device, dtype=torch.int32
++        )
++        zero_num_blocks = torch.zeros_like(num_blocks)
++        zero_indices = torch.zeros(
++            *selected.shape[:-1], kv_blocks, device=device, dtype=torch.int32
++        )
++        sparse_indices = torch.zeros_like(zero_indices)
++        sparse_indices[..., :top_k] = selected
++
++        block_map = torch.zeros(
++            batch, heads, q_blocks, kv_blocks, device=device, dtype=torch.bool
++        )
++        block_map.scatter_(-1, selected.long(), True)
++        dense_mask = block_map.repeat_interleave(q_block_size, -2).repeat_interleave(
++            kv_block_size, -1
++        )
++        ref = (
++            torch.softmax(
++                (q @ k.transpose(-2, -1) / math.sqrt(head_dim)).masked_fill(
++                    ~dense_mask, -float("inf")
++                ),
++                dim=-1,
++            )
++            @ v
++        )
++
++        block_masks = {
++            "full": BlockMask.from_kv_blocks(
++                kv_num_blocks=zero_num_blocks,
++                kv_indices=zero_indices,
++                full_kv_num_blocks=num_blocks,
++                full_kv_indices=sparse_indices,
++                BLOCK_SIZE=(q_block_size, kv_block_size),
++                seq_lengths=(q_blocks * q_block_size, kv_blocks * kv_block_size),
++            ),
++            "partial": BlockMask.from_kv_blocks(
++                kv_num_blocks=num_blocks,
++                kv_indices=sparse_indices,
++                BLOCK_SIZE=(q_block_size, kv_block_size),
++                seq_lengths=(q_blocks * q_block_size, kv_blocks * kv_block_size),
++            ),
++        }
++        flash = torch.compile(
++            functools.partial(flex_attention, kernel_options={"BACKEND": "FLASH"}),
++            dynamic=False,
++        )
++        for name, block_mask in block_masks.items():
++            with self.subTest(name=name):
++                out = flash(q, k, v, block_mask=block_mask)
++                torch.cuda.synchronize()
++                self.assertEqual(out, ref, atol=5e-2, rtol=5e-2)
++
+     @supported_platform
+     @skip_on_cpu
+     @skip_on_mps
+diff --git a/torch/_inductor/kernel/flex/flex_flash_attention.py b/torch/_inductor/kernel/flex/flex_flash_attention.py
+index e1e1e1bb45bea..7ca5b8fe3d249 100644
+--- a/torch/_inductor/kernel/flex/flex_flash_attention.py
++++ b/torch/_inductor/kernel/flex/flex_flash_attention.py
+@@ -465,37 +465,44 @@ def create_flex_flash_attention_kernel(
+         stride=[sympy.sympify(s) for s in output.get_stride()],
+     )
+ 
+-    sparse_q_block_size = V.graph.sizevars.guard_int(sparse_q_block_size)
+-    sparse_kv_block_size = V.graph.sizevars.guard_int(sparse_kv_block_size)
+-
+     mask_graph_is_trivial = is_trivial_mask_graph(mask_graph.graph_module)
+     score_graph_is_trivial = subgraph is None or is_trivial_score_graph(
+         subgraph.graph_module
+     )
+ 
+-    needs_block_mask = not mask_graph_is_trivial
++    if kv_num_blocks is None or kv_indices is None:
++        raise AssertionError("kv block metadata is required for flex FLASH")
++
+     has_score_mod = not score_graph_is_trivial
++    has_mask_mod = not mask_graph_is_trivial
+     has_full_blocks = full_kv_num_blocks is not None
++    if has_full_blocks and full_kv_indices is None:
++        raise AssertionError("full_kv_indices must be provided with full_kv_num_blocks")
++    is_noop_block_mask = not has_full_blocks and V.graph.sizevars.statically_known_true(
++        sympy.And(
++            sympy.Eq(sparse_q_block_size, 1 << 30),
++            sympy.Eq(sparse_kv_block_size, 1 << 30),
++        )
++    )
++    needs_block_mask = not (mask_graph_is_trivial and is_noop_block_mask)
++    sparse_q_block_size = V.graph.sizevars.guard_int(sparse_q_block_size)
++    sparse_kv_block_size = V.graph.sizevars.guard_int(sparse_kv_block_size)
+ 
+     choices: list[Any] = []
+     if flash_attention_cutedsl_template is None:
+         raise AssertionError("flash_attention_cutedsl_template must not be None")
+ 
+     input_nodes = [query, key, value, lse]
+-    if has_full_blocks:
+-        input_nodes.extend(
+-            [kv_num_blocks, kv_indices, full_kv_num_blocks, full_kv_indices]
+-        )
+-
+-    if needs_block_mask and not has_full_blocks:
+-        raise NotImplementedError(
+-            "Flash attention with block mask but without full blocks is not supported yet"
+-        )
++    if needs_block_mask:
++        input_nodes.extend([kv_num_blocks, kv_indices])
++        if has_full_blocks:
++            input_nodes.extend([full_kv_num_blocks, full_kv_indices])
+ 
+     subgraphs = []
+     if has_score_mod:
+         subgraphs.append(subgraph_buffer)
+-    subgraphs.append(mask_graph_buffer)
++    if has_mask_mod:
++        subgraphs.append(mask_graph_buffer)
+ 
+     aux_scalar_symbols = collect_aux_scalar_symbols(
+         score_mod_other_buffers, mask_mod_other_buffers
+@@ -520,7 +527,7 @@ def create_flex_flash_attention_kernel(
+             subgraph.graph_module if has_score_mod and subgraph is not None else None
+         ),
+         score_mod_other_buffers=score_mod_other_buffers,
+-        has_mask_mod=needs_block_mask,
++        has_mask_mod=has_mask_mod,
+         has_mask_aux_tensors=has_mask_aux_tensors,
+         mask_mod_graph_module=mask_graph.graph_module,
+         mask_mod_other_buffers=mask_mod_other_buffers,
+@@ -543,6 +550,8 @@ def create_flex_flash_attention_kernel(
+                 MASK_MOD_OTHER_BUFFERS=mask_mod_other_buffers,
+                 AUX_SCALAR_SYMBOLS=aux_scalar_symbols,
+                 NEEDS_BLOCK_MASK=needs_block_mask,
++                HAS_MASK_MOD=has_mask_mod,
++                HAS_FULL_BLOCKS=has_full_blocks,
+                 SPARSE_Q_BLOCK_SIZE=sparse_q_block_size,
+                 SPARSE_KV_BLOCK_SIZE=sparse_kv_block_size,
+             )
+@@ -556,13 +565,18 @@ def create_flex_flash_attention_kernel(
+         raise RuntimeError(f"CuteDSL template failed: {error}")
+ 
+     input_gen_fns: dict[int, Callable] | None = None
+-    if has_full_blocks:
++    if needs_block_mask:
+         input_gen_fns = {
+             4: create_num_blocks_fake_generator(kv_indices),
+             5: create_indices_fake,
+-            6: create_num_blocks_fake_generator(full_kv_indices),
+-            7: create_indices_fake,
+         }
++        if has_full_blocks:
++            input_gen_fns.update(
++                {
++                    6: create_num_blocks_fake_generator(full_kv_indices),
++                    7: create_indices_fake,
++                }
++            )
+ 
+     template_output, _ = autotune_select_algorithm(
+         "flex_flash_attention",
+diff --git a/torch/_inductor/kernel/flex/templates/flash_attention.py.jinja b/torch/_inductor/kernel/flex/templates/flash_attention.py.jinja
+index b1020c42342fc..de849a8cd3ab4 100644
+--- a/torch/_inductor/kernel/flex/templates/flash_attention.py.jinja
++++ b/torch/_inductor/kernel/flex/templates/flash_attention.py.jinja
+@@ -1,10 +1,14 @@
+-{% if NEEDS_BLOCK_MASK %}
++{% if NEEDS_BLOCK_MASK and HAS_FULL_BLOCKS %}
+ {{def_kernel("Q", "K", "V", "LOGSUMEXP", "KV_NUM_BLKS", "KV_IDX", "FULL_KV_NUM_BLKS", "FULL_KV_IDX")}}
++{% elif NEEDS_BLOCK_MASK %}
++{{def_kernel("Q", "K", "V", "LOGSUMEXP", "KV_NUM_BLKS", "KV_IDX")}}
+ {% else %}
+ {{def_kernel("Q", "K", "V", "LOGSUMEXP")}}
+ {% endif %}
+     from flash_attn.cute.interface import _flash_attn_fwd
++    {% if NEEDS_BLOCK_MASK %}
+     from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
++    {% endif %}
+     {% if MASK_MOD_PACKED_INTERVALS is not none %}
+     import flash_attn.cute.utils as utils
+     {% endif %}
+@@ -56,7 +60,7 @@
+     output = {{get_output()}}
+     output_transposed = output.transpose(1, 2)
+ 
+-    {% if NEEDS_BLOCK_MASK %}
++    {% if HAS_MASK_MOD %}
+     {# mask_mod is subgraph 1 when HAS_SCORE_MOD, else subgraph 0 #}
+     {% set mask_subgraph_idx = 1 if HAS_SCORE_MOD else 0 %}
+     @cute.jit
+@@ -104,11 +108,20 @@
+     {% if MASK_MOD_VEC_SIZE %}
+     mask_mod.__vec_size__ = {{ MASK_MOD_VEC_SIZE }}
+     {% endif %}
+-    block_sparse_tensors = BlockSparseTensorsTorch(KV_NUM_BLKS, KV_IDX, FULL_KV_NUM_BLKS, FULL_KV_IDX, block_size=({{SPARSE_Q_BLOCK_SIZE}}, {{SPARSE_KV_BLOCK_SIZE}}))
+     {% else %}
+-    block_sparse_tensors = None
+     mask_mod = None
+     {% endif %}
++    {% if NEEDS_BLOCK_MASK %}
++    block_sparse_tensors = BlockSparseTensorsTorch(
++        KV_NUM_BLKS,
++        KV_IDX,
++        {% if HAS_FULL_BLOCKS %}FULL_KV_NUM_BLKS{% else %}KV_NUM_BLKS.new_zeros(KV_NUM_BLKS.shape){% endif %},
++        {% if HAS_FULL_BLOCKS %}FULL_KV_IDX{% else %}KV_IDX.new_zeros(KV_IDX.shape){% endif %},
++        block_size=({{SPARSE_Q_BLOCK_SIZE}}, {{SPARSE_KV_BLOCK_SIZE}}),
++    )
++    {% else %}
++    block_sparse_tensors = None
++    {% endif %}
+ 
+     # Collect any additional tensor buffers that were added during modifications
+     {% set tensor_buffers = get_tensor_buffers() -%}

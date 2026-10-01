@@ -1,0 +1,202 @@
+From 6975fbcdc992ce3813143ae9e19b224437f1a791 Mon Sep 17 00:00:00 2001
+From: Ben Vanik <ben.vanik@gmail.com>
+Date: Wed, 13 Apr 2022 09:18:30 -0700
+Subject: [PATCH] Splitting worker shutdown into request+join+deinit. This
+ ensures that all workers (and the poller) have exited and that no threads are
+ live by the time we go to deinitialize their data structures.
+
+---
+ iree/task/executor.c | 21 ++++++++++++++-------
+ iree/task/poller.c   | 24 +++++++++++++++---------
+ iree/task/poller.h   | 20 ++++++++++++++------
+ iree/task/worker.c   | 24 +++++++++++++++---------
+ iree/task/worker.h   | 18 ++++++++++++++----
+ 5 files changed, 72 insertions(+), 35 deletions(-)
+
+diff --git a/iree/task/executor.c b/iree/task/executor.c
+index 506b7fa3675b..dc6859590163 100644
+--- a/iree/task/executor.c
++++ b/iree/task/executor.c
+@@ -182,19 +182,26 @@ static void iree_task_executor_destroy(iree_task_executor_t* executor) {
+     iree_task_worker_request_exit(worker);
+   }
+ 
+-  // Also ask the poller to exit - it'll wake from any wait it's in and abort
+-  // all the remaining waits.
++  // Also ask the poller to exit - it'll wake from any system waits it's in and
++  // abort all the remaining waits.
+   iree_task_poller_request_exit(&executor->poller);
+ 
+-  // Now that all workers should be in the process of exiting we can join with
+-  // them. Some may take longer than others to exit but that's fine as we can't
+-  // return from here until they do anyway.
++  // Now that all workers and the poller should be in the process of exiting we
++  // can join with them. Some may take longer than others to exit but that's
++  // fine as we can't return from here until they exit anyway.
+   for (iree_host_size_t i = 0; i < executor->worker_count; ++i) {
+     iree_task_worker_t* worker = &executor->workers[i];
+-    iree_task_worker_deinitialize(worker);
++    iree_task_worker_await_exit(worker);
+   }
++  iree_task_poller_await_exit(&executor->poller);
+ 
+-  // Once no more workers can possibly put work on the poller we can kill it.
++  // Tear down all workers and the poller now that no more threads are live.
++  // Any live threads may still be touching their own data structures or those
++  // of others (for example when trying to steal work).
++  for (iree_host_size_t i = 0; i < executor->worker_count; ++i) {
++    iree_task_worker_t* worker = &executor->workers[i];
++    iree_task_worker_deinitialize(worker);
++  }
+   iree_task_poller_deinitialize(&executor->poller);
+ 
+   iree_event_pool_free(executor->event_pool);
+diff --git a/iree/task/poller.c b/iree/task/poller.c
+index 5d21ed3b64e6..ee6465b7fc22 100644
+--- a/iree/task/poller.c
++++ b/iree/task/poller.c
+@@ -116,18 +116,24 @@ static bool iree_task_poller_is_zombie(iree_task_poller_t* poller) {
+          IREE_TASK_POLLER_STATE_ZOMBIE;
+ }
+ 
+-void iree_task_poller_deinitialize(iree_task_poller_t* poller) {
++void iree_task_poller_await_exit(iree_task_poller_t* poller) {
++  if (!poller->thread) return;
+   IREE_TRACE_ZONE_BEGIN(z0);
+ 
+-  // Wait for the thread to enter the zombie state indicating it has exited our
+-  // main function - it may still be live in the OS, but it'll not be touching
+-  // any of our data structures again so it's fine to blast away.
+   iree_task_poller_request_exit(poller);
+-  if (poller->thread) {
+-    iree_notification_await(&poller->state_notification,
+-                            (iree_condition_fn_t)iree_task_poller_is_zombie,
+-                            poller, iree_infinite_timeout());
+-  }
++  iree_notification_await(&poller->state_notification,
++                          (iree_condition_fn_t)iree_task_poller_is_zombie,
++                          poller, iree_infinite_timeout());
++
++  IREE_TRACE_ZONE_END(z0);
++}
++
++void iree_task_poller_deinitialize(iree_task_poller_t* poller) {
++  IREE_TRACE_ZONE_BEGIN(z0);
++
++  // Must have called request_exit/await_exit.
++  IREE_ASSERT_TRUE(iree_task_poller_is_zombie(poller));
++
+   iree_thread_release(poller->thread);
+   poller->thread = NULL;
+ 
+diff --git a/iree/task/poller.h b/iree/task/poller.h
+index 4d4e42ada7c4..86186827590d 100644
+--- a/iree/task/poller.h
++++ b/iree/task/poller.h
+@@ -111,18 +111,26 @@ iree_status_t iree_task_poller_initialize(
+     iree_thread_affinity_t ideal_thread_affinity,
+     iree_task_poller_t* out_poller);
+ 
+-// Deinitializes |poller| and joins with the wait thread.
+-// Any active waits will be aborted. May block.
+-// To reduce the potential for blocking issue an iree_task_poller_request_exit
+-// prior to deinitializing.
+-void iree_task_poller_deinitialize(iree_task_poller_t* poller);
+-
+ // Requests that the poller wait thread begin exiting (if it hasn't already).
+ // If the wait thread is in a syscall it will be woken as soon as possible.
+ //
+ // May be called from any thread. Any active waits will be aborted as possible.
+ void iree_task_poller_request_exit(iree_task_poller_t* poller);
+ 
++// Blocks the caller until |poller| has exited.
++//
++// May be called from any thread.
++void iree_task_poller_await_exit(iree_task_poller_t* poller);
++
++// Deinitializes |poller| after the thread has exited.
++// The poller must be in the IREE_TASK_POLLER_STATE_ZOMBIE state.
++//
++// Expected shutdown sequence:
++//  - request_exit
++//  - await_exit
++//  - deinitialize
++void iree_task_poller_deinitialize(iree_task_poller_t* poller);
++
+ // Enqueues |wait_tasks| on the poller and kicks the wait thread.
+ // The task pointers will be retained by the poller and must remain valid.
+ //
+diff --git a/iree/task/worker.c b/iree/task/worker.c
+index e0c4ea61cf42..d12e9a29ce47 100644
+--- a/iree/task/worker.c
++++ b/iree/task/worker.c
+@@ -114,18 +114,24 @@ static bool iree_task_worker_is_zombie(iree_task_worker_t* worker) {
+          IREE_TASK_WORKER_STATE_ZOMBIE;
+ }
+ 
+-void iree_task_worker_deinitialize(iree_task_worker_t* worker) {
++void iree_task_worker_await_exit(iree_task_worker_t* worker) {
++  if (!worker->thread) return;
+   IREE_TRACE_ZONE_BEGIN(z0);
+ 
+-  // Wait for the thread to enter the zombie state indicating it has exited our
+-  // main function - it may still be live in the OS, but it'll not be touching
+-  // any of our data structures again so it's fine to blast away.
+   iree_task_worker_request_exit(worker);
+-  if (worker->thread) {
+-    iree_notification_await(&worker->state_notification,
+-                            (iree_condition_fn_t)iree_task_worker_is_zombie,
+-                            worker, iree_infinite_timeout());
+-  }
++  iree_notification_await(&worker->state_notification,
++                          (iree_condition_fn_t)iree_task_worker_is_zombie,
++                          worker, iree_infinite_timeout());
++
++  IREE_TRACE_ZONE_END(z0);
++}
++
++void iree_task_worker_deinitialize(iree_task_worker_t* worker) {
++  IREE_TRACE_ZONE_BEGIN(z0);
++
++  // Must have called request_exit/await_exit.
++  IREE_ASSERT_TRUE(iree_task_worker_is_zombie(worker));
++
+   iree_thread_release(worker->thread);
+   worker->thread = NULL;
+ 
+diff --git a/iree/task/worker.h b/iree/task/worker.h
+index 6e6c43549535..6a7fc319ff22 100644
+--- a/iree/task/worker.h
++++ b/iree/task/worker.h
+@@ -161,10 +161,6 @@ iree_status_t iree_task_worker_initialize(
+     iree_byte_span_t local_memory, iree_prng_splitmix64_state_t* seed_prng,
+     iree_task_worker_t* out_worker);
+ 
+-// Deinitializes a worker that has successfully exited. The worker must be in
+-// the IREE_TASK_WORKER_STATE_ZOMBIE state.
+-void iree_task_worker_deinitialize(iree_task_worker_t* worker);
+-
+ // Requests that the worker begin exiting (if it hasn't already).
+ // If the worker is actively processing tasks it will wait until it has
+ // completed all it can and is about to go idle prior to exiting.
+@@ -172,6 +168,20 @@ void iree_task_worker_deinitialize(iree_task_worker_t* worker);
+ // May be called from any thread (including the worker thread).
+ void iree_task_worker_request_exit(iree_task_worker_t* worker);
+ 
++// Blocks the caller until |worker| has exited.
++//
++// May be called from any thread.
++void iree_task_worker_await_exit(iree_task_worker_t* worker);
++
++// Deinitializes a worker that has successfully exited.
++// The worker must be in the IREE_TASK_WORKER_STATE_ZOMBIE state.
++//
++// Expected shutdown sequence:
++//  - request_exit on all workers
++//  - await_exit on all workers
++//  - deinitialize all workers
++void iree_task_worker_deinitialize(iree_task_worker_t* worker);
++
+ // Posts a FIFO list of tasks to the worker mailbox. The target worker takes
+ // ownership of the tasks and will be woken if it is currently idle.
+ //

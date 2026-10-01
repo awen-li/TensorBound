@@ -1,0 +1,111 @@
+From e80c34d6246e6628544fe22746541e87b765a757 Mon Sep 17 00:00:00 2001
+From: lenamartens <lenamartens@google.com>
+Date: Mon, 7 Nov 2022 15:46:53 +0000
+Subject: [PATCH] Don't donate arguments in jit/pmap/pjit when debug_nans=True.
+
+---
+ jax/_src/api.py          |  6 ++++--
+ jax/experimental/pjit.py |  2 +-
+ tests/debug_nans_test.py | 41 +++++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 45 insertions(+), 4 deletions(-)
+
+diff --git a/jax/_src/api.py b/jax/_src/api.py
+index 51f1ae81ebf2..ae8f07a8e88c 100644
+--- a/jax/_src/api.py
++++ b/jax/_src/api.py
+@@ -413,7 +413,9 @@ def _prepare_jit(fun, static_argnums, static_argnames, donate_argnums,
+   f, args = argnums_partial_except(f, static_argnums, args, allow_invalid=True)
+   f, kwargs = argnames_partial_except(f, static_argnames, kwargs)
+   args_flat, in_tree = tree_flatten((args, kwargs))
+-  if donate_argnums:
++  # Argument donation is incompatible with jax_debug_nans because it re-uses
++  # donated buffers when rerunning the user's function.
++  if donate_argnums and not config.jax_debug_nans:
+     donated_invars = donation_vector(donate_argnums, args, kwargs)
+   else:
+     donated_invars = (False,) * len(args_flat)
+@@ -2042,7 +2044,7 @@ def _prepare_pmap(fun, in_axes, out_axes, static_broadcasted_tuple,
+     dyn_global_arg_shapes = global_arg_shapes
+   args, in_tree = tree_flatten((dyn_args, kwargs))
+ 
+-  if donate_tuple:
++  if donate_tuple and not config.jax_debug_nans:
+     donated_invars = donation_vector(donate_tuple, dyn_args, kwargs)
+   else:
+     donated_invars = (False,) * len(args)
+diff --git a/jax/experimental/pjit.py b/jax/experimental/pjit.py
+index 6ccd923e38d7..211c1247a70e 100644
+--- a/jax/experimental/pjit.py
++++ b/jax/experimental/pjit.py
+@@ -385,7 +385,7 @@ def infer_params(*args, _global_avals=False, **kwargs):
+ 
+     args_flat, in_tree = tree_flatten(dyn_args)
+     flat_fun, out_tree = flatten_fun_nokwargs(f, in_tree)
+-    if donate_argnums:
++    if donate_argnums and not config.jax_debug_nans:
+       donated_invars = donation_vector(donate_argnums, dyn_args, ())
+     else:
+       donated_invars = (False,) * len(args_flat)
+diff --git a/tests/debug_nans_test.py b/tests/debug_nans_test.py
+index 94a7ab84f6f9..60eaa7be2bd5 100644
+--- a/tests/debug_nans_test.py
++++ b/tests/debug_nans_test.py
+@@ -24,11 +24,12 @@
+ from jax._src import test_util as jtu
+ from jax import numpy as jnp
+ from jax.experimental import pjit
+-import jax._src.lib
++from jax._src.lib import xla_client
+ 
+ from jax.config import config
+ config.parse_flags_with_absl()
+ 
++xla_extension_version = getattr(xla_client, "_version", 0)
+ 
+ class DebugNaNsTest(jtu.JaxTestCase):
+ 
+@@ -158,6 +159,44 @@ def testPjit(self):
+         ans = f(jnp.array([0., 1.]))
+         ans.block_until_ready()
+ 
++  def testDebugNansJitWithDonation(self):
++    # https://github.com/google/jax/issues/12514
++    if jtu.device_under_test() == "cpu" and xla_extension_version < 102:
++      raise SkipTest("CPU buffer donation requires jaxlib > 0.3.22")
++
++    a = jnp.array(0.)
++    with self.assertRaises(FloatingPointError):
++      ans = jax.jit(lambda x: 0. / x, donate_argnums=(0,))(a)
++      ans.block_until_ready()
++
++  def testDebugNansPmapWithDonation(self):
++    if jtu.device_under_test() == "cpu" and xla_extension_version < 102:
++      raise SkipTest("CPU buffer donation requires jaxlib > 0.3.22")
++
++    a = jnp.zeros((1,))
++    with self.assertRaises(FloatingPointError):
++      ans = jax.pmap(lambda x: 0. / x, donate_argnums=(0,))(a)
++      ans.block_until_ready()
++
++  @jtu.ignore_warning(message=".*is an experimental.*")
++  def testDebugNansPjitWithDonation(self):
++    if jtu.device_under_test() == "cpu" and xla_extension_version < 102:
++      raise SkipTest("CPU buffer donation requires jaxlib > 0.3.22")
++
++    if jax.device_count() < 2:
++      raise SkipTest("test requires >=2 devices")
++
++    p = pjit.PartitionSpec('x')
++    f = pjit.pjit(lambda x: 0. / x,
++                  in_axis_resources=p,
++                  out_axis_resources=p,
++                  donate_argnums=(0,))
++
++    with jax.experimental.maps.Mesh(np.array(jax.local_devices()[:2]), ('x',)):
++      with self.assertRaises(FloatingPointError):
++        ans = f(jnp.array([0., 1.]))
++        ans.block_until_ready()
++
+   # TODO(skye): add parallel inf tests, ideally by factoring out test logic
+ 
+ class DebugInfsTest(jtu.JaxTestCase):

@@ -1,0 +1,289 @@
+From e298fb620b4ffc5e7e90d2f6200e9a25dcde5223 Mon Sep 17 00:00:00 2001
+From: Adrian Kuegel <akuegel@google.com>
+Date: Tue, 22 Sep 2026 04:28:16 -0700
+Subject: [PATCH] [XLA] Fix runtime variable ordering when composing indexing
+ maps
+
+ComposeIndexingMaps(first, second) orders symbols in the composed IndexingMap
+as [range_vars(second), range_vars(first), rt_vars(second), rt_vars(first)].
+However, both ComposeOperandIndexing and ComposeInstructionIndexing appended
+first's runtime variables before second's runtime variables, causing the
+runtime variable bindings to be rotated relative to the composed map's RTVar
+domains and affine expressions.
+
+Reorder the runtime variable lists in ComposeOperandIndexing and
+ComposeInstructionIndexing to place second's runtime variables before first's.
+
+PiperOrigin-RevId: 985904188
+---
+ .../dynamic_slice/dyn_slice_of_dyn_slice.hlo  |   4 +-
+ .../dyn_slice_of_dyn_slice_no_convert.hlo     |   4 +-
+ xla/codegen/tiling/symbolic_tile_analysis.cc  |  24 ++--
+ .../tiling/symbolic_tile_analysis_test.cc     |   4 +-
+ xla/hlo/analysis/indexing_analysis.cc         |   6 +-
+ xla/hlo/analysis/indexing_analysis_test.cc    | 103 +++++++++++++++++-
+ 6 files changed, 117 insertions(+), 28 deletions(-)
+
+diff --git a/xla/backends/gpu/codegen/triton/tests/dynamic_slice/dyn_slice_of_dyn_slice.hlo b/xla/backends/gpu/codegen/triton/tests/dynamic_slice/dyn_slice_of_dyn_slice.hlo
+index 0d043256e2e2c..246df4f03ead2 100644
+--- a/xla/backends/gpu/codegen/triton/tests/dynamic_slice/dyn_slice_of_dyn_slice.hlo
++++ b/xla/backends/gpu/codegen/triton/tests/dynamic_slice/dyn_slice_of_dyn_slice.hlo
+@@ -7,8 +7,6 @@
+ 
+ fusion {
+   p0 = f32[64] parameter(0)
+-  // Fun fact: if you remove this convert and pass s32 parameter directly to the
+-  // fusion, then the current emitter will generate incorrect code.
+   c0 = s32[64] convert(p0)
+   slice1 = s32[1] slice(c0), slice={[0:1]}
+   off = s32[] reshape(slice1)
+@@ -43,7 +41,7 @@ fusion {
+ // CHECK-NEW:         xtile.insert %{{.*}} into %[[ARG1]][%[[C0]]] [32] [{{.*}}] : tensor<32xi32> -> memref<10xi32>
+ // CHECK-NEW:         xtile.return
+ //
+-// CHECK-OLD-COUNT-3: arith.minsi
++// CHECK-OLD-COUNT-2: arith.minsi
+ 
+ ENTRY main {
+   p0 = f32[64] parameter(0)
+diff --git a/xla/backends/gpu/codegen/triton/tests/dynamic_slice/dyn_slice_of_dyn_slice_no_convert.hlo b/xla/backends/gpu/codegen/triton/tests/dynamic_slice/dyn_slice_of_dyn_slice_no_convert.hlo
+index 107507c3a22da..47de9a9b17eb2 100644
+--- a/xla/backends/gpu/codegen/triton/tests/dynamic_slice/dyn_slice_of_dyn_slice_no_convert.hlo
++++ b/xla/backends/gpu/codegen/triton/tests/dynamic_slice/dyn_slice_of_dyn_slice_no_convert.hlo
+@@ -1,5 +1,5 @@
+ // RUN: fusion_to_triton --xla_gpu_experimental_enable_tiling_propagation=false %s | FileCheck %s --check-prefixes=CHECK-OLD
+-// We do not run this test with the current emitter, because it generates incorrect code.
++// RUN: triton_test_correctness --xla_gpu_experimental_enable_tiling_propagation=false %s
+ 
+ // RUN: fusion_to_triton %s --xla_gpu_experimental_enable_tiling_propagation | FileCheck %s --check-prefixes=CHECK-NEW
+ // RUN: triton_test_correctness %s --xla_gpu_experimental_enable_tiling_propagation
+@@ -39,7 +39,7 @@ fusion {
+ // CHECK-NEW:         xtile.insert %[[EXTRACT2]] into %[[ARG1]][%[[C0]]] [32] [{{.*}}] : tensor<32xi32> -> memref<10xi32>
+ // CHECK-NEW:         xtile.return
+ //
+-// CHECK-OLD-COUNT-3: arith.minsi
++// CHECK-OLD-COUNT-2: arith.minsi
+ 
+ ENTRY main {
+   p0 = s32[64] parameter(0)
+diff --git a/xla/codegen/tiling/symbolic_tile_analysis.cc b/xla/codegen/tiling/symbolic_tile_analysis.cc
+index 2d900c30a6dad..771389ae7f89d 100644
+--- a/xla/codegen/tiling/symbolic_tile_analysis.cc
++++ b/xla/codegen/tiling/symbolic_tile_analysis.cc
+@@ -1114,21 +1114,10 @@ ComposeIndexingResult ComposeInstructionIndexing(
+   std::vector<SymbolicTiledHloInstruction*> rt_operands;
+   rt_operands.reserve(tiled_hlo_instruction->runtime_variables().size() +
+                       operand_indexing.runtime_variables().size());
+-  for (auto [i, rt] :
+-       llvm::enumerate(tiled_hlo_instruction->runtime_variables())) {
+-    size_t idx = i + range_vars_count;
+-    if (removed.size() > idx && removed[idx]) {
+-      continue;
+-    }
+-    VLOG(2) << "adding runtime variable from instruction " << rt;
+-    rt_operands.push_back(rt);
+-  }
+-
+   std::vector<SymbolicTiledHloInstruction*> new_instructions;
+   for (const auto& [i, rt_var] :
+        llvm::enumerate(operand_indexing.runtime_variables())) {
+-    size_t idx = i + tiled_hlo_instruction->runtime_variables().size() +
+-                 range_vars_count;
++    size_t idx = i + range_vars_count;
+     if (removed.size() > idx && removed[idx]) {
+       continue;
+     }
+@@ -1148,6 +1137,17 @@ ComposeIndexingResult ComposeInstructionIndexing(
+     }
+   }
+ 
++  for (auto [i, rt] :
++       llvm::enumerate(tiled_hlo_instruction->runtime_variables())) {
++    size_t idx =
++        i + operand_indexing.runtime_variables().size() + range_vars_count;
++    if (removed.size() > idx && removed[idx]) {
++      continue;
++    }
++    VLOG(2) << "adding runtime variable from instruction " << rt;
++    rt_operands.push_back(rt);
++  }
++
+   // Whenever a range variable is introduced in our indexing map, we have
+   // introduced a dimension that is collapsed in the output of the fusion.
+   // Such dimensions need to be tiled, so we need to map it to one of the
+diff --git a/xla/codegen/tiling/symbolic_tile_analysis_test.cc b/xla/codegen/tiling/symbolic_tile_analysis_test.cc
+index 37d2f34b9e3b2..7455623737992 100644
+--- a/xla/codegen/tiling/symbolic_tile_analysis_test.cc
++++ b/xla/codegen/tiling/symbolic_tile_analysis_test.cc
+@@ -1655,14 +1655,14 @@ ENTRY entry_computation {
+   )"));
+   EXPECT_THAT(convert->runtime_variables(), SizeIs(2));
+   const TiledHloInstruction* convert_rt0 = convert->runtime_variables()[0];
+-  EXPECT_EQ(convert_rt0->hlo()->name(), "off2");
++  EXPECT_EQ(convert_rt0->hlo()->name(), "off");
+   EXPECT_THAT(*convert_rt0, MatchTiledHloInstruction(
+                                 /*tile_sizes=*/{},
+                                 /*tile_strides=*/{},
+                                 /*tile_offsets_indexing=*/R"(
+     (pid_0) -> (), domain: pid_0 in [0, 9]
+   )"));
+-  EXPECT_EQ(convert->runtime_variables()[1]->hlo()->name(), "off");
++  EXPECT_EQ(convert->runtime_variables()[1]->hlo()->name(), "off2");
+ 
+   EXPECT_THAT(*off, MatchTiledHloInstruction(
+                         /*tile_sizes=*/{},
+diff --git a/xla/hlo/analysis/indexing_analysis.cc b/xla/hlo/analysis/indexing_analysis.cc
+index 3d5de91175f7b..96ae6f481e4fd 100644
+--- a/xla/hlo/analysis/indexing_analysis.cc
++++ b/xla/hlo/analysis/indexing_analysis.cc
+@@ -1912,14 +1912,14 @@ OperandIndexing ComposeOperandIndexing(const OperandIndexing& first,
+   std::vector<RuntimeVarIndexing> combined_runtime;
+   combined_runtime.reserve(first.runtime_variables().size() +
+                            second.runtime_variables().size());
+-  combined_runtime.insert(combined_runtime.end(),
+-                          first.runtime_variables().begin(),
+-                          first.runtime_variables().end());
+   for (const auto& rt_var : second.runtime_variables()) {
+     IndexingMap combined_map = ComposeIndexingMaps(first.map(), rt_var.map);
+     combined_runtime.push_back(
+         RuntimeVarIndexing{rt_var.instruction_ref, combined_map});
+   }
++  combined_runtime.insert(combined_runtime.end(),
++                          first.runtime_variables().begin(),
++                          first.runtime_variables().end());
+ 
+   std::optional<IndexingMap> replica_id_map;
+   if (first.replica_id_map().has_value()) {
+diff --git a/xla/hlo/analysis/indexing_analysis_test.cc b/xla/hlo/analysis/indexing_analysis_test.cc
+index ccbfd98273700..28fb8e989fd11 100644
+--- a/xla/hlo/analysis/indexing_analysis_test.cc
++++ b/xla/hlo/analysis/indexing_analysis_test.cc
+@@ -1653,11 +1653,7 @@ TEST_P(IndexingAnalysisTest, FusionOpWithDynSliceOfDynSlice) {
+         rt2 in [0, 25],
+         rt3 in [0, 16]
+       runtime variables:
+-        rt0: parameter(3); (d0, d1) -> (),
+-          domain: d0 in [0, 24], d1 in [0, 15]
+-        rt1: parameter(4); (d0, d1) -> (),
+-          domain: d0 in [0, 24], d1 in [0, 15]
+-        rt2: parameter(1); (d0, d1){rt0, rt1} -> (),
++        rt0: parameter(1); (d0, d1){rt0, rt1} -> (),
+           domain:
+             d0 in [0, 24],
+             d1 in [0, 15],
+@@ -1665,12 +1661,16 @@ TEST_P(IndexingAnalysisTest, FusionOpWithDynSliceOfDynSlice) {
+             rt1 in [0, 16],
+             d0 + rt0 in [0, 49],
+             d1 + rt1 in [0, 31]
+-        rt3: parameter(2); (d0, d1){rt0, rt1} -> (),
++        rt1: parameter(2); (d0, d1){rt0, rt1} -> (),
+           domain:
+             d0 in [0, 24], d1 in [0, 15],
+             rt0 in [0, 25], rt1 in [0, 16],
+             d0 + rt0 in [0, 49],
+             d1 + rt1 in [0, 31]
++        rt2: parameter(3); (d0, d1) -> (),
++          domain: d0 in [0, 24], d1 in [0, 15]
++        rt3: parameter(4); (d0, d1) -> (),
++          domain: d0 in [0, 24], d1 in [0, 15]
+     operand id = 1
+       (d0, d1) -> (),
+       domain:
+@@ -3255,6 +3255,97 @@ TEST_P(IndexingAnalysisTest, NestedDotFusionWithDynamicUpdateSlice) {
+   )"));
+ }
+ 
++TEST_P(IndexingAnalysisTest, FusionOpWithDynamicUpdateSliceAndDynamicSlice) {
++  auto input_indexing = GetOutputToInputIndexing(ParseAndGetRoot(R"hlo(
++    HloModule m
++    fused_computation {
++      dst = s32[7,11] parameter(0)
++      upd = s32[2,4] parameter(1)
++      dus_i0 = s32[] parameter(2)
++      dus_i1 = s32[] parameter(3)
++      dus = s32[7,11] dynamic-update-slice(dst, upd, dus_i0, dus_i1)
++      ds_i0 = s32[] parameter(4)
++      ds_i1 = s32[] parameter(5)
++      ROOT ds = s32[3,5] dynamic-slice(dus, ds_i0, ds_i1),
++        dynamic_slice_sizes={3,5}
++    }
++    ENTRY main {
++      p0 = s32[7,11] parameter(0)
++      p1 = s32[2,4] parameter(1)
++      p2 = s32[] parameter(2)
++      p3 = s32[] parameter(3)
++      p4 = s32[] parameter(4)
++      p5 = s32[] parameter(5)
++      ROOT fusion = s32[3,5] fusion(p0, p1, p2, p3, p4, p5), kind=kLoop,
++        calls=fused_computation
++    }
++  )hlo"));
++  EXPECT_THAT(input_indexing.ToString(), MatchIndexingString(R"(
++    operand id = 0
++      (d0, d1){rt0, rt1} -> (d0 + rt0, d1 + rt1),
++      domain:
++        d0 in [0, 2],
++        d1 in [0, 4],
++        rt0 in [0, 4],
++        rt1 in [0, 6]
++      runtime variables:
++        rt0: parameter(4); (d0, d1) -> (),
++          domain: d0 in [0, 2], d1 in [0, 4]
++        rt1: parameter(5); (d0, d1) -> (),
++          domain: d0 in [0, 2], d1 in [0, 4]
++    operand id = 1
++      (d0, d1){rt0, rt1, rt2, rt3} -> (-rt0 + d0 + rt2, -rt1 + d1 + rt3),
++      domain:
++        d0 in [0, 2],
++        d1 in [0, 4],
++        rt0 in [0, 5],
++        rt1 in [0, 7],
++        rt2 in [0, 4],
++        rt3 in [0, 6]
++      runtime variables:
++        rt0: parameter(2); (d0, d1){rt0, rt1} -> (),
++          domain:
++            d0 in [0, 2],
++            d1 in [0, 4],
++            rt0 in [0, 4],
++            rt1 in [0, 6],
++            d0 + rt0 in [0, 6],
++            d1 + rt1 in [0, 10]
++        rt1: parameter(3); (d0, d1){rt0, rt1} -> (),
++          domain:
++            d0 in [0, 2],
++            d1 in [0, 4],
++            rt0 in [0, 4],
++            rt1 in [0, 6],
++            d0 + rt0 in [0, 6],
++            d1 + rt1 in [0, 10]
++        rt2: parameter(4); (d0, d1) -> (),
++          domain: d0 in [0, 2], d1 in [0, 4]
++        rt3: parameter(5); (d0, d1) -> (),
++          domain: d0 in [0, 2], d1 in [0, 4]
++    operand id = 2
++      (d0, d1) -> (),
++      domain:
++        d0 in [0, 2],
++        d1 in [0, 4]
++    operand id = 3
++      (d0, d1) -> (),
++      domain:
++        d0 in [0, 2],
++        d1 in [0, 4]
++    operand id = 4
++      (d0, d1) -> (),
++      domain:
++        d0 in [0, 2],
++        d1 in [0, 4]
++    operand id = 5
++      (d0, d1) -> (),
++      domain:
++        d0 in [0, 2],
++        d1 in [0, 4]
++  )"));
++}
++
+ TEST_P(IndexingAnalysisTest, AllGatherOp) {
+   auto input_indexing = GetOutputToInputIndexing(ParseAndGetRoot(R"(
+     HloModule m, replica_count=4

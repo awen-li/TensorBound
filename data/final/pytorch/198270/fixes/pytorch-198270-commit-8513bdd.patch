@@ -1,0 +1,60 @@
+From 8513bddb54689f22e4af0cdd71bdebb3989ac9d9 Mon Sep 17 00:00:00 2001
+From: Alessandro Potenza <ap.alessandro.potenza@gmail.com>
+Date: Tue, 29 Sep 2026 03:59:03 +0000
+Subject: [PATCH] [inductor] Count reads of an earlier mutation of the buffer
+ in fusable_weak_dep (#198325)
+
+Fixes #198270
+
+`fusable_weak_dep` decides whether a reader of a buffer may be fused with a later mutation of it by comparing the reader's reads of `mutation_real_name[mutating_buf]` with the mutation's write. A read of an earlier mutation of the same buffer has another name (after `x.index_put_(...)`, reads of x go through the index_put_ output), so it wasn't counted: the check found no reads, skipped the same-index comparison and allowed the fusion. `x.index_put_(...); x.add_(x.flip(0))` then compiles to one kernel that reads x flipped while writing it.
+
+This resolves each read through `mutation_real_name` before comparing.
+
+Test plan: `test_inplace_flip_after_index_put` in test_torchinductor.py, which fails on CPU without the change. On 2.14 with CUDA (RTX 4070), with the change and without: test_torchinductor.py GPUTests on mutation, indexing, copies and views (341), test_inductor_scheduler.py, test_loop_ordering.py, test_cuda_repro.py, test_inplacing_pass.py, test_foreach.py and test_compiled_optimizers.py, with no new failure.
+
+Pull Request resolved: https://github.com/pytorch/pytorch/pull/198325
+Approved by: https://github.com/jansel
+---
+ test/inductor/test_torchinductor.py | 10 ++++++++++
+ torch/_inductor/scheduler.py        |  4 +++-
+ 2 files changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/test/inductor/test_torchinductor.py b/test/inductor/test_torchinductor.py
+index 003736caee1e4..58e0280a4babd 100644
+--- a/test/inductor/test_torchinductor.py
++++ b/test/inductor/test_torchinductor.py
+@@ -8525,6 +8525,16 @@ def f(x, y):
+         y = torch.randn(20, 1024 * 1024)
+         self.common(f, (x, y), atol=1e-3, rtol=1e-3)
+ 
++    def test_inplace_flip_after_index_put(self):
++        # After index_put_ has mutated x, the flip reads x under the name of
++        # the index_put_ output, which the copy back into x must not fuse with.
++        def f(x):
++            x.index_put_((torch.arange(x.size(0), device=x.device),), x * 2.0)
++            x.add_(x.flip(0))
++            return x
++
++        self.common(f, (torch.randn(20, 1024),))
++
+     def test_gather_scatter(self):
+         def fn(node_feat, edge_index):
+             src_node_feat = node_feat[edge_index[0]]
+diff --git a/torch/_inductor/scheduler.py b/torch/_inductor/scheduler.py
+index 359999b6439f2..7cce15e0f36de 100644
+--- a/torch/_inductor/scheduler.py
++++ b/torch/_inductor/scheduler.py
+@@ -10935,10 +10935,12 @@ def fusable_weak_dep(
+             relevant_reading_nodes = node1.snodes
+         num_concurrent_reads = 0
+         for reading_node in relevant_reading_nodes:
++            # A read of an earlier mutation of the same buffer (the output of an
++            # index_put_ into it, say) reads the same memory under another name.
+             relevant_reads = [
+                 read
+                 for read in reading_node.read_writes.reads
+-                if read.name == real_name
++                if self.mutation_real_name.get(read.name, read.name) == real_name
+             ]
+             if not relevant_reads:
+                 continue

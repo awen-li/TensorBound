@@ -1,0 +1,53 @@
+From b925310db61631ccb8aa5502b0437e72016215a3 Mon Sep 17 00:00:00 2001
+From: Matthew Johnson <mattjj@google.com>
+Date: Fri, 11 Sep 2020 22:14:44 -0700
+Subject: [PATCH 1/2] thread backend in pxla.replicate
+
+fixes #4223
+---
+ jax/interpreters/pxla.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/jax/interpreters/pxla.py b/jax/interpreters/pxla.py
+index dabea931f653..8e9bc2b1ae9a 100644
+--- a/jax/interpreters/pxla.py
++++ b/jax/interpreters/pxla.py
+@@ -925,7 +925,7 @@ def replicate(val, axis_size, nrep, devices=None, backend=None):
+     A ShardedDeviceArray of length `axis_size` where each shard is equal to
+     ``val``.
+   """
+-  device_count = (len(devices) if devices else xb.local_device_count())
++  device_count = (len(devices) if devices else xb.local_device_count(backend))
+   if nrep > device_count:
+     msg = ("Cannot replicate across %d replicas because only %d local devices "
+            "are available." % (nrep, device_count))
+
+From e2d96bfb213f3efde7c3db1733228358f9902648 Mon Sep 17 00:00:00 2001
+From: Matthew Johnson <mattjj@google.com>
+Date: Fri, 11 Sep 2020 22:17:35 -0700
+Subject: [PATCH 2/2] add test for #4223
+
+---
+ tests/pmap_test.py | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/tests/pmap_test.py b/tests/pmap_test.py
+index 7016311125ac..49e519a61d19 100644
+--- a/tests/pmap_test.py
++++ b/tests/pmap_test.py
+@@ -1481,6 +1481,15 @@ def pmapped_multi_step(state):
+     u = np.ones((device_count, 100))
+     multi_step_pmap(u)  # doesn't crash
+ 
++  @jtu.skip_on_devices("cpu")
++  def test_replicate_backend(self):
++    # https://github.com/google/jax/issues/4223
++    def fn(indices):
++      return jnp.equal(indices, jnp.arange(3)).astype(jnp.float32)
++    mapped_fn = jax.pmap(fn, axis_name='i', backend='cpu')
++    mapped_fn = jax.pmap(mapped_fn, axis_name='j', backend='cpu')
++    indices = np.array([[[2], [1]], [[0], [0]]])
++    mapped_fn(indices)  # doesn't crash
+ 
+ 
+ class VmapOfPmapTest(jtu.JaxTestCase):

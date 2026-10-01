@@ -1,0 +1,61 @@
+From 7be84611ae0d998a9e13b9be2de03681c8697305 Mon Sep 17 00:00:00 2001
+From: Ben Vanik <ben.vanik@gmail.com>
+Date: Thu, 16 Mar 2023 13:16:31 -0700
+Subject: [PATCH] Upload initial_data when returning existing cached buffers.
+ (#12660)
+
+Previously the code was double initializing new buffers (stupid but
+correct) while not initializing old buffers (stupid _and_ incorrect).
+
+Fixes #12161.
+---
+ .../src/iree/hal/utils/caching_allocator.c    | 28 +++++++++++--------
+ 1 file changed, 16 insertions(+), 12 deletions(-)
+
+diff --git a/runtime/src/iree/hal/utils/caching_allocator.c b/runtime/src/iree/hal/utils/caching_allocator.c
+index 43dfb19dd39c..b9c9b24abe58 100644
+--- a/runtime/src/iree/hal/utils/caching_allocator.c
++++ b/runtime/src/iree/hal/utils/caching_allocator.c
+@@ -258,10 +258,23 @@ static iree_status_t iree_hal_caching_allocator_pool_acquire(
+   }
+   iree_slim_mutex_unlock(&pool->mutex);
+   if (existing_buffer) {
+-    // Found a buffer - return it.
+-    *out_buffer = existing_buffer;
++    // Found a buffer - return it after writing in initial_data (if any).
++    // We can only do this if the buffer supports mapping and expect unmappable
++    // buffers to have been filtered out earlier up.
++    iree_status_t status = iree_ok_status();
++    if (!iree_const_byte_span_is_empty(initial_data)) {
++      status = iree_hal_buffer_map_write(existing_buffer, 0, initial_data.data,
++                                         initial_data.data_length);
++    }
++    if (iree_status_is_ok(status)) {
++      // Return the initialized buffer.
++      *out_buffer = existing_buffer;
++    } else {
++      // Release the buffer back to the pool.
++      iree_hal_buffer_release(existing_buffer);
++    }
+     IREE_TRACE_ZONE_END(z0);
+-    return iree_ok_status();
++    return status;
+   }
+ 
+   // Trim first before allocating so that we don't go over peak.
+@@ -276,15 +289,6 @@ static iree_status_t iree_hal_caching_allocator_pool_acquire(
+   iree_status_t status = iree_hal_allocator_allocate_buffer(
+       pool->device_allocator, *params, allocation_size, initial_data, &buffer);
+ 
+-  // If initial data was provided then write it into the buffer.
+-  // We can only do this if the buffer supports mapping and expect unmappable
+-  // buffers to have been filtered out earlier up.
+-  if (iree_status_is_ok(status) &&
+-      !iree_const_byte_span_is_empty(initial_data)) {
+-    status = iree_hal_buffer_map_write(buffer, 0, initial_data.data,
+-                                       initial_data.data_length);
+-  }
+-
+   // If the allocation failed then remove the size from the total.
+   if (iree_status_is_ok(status)) {
+     *out_buffer = buffer;

@@ -1,0 +1,123 @@
+From ff848d1e1dbe7004ddafa4f8c0443a3add2ed908 Mon Sep 17 00:00:00 2001
+From: Tobias Fuchs <fuchs@roofline.ai>
+Date: Tue, 21 Jul 2026 12:54:54 +0000
+Subject: [PATCH 1/2] [Vulkan] Add fall-back to ANY queue affinity on
+ fill/update
+
+Signed-off-by: Tobias Fuchs <fuchs@roofline.ai>
+---
+ .../iree/hal/drivers/vulkan/logical_device.c  | 51 ++++++++++++++++---
+ 1 file changed, 44 insertions(+), 7 deletions(-)
+
+diff --git a/runtime/src/iree/hal/drivers/vulkan/logical_device.c b/runtime/src/iree/hal/drivers/vulkan/logical_device.c
+index 7aff06944e95..5b81b75d609f 100644
+--- a/runtime/src/iree/hal/drivers/vulkan/logical_device.c
++++ b/runtime/src/iree/hal/drivers/vulkan/logical_device.c
+@@ -1012,7 +1012,14 @@ iree_hal_vulkan_logical_device_required_queue_flags_for_command_categories(
+   }
+   if (iree_any_bit_set(command_categories,
+                        IREE_HAL_COMMAND_CATEGORY_TRANSFER)) {
+-    queue_flags |= VK_QUEUE_TRANSFER_BIT;
++    // Transfer command buffers may record unaligned fills/updates, which are
++    // emulated with compute built-ins (see the fill/update replay paths in
++    // command_buffer.c). The queue family is fixed before those dispatches are
++    // recorded, so a transfer command buffer must be placed on a
++    // compute-capable lane; otherwise the built-in dispatch is recorded onto a
++    // transfer-only queue family, which is invalid and silently drops the work
++    // on hardware (hanging any semaphore waiting on the submission).
++    queue_flags |= VK_QUEUE_TRANSFER_BIT | VK_QUEUE_COMPUTE_BIT;
+   }
+   return queue_flags;
+ }
+@@ -1260,6 +1267,36 @@ static iree_status_t iree_hal_vulkan_logical_device_queue_dealloca(
+       queue, wait_semaphore_list, signal_semaphore_list, buffer, flags);
+ }
+ 
++// Selects the queue lane for a native fill/update. Fills and updates are
++// transfer-category operations, but their unaligned path is emulated with a
++// compute built-in.
++static iree_status_t
++iree_hal_vulkan_logical_device_select_transfer_operation_lane(
++    iree_hal_vulkan_logical_device_t* device,
++    iree_hal_queue_affinity_t queue_affinity,
++    iree_hal_vulkan_queue_t** out_queue) {
++  const iree_hal_command_category_t command_categories =
++      IREE_HAL_COMMAND_CATEGORY_TRANSFER;
++  const iree_hal_vulkan_queue_role_t preferred_role =
++      iree_hal_vulkan_logical_device_preferred_queue_role_for_command_categories(
++          command_categories);
++  const VkQueueFlags required_flags =
++      iree_hal_vulkan_logical_device_required_queue_flags_for_command_categories(
++          command_categories);
++
++  // Prefer a lane within the requested affinity.
++  iree_status_t status = iree_hal_vulkan_logical_device_select_queue_lane(
++      device, preferred_role, required_flags, queue_affinity, out_queue);
++  if (iree_status_is_ok(status)) return status;
++
++  // Retry with any queue affinity - the operation may need the compute built-in
++  // (e.g. an unaligned fill/update).
++  iree_status_ignore(status);
++  return iree_hal_vulkan_logical_device_select_queue_lane(
++      device, preferred_role, required_flags, IREE_HAL_QUEUE_AFFINITY_ANY,
++      out_queue);
++}
++
+ static iree_status_t iree_hal_vulkan_logical_device_queue_fill(
+     iree_hal_device_t* base_device, iree_hal_queue_affinity_t queue_affinity,
+     const iree_hal_semaphore_list_t wait_semaphore_list,
+@@ -1270,9 +1307,9 @@ static iree_status_t iree_hal_vulkan_logical_device_queue_fill(
+   iree_hal_vulkan_logical_device_t* device =
+       iree_hal_vulkan_logical_device_cast(base_device);
+   iree_hal_vulkan_queue_t* queue = NULL;
+-  IREE_RETURN_IF_ERROR(iree_hal_vulkan_logical_device_select_queue_lane(
+-      device, IREE_HAL_VULKAN_QUEUE_ROLE_TRANSFER, VK_QUEUE_TRANSFER_BIT,
+-      queue_affinity, &queue));
++  IREE_RETURN_IF_ERROR(
++      iree_hal_vulkan_logical_device_select_transfer_operation_lane(
++          device, queue_affinity, &queue));
+   return iree_hal_vulkan_queue_submit_fill(
+       queue, wait_semaphore_list, signal_semaphore_list, target_buffer,
+       target_offset, length, pattern, pattern_length, flags);
+@@ -1288,9 +1325,9 @@ static iree_status_t iree_hal_vulkan_logical_device_queue_update(
+   iree_hal_vulkan_logical_device_t* device =
+       iree_hal_vulkan_logical_device_cast(base_device);
+   iree_hal_vulkan_queue_t* queue = NULL;
+-  IREE_RETURN_IF_ERROR(iree_hal_vulkan_logical_device_select_queue_lane(
+-      device, IREE_HAL_VULKAN_QUEUE_ROLE_TRANSFER, VK_QUEUE_TRANSFER_BIT,
+-      queue_affinity, &queue));
++  IREE_RETURN_IF_ERROR(
++      iree_hal_vulkan_logical_device_select_transfer_operation_lane(
++          device, queue_affinity, &queue));
+   return iree_hal_vulkan_queue_submit_update(
+       queue, wait_semaphore_list, signal_semaphore_list, source_buffer,
+       source_offset, target_buffer, target_offset, length, flags);
+
+From 6804bfde80a626ecdb7aa03ce7d536c41309d1ac Mon Sep 17 00:00:00 2001
+From: Tobias Fuchs <9053039+devtbi@users.noreply.github.com>
+Date: Mon, 24 Aug 2026 11:29:37 +0200
+Subject: [PATCH 2/2] Update comment
+
+Co-authored-by: Artem Gindinson <gindinson@roofline.ai>
+Signed-off-by: Tobias Fuchs <fuchs@roofline.ai>
+---
+ runtime/src/iree/hal/drivers/vulkan/logical_device.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/runtime/src/iree/hal/drivers/vulkan/logical_device.c b/runtime/src/iree/hal/drivers/vulkan/logical_device.c
+index 5b81b75d609f..2432d5563c6b 100644
+--- a/runtime/src/iree/hal/drivers/vulkan/logical_device.c
++++ b/runtime/src/iree/hal/drivers/vulkan/logical_device.c
+@@ -1016,9 +1016,9 @@ iree_hal_vulkan_logical_device_required_queue_flags_for_command_categories(
+     // emulated with compute built-ins (see the fill/update replay paths in
+     // command_buffer.c). The queue family is fixed before those dispatches are
+     // recorded, so a transfer command buffer must be placed on a
+-    // compute-capable lane; otherwise the built-in dispatch is recorded onto a
+-    // transfer-only queue family, which is invalid and silently drops the work
+-    // on hardware (hanging any semaphore waiting on the submission).
++    // compute-capable lane. Recording the built-in dispatch onto a
++    // transfer-only is invalid – that will hang any semaphore waiting on the
++    // submission.
+     queue_flags |= VK_QUEUE_TRANSFER_BIT | VK_QUEUE_COMPUTE_BIT;
+   }
+   return queue_flags;

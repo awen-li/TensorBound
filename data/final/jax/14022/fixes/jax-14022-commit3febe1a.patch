@@ -1,0 +1,449 @@
+From 3febe1abf5ab978b84eaad014c7d8bae9e02a8cc Mon Sep 17 00:00:00 2001
+From: Parker Schuh <parkers@google.com>
+Date: Mon, 6 Feb 2023 12:56:25 -0800
+Subject: [PATCH] Support precision_config in xla.gpu.gemm custom-call when
+ these are emitted over thunks.
+
+PiperOrigin-RevId: 507559793
+---
+ .../transforms/lmhlo_gpu_to_gpu_runtime.cc    | 11 +++++
+ xla/service/gpu/gemm_rewriter.cc              |  4 +-
+ xla/service/gpu/gpu_compiler.cc               | 39 +++++++++++++-----
+ xla/service/gpu/ir_emitter_unnested.cc        |  3 +-
+ xla/service/gpu/matmul_utils.cc               | 11 ++---
+ xla/service/gpu/matmul_utils.h                |  3 +-
+ xla/service/gpu/runtime/cublas_lt_matmul.cc   |  8 ++--
+ xla/service/gpu/runtime/gemm.cc               | 10 +++--
+ xla/service/gpu/runtime/support.h             |  5 +--
+ xla/service/gpu/tests/BUILD                   | 10 ++++-
+ xla/service/gpu/tests/mlir_fft_test.cc        |  3 ++
+ xla/service/gpu/tests/mlir_gemm_test.cc       | 40 ++++++++++++++-----
+ xla/service/gpu/tests/mlir_gpu_test_base.cc   |  2 +-
+ xla/service/gpu/tests/mlir_gpu_test_base.h    |  3 ++
+ xla/service/gpu/tests/mlir_sorting_test.cc    |  3 ++
+ 15 files changed, 113 insertions(+), 42 deletions(-)
+
+diff --git a/xla/mlir/backends/gpu/transforms/lmhlo_gpu_to_gpu_runtime.cc b/xla/mlir/backends/gpu/transforms/lmhlo_gpu_to_gpu_runtime.cc
+index 84447daa1953b..08a3081494ddf 100644
+--- a/xla/mlir/backends/gpu/transforms/lmhlo_gpu_to_gpu_runtime.cc
++++ b/xla/mlir/backends/gpu/transforms/lmhlo_gpu_to_gpu_runtime.cc
+@@ -104,6 +104,17 @@ class GemmOpLowering : public OpRewritePattern<GEMMOp> {
+     call->setAttr(b.getStringAttr("beta"), op.getBetaAttr());
+     call->setAttr(b.getStringAttr("dot_dims"), op.getDotDimensionNumbers());
+ 
++    if (auto precisions = op.getPrecisionConfig()) {
++      llvm::SmallVector<int32_t> values;
++      for (auto precision : *precisions) {
++        auto value = precision.cast<mhlo::PrecisionAttr>().getValue();
++        values.push_back(static_cast<int32_t>(value));
++      }
++      call->setAttr(b.getStringAttr("precision"), b.getI32TensorAttr(values));
++    } else {
++      call->setAttr(b.getStringAttr("precision"), b.getI32TensorAttr({0, 0}));
++    }
++
+     // Erase the original gemm operation.
+     rewriter.eraseOp(op);
+ 
+diff --git a/xla/service/gpu/gemm_rewriter.cc b/xla/service/gpu/gemm_rewriter.cc
+index 0fbb3cd2c0d89..47601670c5c7a 100644
+--- a/xla/service/gpu/gemm_rewriter.cc
++++ b/xla/service/gpu/gemm_rewriter.cc
+@@ -1089,7 +1089,9 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
+     TF_ASSIGN_OR_RETURN(const se::blas::DataType output_dtype,
+                         AsBlasDataType(instr->shape().element_type()));
+     TF_ASSIGN_OR_RETURN(const se::blas::ComputationType compute_type,
+-                        GetBlasComputationType(instr->shape().element_type()));
++                        GetBlasComputationType(
++                            instr->shape().element_type(),
++                            stream_executor::blas::kDefaultComputePrecision));
+     se::blas::DataType scale_type =
+         cublas_lt::GetScaleType(output_dtype, compute_type);
+ 
+diff --git a/xla/service/gpu/gpu_compiler.cc b/xla/service/gpu/gpu_compiler.cc
+index 358e9c03ce4c8..8a51ff64fa580 100644
+--- a/xla/service/gpu/gpu_compiler.cc
++++ b/xla/service/gpu/gpu_compiler.cc
+@@ -1034,14 +1034,14 @@ static Status LowerToXlaGpuRuntime(mlir::ModuleOp module,
+ 
+ static StatusOr<OwnedGpuRuntimeProgram> LowerToJitRt(
+     mlir::ModuleOp mlir_module, llvm::StringRef entry_function_name,
+-    llvm::ArrayRef<int64_t> buffer_sizes, HloModule* hlo_module,
++    llvm::ArrayRef<int64_t> buffer_sizes, const HloModuleConfig& module_config,
+     std::unique_ptr<ThunkSequence> thunk_sequence) {
+   // Forward collective (NCCL) attributes for use by the lowering pipeline.
+   mlir::OpBuilder builder(mlir_module.getContext());
+   mlir::IntegerAttr replica_count_attr =
+-      builder.getI64IntegerAttr(hlo_module->config().replica_count());
++      builder.getI64IntegerAttr(module_config.replica_count());
+   mlir::IntegerAttr num_partitions_attr =
+-      builder.getI64IntegerAttr(hlo_module->config().num_partitions());
++      builder.getI64IntegerAttr(module_config.num_partitions());
+   mlir::func::FuncOp func =
+       mlir_module.lookupSymbol<mlir::func::FuncOp>(entry_function_name);
+   func->setAttr("replica_count", replica_count_attr);
+@@ -1050,8 +1050,7 @@ static StatusOr<OwnedGpuRuntimeProgram> LowerToJitRt(
+   // Lower LMHLO operations to the JitRt compatible custom calls.
+   TF_RETURN_IF_ERROR(LowerToXlaGpuRuntime(
+       mlir_module, {entry_function_name.data(), entry_function_name.size()},
+-      buffer_sizes, thunk_sequence.get(),
+-      hlo_module->config().debug_options()));
++      buffer_sizes, thunk_sequence.get(), module_config.debug_options()));
+   // Serialize module to pass it to GpuExecutable for compilation.
+   std::string serialized_module;
+   llvm::raw_string_ostream os(serialized_module);
+@@ -1059,9 +1058,9 @@ static StatusOr<OwnedGpuRuntimeProgram> LowerToJitRt(
+ 
+   // TODO(b/232033540): Pass MLIR module directly to Gpu runtime executable
+   // without forcing serialization.
+-  return std::make_unique<GpuRuntimeProgram>(
+-      entry_function_name.str(), os.str(), buffer_sizes.vec(),
+-      hlo_module->config().debug_options());
++  return std::make_unique<GpuRuntimeProgram>(entry_function_name.str(),
++                                             os.str(), buffer_sizes.vec(),
++                                             module_config.debug_options());
+ }
+ 
+ using OutputInfoMap =
+@@ -1303,7 +1302,7 @@ static Status CompileModuleToLlvmIrImpl(
+     TF_ASSIGN_OR_RETURN(
+         results->executable,
+         LowerToJitRt(*mlir_module, entry_function.getName(), buffer_sizes,
+-                     hlo_module, ir_emitter->ConsumeThunkSequence()));
++                     hlo_module->config(), ir_emitter->ConsumeThunkSequence()));
+     return OkStatus();
+   }
+ 
+@@ -1957,8 +1956,6 @@ StatusOr<std::unique_ptr<Executable>> CompileLmhloToExecutable(
+                                         ir_emitter_context->constants());
+   }
+ 
+-  auto thunk_sequence = ir_emitter->ConsumeThunkSequence();
+-
+   using BackendCompileResult = std::pair<std::string, std::vector<uint8_t>>;
+   TF_ASSIGN_OR_RETURN(BackendCompileResult backend_result,
+                       compiler->CompileToTargetBinary(
+@@ -1966,6 +1963,26 @@ StatusOr<std::unique_ptr<Executable>> CompileLmhloToExecutable(
+                           compiler->GetGpuVersion(stream_exec), stream_exec,
+                           options, /*debug_module=*/nullptr));
+ 
++  if (IsXlaRuntimeExecutableEnabled(module_config)) {
++    std::vector<int64_t> buffer_sizes;
++    llvm::transform(
++        allocations, std::back_inserter(buffer_sizes),
++        [](const BufferAllocation& allocation) { return allocation.size(); });
++    TF_ASSIGN_OR_RETURN(
++        auto executable,
++        LowerToJitRt(module, entry_function.getName(), buffer_sizes,
++                     module_config, ir_emitter->ConsumeThunkSequence()));
++
++    GpuVersion gpu_version = compiler->GetGpuVersion(stream_exec);
++    return GpuExecutable::Create(
++        {std::move(backend_result.first), std::move(backend_result.second),
++         gpu_version, std::move(executable), entry_func_attrs,
++         std::move(ir_emitter_context->constants()), std::move(output_info),
++         module_name, output_shape, std::move(allocations)});
++  }
++
++  auto thunk_sequence = ir_emitter->ConsumeThunkSequence();
++
+   GpuVersion gpu_version = compiler->GetGpuVersion(stream_exec);
+   return GpuExecutable::Create(
+       {std::move(backend_result.first), std::move(backend_result.second),
+diff --git a/xla/service/gpu/ir_emitter_unnested.cc b/xla/service/gpu/ir_emitter_unnested.cc
+index ee59ac19a74f0..197a06db08b78 100644
+--- a/xla/service/gpu/ir_emitter_unnested.cc
++++ b/xla/service/gpu/ir_emitter_unnested.cc
+@@ -5579,7 +5579,8 @@ Status IrEmitterUnnested::EmitLmhloRegion(mlir::Region* region) {
+ void IrEmitterUnnested::GetDependentDialects(mlir::DialectRegistry& registry) {
+   registry.insert<mlir::arith::ArithDialect, mlir::func::FuncDialect,
+                   mlir::gpu::GPUDialect, mlir::lmhlo::LmhloDialect,
+-                  mlir::lmhlo_gpu::LmhloGpuDialect, mlir::mhlo::MhloDialect>();
++                  mlir::lmhlo_gpu::LmhloGpuDialect, mlir::mhlo::MhloDialect,
++                  mlir::memref::MemRefDialect>();
+   mlir::registerLLVMDialectTranslation(registry);
+   mlir::registerNVVMDialectTranslation(registry);
+   mlir::registerROCDLDialectTranslation(registry);
+diff --git a/xla/service/gpu/matmul_utils.cc b/xla/service/gpu/matmul_utils.cc
+index a7d1944364055..283659de9010a 100644
+--- a/xla/service/gpu/matmul_utils.cc
++++ b/xla/service/gpu/matmul_utils.cc
+@@ -402,7 +402,7 @@ StatusOr<bool> CanFoldTransposeOperandIntoDot(const HloInstruction& dot,
+ }
+ 
+ StatusOr<se::blas::ComputationType> GetBlasComputationType(
+-    PrimitiveType dtype) {
++    PrimitiveType dtype, int64_t compute_precision) {
+   switch (dtype) {
+     case F8E5M2:    // fall-through
+     case F8E4M3FN:  // fall-through
+@@ -413,7 +413,7 @@ StatusOr<se::blas::ComputationType> GetBlasComputationType(
+     case F32:  // fall-through
+     case C64:
+ #if GOOGLE_CUDA
+-      if (tsl::tensor_float_32_execution_enabled()) {
++      if (tsl::tensor_float_32_execution_enabled() && compute_precision <= 1) {
+         return se::blas::ComputationType::kTF32AsF32;
+       }
+ #endif
+@@ -512,7 +512,7 @@ Status DoGemmWithAlgorithm(int64_t batch_size, int64_t m, int64_t n, int64_t k,
+   CHECK(output.transpose == se::blas::Transpose::kNoTranspose);
+   PrimitiveType output_type = primitive_util::NativeToPrimitiveType<Output>();
+   TF_ASSIGN_OR_RETURN(se::blas::ComputationType computation_type,
+-                      GetBlasComputationType(output_type));
++                      GetBlasComputationType(output_type, compute_precision));
+   se::DeviceMemory<Output> output_data(output.data);
+ 
+   if (batch_size != 1) {
+@@ -819,8 +819,9 @@ StatusOr<se::cuda::BlasLt::Epilogue> AsBlasLtEpilogue(
+ 
+   TF_ASSIGN_OR_RETURN(se::blas::DataType output_dtype,
+                       AsBlasDataType(output_layout.dtype));
+-  TF_ASSIGN_OR_RETURN(se::blas::ComputationType computation_type,
+-                      GetBlasComputationType(output_layout.dtype));
++  TF_ASSIGN_OR_RETURN(
++      se::blas::ComputationType computation_type,
++      GetBlasComputationType(output_layout.dtype, config.compute_precision));
+   TF_ASSIGN_OR_RETURN(
+       se::cuda::BlasLt::MatmulDesc op_desc,
+       se::cuda::BlasLt::MatmulDesc::Create(
+diff --git a/xla/service/gpu/matmul_utils.h b/xla/service/gpu/matmul_utils.h
+index abfa6a36644ce..0e1651caba142 100644
+--- a/xla/service/gpu/matmul_utils.h
++++ b/xla/service/gpu/matmul_utils.h
+@@ -119,7 +119,8 @@ struct GemmConfig {
+   int64_t compute_precision;
+ };
+ 
+-StatusOr<se::blas::ComputationType> GetBlasComputationType(PrimitiveType dtype);
++StatusOr<se::blas::ComputationType> GetBlasComputationType(
++    PrimitiveType dtype, int64_t compute_precision);
+ 
+ namespace cublas_lt {
+ 
+diff --git a/xla/service/gpu/runtime/cublas_lt_matmul.cc b/xla/service/gpu/runtime/cublas_lt_matmul.cc
+index 9cc691c57a839..14040c53740aa 100644
+--- a/xla/service/gpu/runtime/cublas_lt_matmul.cc
++++ b/xla/service/gpu/runtime/cublas_lt_matmul.cc
+@@ -96,9 +96,11 @@ static absl::Status CublasLtMatmulImpl(
+ 
+   // Find the gemm config for this instance of matmul.
+   absl::StatusOr<GemmConfig*> config = gemm_config.GetOrCreate([&] {
+-    return ToAbsl(GetGemmConfig(a, b, c, algorithm, alpha_real, alpha_imag,
+-                                beta, dot_dims.lhs_batch, dot_dims.lhs_contract,
+-                                dot_dims.rhs_batch, dot_dims.rhs_contract));
++    return ToAbsl(GetGemmConfig(
++        a, b, c, algorithm, alpha_real, alpha_imag, beta, dot_dims.lhs_batch,
++        dot_dims.lhs_contract, dot_dims.rhs_batch, dot_dims.rhs_contract,
++        precision.empty() ? se::blas::kDefaultComputePrecision
++                          : *absl::c_max_element(precision)));
+   });
+   if (!config.ok()) return config.status();
+ 
+diff --git a/xla/service/gpu/runtime/gemm.cc b/xla/service/gpu/runtime/gemm.cc
+index 7c2dc99899622..83fa5374e950b 100644
+--- a/xla/service/gpu/runtime/gemm.cc
++++ b/xla/service/gpu/runtime/gemm.cc
+@@ -100,7 +100,8 @@ static absl::Status GemmImpl(const ServiceExecutableRunOptions* run_options,
+                              StridedMemrefView rhs, StridedMemrefView out,
+                              int64_t algorithm, double alpha_real,
+                              double alpha_imag, double beta,
+-                             DotDimensionNumbers dot_dims) {
++                             DotDimensionNumbers dot_dims,
++                             absl::Span<const int32_t> precision) {
+   se::DeviceMemoryBase lhs_data = GetDeviceAddress(lhs);
+   se::DeviceMemoryBase rhs_data = GetDeviceAddress(rhs);
+   se::DeviceMemoryBase output_data = GetDeviceAddress(out);
+@@ -114,7 +115,9 @@ static absl::Status GemmImpl(const ServiceExecutableRunOptions* run_options,
+     StatusOr<GemmConfig> gemm_config =
+         GetGemmConfig(lhs, rhs, out, algorithm, alpha_real, alpha_imag, beta,
+                       dot_dims.lhs_batch, dot_dims.lhs_contract,
+-                      dot_dims.rhs_batch, dot_dims.rhs_contract);
++                      dot_dims.rhs_batch, dot_dims.rhs_contract,
++                      precision.empty() ? se::blas::kDefaultComputePrecision
++                                        : *absl::c_max_element(precision));
+ #if GOOGLE_CUDA
+     if (!gemm_config.ok()) return ToAbsl(gemm_config);
+     if (gemm_config->algorithm == stream_executor::blas::kRuntimeAutotuning) {
+@@ -150,7 +153,8 @@ XLA_RUNTIME_DEFINE_CUSTOM_CALL(
+         .Attr<double>("alpha_real")
+         .Attr<double>("alpha_imag")
+         .Attr<double>("beta")
+-        .Attr<DotDimensionNumbers>("dot_dims"));
++        .Attr<DotDimensionNumbers>("dot_dims")
++        .Attr<absl::Span<const int32_t>>("precision"));
+ 
+ void RegisterGemmCustomCalls(runtime::DirectCustomCallRegistry& registry) {
+   registry.Register("xla.gpu.gemm", Gemm);
+diff --git a/xla/service/gpu/runtime/support.h b/xla/service/gpu/runtime/support.h
+index 37896dde8f46c..904e7ae1acc5c 100644
+--- a/xla/service/gpu/runtime/support.h
++++ b/xla/service/gpu/runtime/support.h
+@@ -96,11 +96,10 @@ inline StatusOr<GemmConfig> GetGemmConfig(
+     const runtime::StridedMemrefView& out, int64_t algorithm, double alpha_real,
+     double alpha_imag, double beta, absl::Span<const int64_t> lhs_batch,
+     absl::Span<const int64_t> lhs_contract, absl::Span<const int64_t> rhs_batch,
+-    absl::Span<const int64_t> rhs_contract) {
++    absl::Span<const int64_t> rhs_contract, int64_t compute_precision) {
+   return GemmConfig::For(ToShape(lhs), lhs_batch, lhs_contract, ToShape(rhs),
+                          rhs_batch, rhs_contract, ToShape(out), alpha_real,
+-                         alpha_imag, beta, algorithm,
+-                         se::blas::kDefaultComputePrecision);
++                         alpha_imag, beta, algorithm, compute_precision);
+ }
+ 
+ // adds Dot Dimension Attribute encodings for calls to Gemm and cuBLASLt
+diff --git a/xla/service/gpu/tests/BUILD b/xla/service/gpu/tests/BUILD
+index 60dfc33a187cf..d05d70249bd9c 100644
+--- a/xla/service/gpu/tests/BUILD
++++ b/xla/service/gpu/tests/BUILD
+@@ -122,10 +122,16 @@ xla_cc_test(
+     ],
+ )
+ 
+-xla_cc_test(
++xla_test(
+     name = "mlir_gemm_test",
+     srcs = ["mlir_gemm_test.cc"],
+-    tags = tf_cuda_tests_tags(),
++    backend_tags = {"gpu": [
++        "requires-gpu-nvidia",
++        "requires-gpu-sm80-only",
++    ]},
++    backends = [
++        "gpu",
++    ],
+     deps = [
+         ":mlir_gpu_test_base",
+         "@tsl//tsl/lib/core:status_test_util",
+diff --git a/xla/service/gpu/tests/mlir_fft_test.cc b/xla/service/gpu/tests/mlir_fft_test.cc
+index 54301c8982c76..82c60b125542d 100644
+--- a/xla/service/gpu/tests/mlir_fft_test.cc
++++ b/xla/service/gpu/tests/mlir_fft_test.cc
+@@ -24,6 +24,9 @@ using ::testing::ElementsAreArray;
+ class FftTest : public MlirGpuTestBase {};
+ 
+ TEST_F(FftTest, SimpleCase1) {
++  // TODO(b/267637553): convert to use new MLIR executables (most likely just
++  // updating the mlir text to use untyped u8 memrefs).
++  mutable_debug_options()->set_xla_gpu_enable_xla_runtime_executable(false);
+   const char* mlir_text = R"(
+       module attributes {hlo.unique_id = 0 : i32} {
+         func.func @main(%arg0: memref<4xf32> {
+diff --git a/xla/service/gpu/tests/mlir_gemm_test.cc b/xla/service/gpu/tests/mlir_gemm_test.cc
+index 8eac7540b25d5..8cb5afbc6f860 100644
+--- a/xla/service/gpu/tests/mlir_gemm_test.cc
++++ b/xla/service/gpu/tests/mlir_gemm_test.cc
+@@ -32,11 +32,17 @@ class GemmTest : public MlirGpuTestBase {
+     std::string mlir_text = absl::StrCat(
+         R"(
+       module attributes {hlo.unique_id = 0 : i32} {
+-        func.func @main(%arg0: memref<2x2xf32> {lmhlo.params = 0 : index},
+-                   %arg1: memref<2x2xf32> {lmhlo.params = 1 : index},
+-                   %arg2: memref<2x2xf32> {lmhlo.output_index = dense<[0]> : tensor<1xindex>}) attributes {
++        func.func @main(%raw_arg0: memref<16xi8> {lmhlo.params = 0 : index},
++                   %raw_arg1: memref<16xi8> {lmhlo.params = 1 : index},
++                   %raw_arg2: memref<16xi8> {lmhlo.output_index = dense<[0]> : tensor<1xindex>}) attributes {
+                        result_xla_shape = "(f32[4]) "
+                    } {
++          %c0 = arith.constant 0 : index
++          %arg0 = memref.view %raw_arg0[%c0][] : memref<16xi8> to memref<2x2xf32>
++          %c1 = arith.constant 0 : index
++          %arg1 = memref.view %raw_arg1[%c1][] : memref<16xi8> to memref<2x2xf32>
++          %c2 = arith.constant 0 : index
++          %arg2 = memref.view %raw_arg2[%c2][] : memref<16xi8> to memref<2x2xf32>
+           "lmhlo_gpu.gemm"(%arg0, %arg1, %arg2) {alpha_imag = 0.000000e+00 : f64, alpha_real = 1.000000e+00 : f64, beta = 0.000000e+00 : f64, batch_size = 1 : i64, lhs_stride = 4 : i64, rhs_stride = 4 : i64, dot_dimension_numbers = #mhlo.dot<lhs_contracting_dimensions = [1], rhs_contracting_dimensions = [0]>)",
+         matmul_options,
+         R"(} : (memref<2x2xf32>, memref<2x2xf32>, memref<2x2xf32>) -> ()
+@@ -55,11 +61,17 @@ class GemmTest : public MlirGpuTestBase {
+     std::string mlir_text = absl::StrCat(
+         R"(
+       module attributes {hlo.unique_id = 0 : i32} {
+-        func.func @main(%arg0: memref<256x256xf32> {lmhlo.params = 0 : index},
+-                   %arg1: memref<256x256xf32> {lmhlo.params = 1 : index},
+-                   %arg2: memref<256x256xf32> {lmhlo.output_index = dense<[0]> : tensor<1xindex>}) attributes {
+-                       result_xla_shape = "(f32[65536]) "
++        func.func @main(%raw_arg0: memref<262144xi8> {lmhlo.params = 0 : index},
++                   %raw_arg1: memref<262144xi8> {lmhlo.params = 1 : index},
++                   %raw_arg2: memref<262144xi8> {lmhlo.output_index = dense<[0]> : tensor<1xindex>}) attributes {
++                       result_xla_shape = "(f32[4]) "
+                    } {
++          %c0 = arith.constant 0 : index
++          %arg0 = memref.view %raw_arg0[%c0][] : memref<262144xi8> to memref<256x256xf32>
++          %c1 = arith.constant 0 : index
++          %arg1 = memref.view %raw_arg1[%c1][] : memref<262144xi8> to memref<256x256xf32>
++          %c2 = arith.constant 0 : index
++          %arg2 = memref.view %raw_arg2[%c2][] : memref<262144xi8> to memref<256x256xf32>
+           "lmhlo_gpu.gemm"(%arg0, %arg1, %arg2) {alpha_imag = 0.000000e+00 : f64, alpha_real = 1.000000e+00 : f64, beta = 0.000000e+00 : f64, batch_size = 1 : i64, lhs_stride = 65536 : i64, rhs_stride = 65536 : i64, op_type = "", op_name = "", dot_dimension_numbers = #mhlo.dot<lhs_contracting_dimensions = [1], rhs_contracting_dimensions = [0]>)",
+         matmul_options,
+         R"(} : (memref<256x256xf32>, memref<256x256xf32>, memref<256x256xf32>) -> ()
+@@ -121,11 +133,17 @@ TEST_F(GemmTest, GemmBatchedPrecisionHighest) {
+ 
+   std::string_view mlir_text = R"(
+     module attributes {hlo.unique_id = 0 : i32} {
+-      func.func @main(%arg0: memref<2x2x2xf32> {lmhlo.params = 0 : index},
+-                 %arg1: memref<2x2xf32> {lmhlo.params = 1 : index},
+-                 %arg2: memref<2x2x2xf32> {lmhlo.output_index = dense<[0]> : tensor<1xindex>}) attributes {
+-                     result_xla_shape = "(f32[8]) "
++      func.func @main(%raw_arg0: memref<32xi8> {lmhlo.params = 0 : index},
++                 %raw_arg1: memref<16xi8> {lmhlo.params = 1 : index},
++                 %raw_arg2: memref<32xi8> {lmhlo.output_index = dense<[0]> : tensor<1xindex>}) attributes {
++                     result_xla_shape = "(f32[4]) "
+                  } {
++        %c0 = arith.constant 0 : index
++        %arg0 = memref.view %raw_arg0[%c0][] : memref<32xi8> to memref<2x2x2xf32>
++        %c1 = arith.constant 0 : index
++        %arg1 = memref.view %raw_arg1[%c1][] : memref<16xi8> to memref<2x2xf32>
++        %c2 = arith.constant 0 : index
++        %arg2 = memref.view %raw_arg2[%c2][] : memref<32xi8> to memref<2x2x2xf32>
+         "lmhlo_gpu.gemm"(%arg0, %arg1, %arg2) {alpha_imag = 0.000000e+00 : f64, alpha_real = 1.000000e+00 : f64, beta = 0.000000e+00 : f64, batch_size = 2 : i64, lhs_stride = 4 : i64, rhs_stride = 4 : i64, dot_dimension_numbers = #mhlo.dot<lhs_batching_dimensions = [0], lhs_contracting_dimensions = [2], rhs_contracting_dimensions = [0]>, precision_config = [#mhlo<precision HIGH>, #mhlo<precision HIGHEST>]} : (memref<2x2x2xf32>, memref<2x2xf32>, memref<2x2x2xf32>) -> ()
+         "lmhlo.terminator"() : () -> ()
+       }
+diff --git a/xla/service/gpu/tests/mlir_gpu_test_base.cc b/xla/service/gpu/tests/mlir_gpu_test_base.cc
+index f61a7ba6aa2aa..3431a6bef0191 100644
+--- a/xla/service/gpu/tests/mlir_gpu_test_base.cc
++++ b/xla/service/gpu/tests/mlir_gpu_test_base.cc
+@@ -63,7 +63,7 @@ StatusOr<std::unique_ptr<Executable>> MlirGpuTestBase::CompileMlirModule(
+       /*mlir_context=*/nullptr, llvm_module.get());
+ 
+   HloModuleConfig module_config;
+-  module_config.set_debug_options(GetDebugOptionsFromFlags());
++  module_config.set_debug_options(debug_options_);
+   return CompileLmhloToExecutable(
+       static_cast<GpuCompiler*>(backend_->compiler()), module, "TestModule",
+       module_config, Compiler::CompileOptions(), "main", stream_exec,
+diff --git a/xla/service/gpu/tests/mlir_gpu_test_base.h b/xla/service/gpu/tests/mlir_gpu_test_base.h
+index d1504639e156d..173ed7d4a3cfb 100644
+--- a/xla/service/gpu/tests/mlir_gpu_test_base.h
++++ b/xla/service/gpu/tests/mlir_gpu_test_base.h
+@@ -48,6 +48,8 @@ class MlirGpuTestBase : public HloTestBase {
+ 
+   StreamPool::Ptr BorrowStream();
+ 
++  xla::DebugOptions* mutable_debug_options() { return &debug_options_; }
++
+  private:
+   StatusOr<std::vector<std::vector<uint8_t>>> RunMlirModuleWithHostBuffers(
+       mlir::ModuleOp module, std::vector<absl::Span<uint8_t>> arguments);
+@@ -63,6 +65,7 @@ class MlirGpuTestBase : public HloTestBase {
+       absl::string_view module_text, mlir::MLIRContext& context);
+ 
+   std::unique_ptr<xla::Backend> backend_;
++  xla::DebugOptions debug_options_ = GetDebugOptionsFromFlags();
+ };
+ 
+ }  // namespace gpu
+diff --git a/xla/service/gpu/tests/mlir_sorting_test.cc b/xla/service/gpu/tests/mlir_sorting_test.cc
+index 0a488447d6b2e..fa060a5e3b3fc 100644
+--- a/xla/service/gpu/tests/mlir_sorting_test.cc
++++ b/xla/service/gpu/tests/mlir_sorting_test.cc
+@@ -24,6 +24,9 @@ using ::testing::ElementsAreArray;
+ class SortingTest : public MlirGpuTestBase {};
+ 
+ TEST_F(SortingTest, SimpleCase1) {
++  // TODO(b/267638219): convert to use new MLIR executables (most likely just
++  // updating the mlir text to use untyped u8 memrefs).
++  mutable_debug_options()->set_xla_gpu_enable_xla_runtime_executable(false);
+   const char* mlir_text = R"(
+       func.func @main(%arg0: memref<4xf32> {lmhlo.params = 0 : index},
+                  %arg1: memref<4xf32> {lmhlo.params = 1 : index},

@@ -1,0 +1,108 @@
+From 7f999298ac98e502e8b7bbe7ebbf0b5e27a0d5f8 Mon Sep 17 00:00:00 2001
+From: Dan Foreman-Mackey <danfm@google.com>
+Date: Thu, 13 Feb 2025 09:34:32 -0800
+Subject: [PATCH] Only cache jax.Array._npy_value when a copy is required.
+
+As discovered in https://github.com/jax-ml/jax/issues/26216, for non-standard dtypes, calling `np.array` on a JAX array will unnecessarily cache the constructed `_npy_value` even when a copy isn't required. This change updates the logic to only save the cached value when it is a copy.
+
+This fixes https://github.com/jax-ml/jax/issues/26216 by making the behavior consistent across dtypes, but we probably also want to expose a mechanism for clearing this cached value regardless.
+
+PiperOrigin-RevId: 726522955
+---
+ jax/_src/array.py   | 25 ++++++++++++++++++-------
+ tests/array_test.py | 18 +++++++++++++++++-
+ 2 files changed, 35 insertions(+), 8 deletions(-)
+
+diff --git a/jax/_src/array.py b/jax/_src/array.py
+index d18a2f4170c7..b2de0da5d96e 100644
+--- a/jax/_src/array.py
++++ b/jax/_src/array.py
+@@ -651,9 +651,18 @@ def block_until_ready(self):
+       db.block_until_ready()
+     return self
+ 
+-  @use_cpp_method()
+-  def _single_device_array_to_np_array(self):
+-    return np.asarray(self._arrays[0])
++  if xla_extension_version >= 314:
++    @use_cpp_method()
++    def _single_device_array_to_np_array_did_copy(self) -> tuple[np.ndarray, bool]:  # type: ignore
++      ...  # type: ignore
++
++  else:
++    @use_cpp_method()
++    def _single_device_array_to_np_array(self):
++      return np.asarray(self._arrays[0])
++
++    def _single_device_array_to_np_array_did_copy(self) -> tuple[np.ndarray, bool]:
++      return cast(np.ndarray, self._single_device_array_to_np_array()), True
+ 
+   @use_cpp_method()
+   def _copy_single_device_array_to_host_async(self):
+@@ -676,9 +685,11 @@ def _value(self) -> np.ndarray:
+ 
+     if self._npy_value is None:
+       if self.is_fully_replicated:
+-        self._npy_value = self._single_device_array_to_np_array()
+-        self._npy_value.flags.writeable = False
+-        return cast(np.ndarray, self._npy_value)
++        npy_value, did_copy = self._single_device_array_to_np_array_did_copy()
++        npy_value.flags.writeable = False
++        if did_copy:
++          self._npy_value = npy_value
++        return npy_value
+ 
+       # TODO(yashkatariya): Merge `_process_has_full_value_in_mcjax` with
+       # is_fully_addressable.
+@@ -697,7 +708,7 @@ def _value(self) -> np.ndarray:
+ 
+       npy_value = np.empty(self.shape, self.dtype)
+       for i, ind in _cached_index_calc(self.sharding, self.shape):
+-        npy_value[ind] = self._arrays[i]._single_device_array_to_np_array()
++        npy_value[ind], _ = self._arrays[i]._single_device_array_to_np_array_did_copy()
+       self._npy_value = npy_value
+       self._npy_value.flags.writeable = False
+     return self._npy_value
+diff --git a/tests/array_test.py b/tests/array_test.py
+index 5ea7eeb67795..dcda9435446b 100644
+--- a/tests/array_test.py
++++ b/tests/array_test.py
+@@ -29,6 +29,7 @@
+ from jax._src import test_util as jtu
+ from jax._src import xla_bridge as xb
+ from jax._src.lib import xla_client as xc
++from jax._src.lib import xla_extension_version
+ from jax._src.lib.mlir import dialects, ir
+ from jax._src.util import safe_zip
+ from jax._src.mesh import AxisTypes
+@@ -81,7 +82,8 @@ def test_jax_array_value(self, mesh_axes):
+       self.assertTrue(dispatch.is_single_device_sharding(s.data.sharding))
+       self.assertArraysEqual(s.data, global_data[s.index])
+     self.assertArraysEqual(arr._value, global_data)
+-    self.assertArraysEqual(arr._npy_value, global_data)
++    if arr._npy_value is not None:
++      self.assertArraysEqual(arr._npy_value, global_data)
+ 
+   @parameterized.named_parameters(
+       ("mesh_x_y", P("x", "y"),
+@@ -820,6 +822,20 @@ def test_make_array_from_process_data_single_host_data_sharding(self):
+     self.assertArraysEqual(result, data)
+     self.assertEqual(result.sharding, s)
+ 
++  @parameterized.product(dtype=jtu.dtypes.all + jtu.dtypes.custom_floats)
++  @jtu.run_on_devices("gpu")
++  def test_pinned_host_npy_value_doesnt_cache(self, dtype):
++    if xla_extension_version < 314:
++      self.skipTest("Requires XLA extension version >= 314")
++    # see https://github.com/jax-ml/jax/issues/26216
++    d_tensor = jnp.array(0, dtype=dtype)
++    d_sharding = d_tensor.sharding
++    h_sharding = d_sharding.with_memory_kind("pinned_host")
++    h_tensor = jax.device_put(d_tensor, h_sharding)
++    np.array(h_tensor)
++    self.assertIsNone(h_tensor._npy_value)
++
++
+ class ShardingTest(jtu.JaxTestCase):
+ 
+   def test_mesh_pspec_sharding_interface(self):

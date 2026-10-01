@@ -1,0 +1,67 @@
+From faef81a871860da2da7ab3aee8e2f44178d280b4 Mon Sep 17 00:00:00 2001
+From: Yash Katariya <yashkatariya@google.com>
+Date: Wed, 20 Aug 2025 15:06:22 -0700
+Subject: [PATCH] Always copy in wsc impl instead of forwarding the original
+ input. This matches device_put and identity jit behavior. Fixes
+ https://github.com/jax-ml/jax/issues/31199
+
+PiperOrigin-RevId: 797479995
+---
+ jax/_src/pjit.py   |  5 -----
+ tests/pjit_test.py | 17 ++++++++++-------
+ 2 files changed, 10 insertions(+), 12 deletions(-)
+
+diff --git a/jax/_src/pjit.py b/jax/_src/pjit.py
+index 80d2c14e33aa..e305075ca7c0 100644
+--- a/jax/_src/pjit.py
++++ b/jax/_src/pjit.py
+@@ -2846,14 +2846,9 @@ def _sharding_constraint_impl(x, sharding, layout, context_mesh,
+       sharding = NamedSharding(x.sharding.mesh, sharding.spec)
+ 
+   if layout is None:
+-    if hasattr(x, 'sharding') and x.sharding.is_equivalent_to(sharding, x.ndim):
+-      return x
+     # Run a jit here to raise good errors when device assignment don't match.
+     return api.jit(_identity_fn, out_shardings=sharding)(x)
+   else:
+-    if (hasattr(x, 'format') and x.format.layout == layout and
+-        x.sharding.is_equivalent_to(sharding, x.ndim)):
+-      return x
+     return api.jit(_identity_fn, out_shardings=Format(layout, sharding))(x)
+ 
+ 
+diff --git a/tests/pjit_test.py b/tests/pjit_test.py
+index 1e47a012fa66..a49a9de18a59 100644
+--- a/tests/pjit_test.py
++++ b/tests/pjit_test.py
+@@ -2640,6 +2640,16 @@ def _invoke_with_mesh_twice(arg_tuple):
+       for i, x, y in zip(range(n), xs, ys):
+         self.assertAllClose(x + i, y)
+ 
++  def test_wsc_eager_copy(self):
++    sharding = jax.sharding.SingleDeviceSharding(jax.devices()[0])
++    x = jnp.arange(10)
++    y_wsc = jax.lax.with_sharding_constraint(x, sharding)
++    y_jit = jax.jit(lambda x: x, out_shardings=sharding)(x)
++    y_dp = jax.device_put(x, sharding)
++    self.assertTrue(y_wsc.committed)
++    self.assertTrue(y_jit.committed)
++    self.assertTrue(y_dp.committed)
++
+   def test_trivial_computation(self):
+     shape = (8, 2)
+     mesh = jtu.create_mesh((2, 2), ('x', 'y'))
+@@ -3864,13 +3874,6 @@ def test_wsc_eager(self):
+     for s in out.addressable_shards:
+       self.assertArraysEqual(s.data, np_inp[s.index])
+ 
+-  def test_wsc_eager_no_resharding(self):
+-    mesh = jtu.create_mesh((2,), ('x',))
+-    np_inp = np.arange(8)
+-    inp = jax.device_put(np_inp, NamedSharding(mesh, P('x')))
+-    out = with_sharding_constraint(inp, NamedSharding(mesh, P('x')))
+-    self.assertEqual(id(out), id(inp))
+-
+   def test_wsc_eager_different_order_devices(self):
+     mesh1 = jtu.create_mesh((2,), ('x',))
+     mesh2 = jax.sharding.Mesh([jax.devices()[1], jax.devices()[0]], 'x')

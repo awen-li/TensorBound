@@ -1,0 +1,1294 @@
+From 031ebf1b3f1e98080fe94b5492294d827b711210 Mon Sep 17 00:00:00 2001
+From: Trevor Morris <tmorris@nvidia.com>
+Date: Thu, 13 Apr 2023 17:09:53 -0700
+Subject: [PATCH 1/8] Add util.reinterpret and use it to prevent unsigned
+ integer inputs/outputs from becoming signed
+
+---
+ .../Util/Conversion/ConversionPatterns.cpp    |  3 +
+ .../Dialect/Util/IR/UtilOpFolders.cpp         | 64 +++++++++++++++++++
+ .../iree/compiler/Dialect/Util/IR/UtilOps.cpp |  7 ++
+ .../iree/compiler/Dialect/Util/IR/UtilOps.td  | 23 +++++++
+ .../compiler/Dialect/Util/IR/test/BUILD.bazel |  1 +
+ .../Dialect/Util/IR/test/CMakeLists.txt       |  1 +
+ .../Util/IR/test/reinterpret_folding.mlir     | 21 ++++++
+ .../MHLO/ConvertMHLOToLinalgExt.cpp           |  4 +-
+ .../MHLO/MHLOToLinalgOnTensors.cpp            | 57 ++++++++++++++++-
+ .../MHLO/test/convert_mhlo_to_linalg_ext.mlir |  6 +-
+ .../MHLO/test/mhlo_to_linalg.mlir             | 24 ++++++-
+ 11 files changed, 201 insertions(+), 10 deletions(-)
+ create mode 100644 compiler/src/iree/compiler/Dialect/Util/IR/test/reinterpret_folding.mlir
+
+diff --git a/compiler/src/iree/compiler/Dialect/Util/Conversion/ConversionPatterns.cpp b/compiler/src/iree/compiler/Dialect/Util/Conversion/ConversionPatterns.cpp
+index 3272f7d4d814..1118b5e14909 100644
+--- a/compiler/src/iree/compiler/Dialect/Util/Conversion/ConversionPatterns.cpp
++++ b/compiler/src/iree/compiler/Dialect/Util/Conversion/ConversionPatterns.cpp
+@@ -33,6 +33,9 @@ void populateUtilConversionPatterns(MLIRContext *context,
+   patterns
+       .insert<GenericConvertTypesPattern<IREE::Util::OptimizationBarrierOp>>(
+           typeConverter, context);
++  patterns
++      .insert<GenericConvertTypesPattern<IREE::Util::ReinterpretOp>>(
++          typeConverter, context);
+ 
+   typeConverter.addConversion([&](IREE::Util::PtrType type,
+                                   SmallVectorImpl<Type> &results) {
+diff --git a/compiler/src/iree/compiler/Dialect/Util/IR/UtilOpFolders.cpp b/compiler/src/iree/compiler/Dialect/Util/IR/UtilOpFolders.cpp
+index 27a823a9abec..f2b1673f6666 100644
+--- a/compiler/src/iree/compiler/Dialect/Util/IR/UtilOpFolders.cpp
++++ b/compiler/src/iree/compiler/Dialect/Util/IR/UtilOpFolders.cpp
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ 
+ #include "iree/compiler/Dialect/Util/IR/UtilOps.h"
++#include "iree/compiler/Dialect/Stream/IR/StreamOps.h"
+ #include "llvm/ADT/BitVector.h"
+ #include "llvm/ADT/EquivalenceClasses.h"
+ #include "llvm/ADT/SmallPtrSet.h"
+@@ -820,6 +821,69 @@ OpFoldResult BufferLoadOp::fold(FoldAdaptor operands) {
+   return {};
+ }
+ 
++//===----------------------------------------------------------------------===//
++// util.reinterpret
++//===----------------------------------------------------------------------===//
++
++namespace {
++
++// Folds subspan ranges into storage ranges.
++//
++// Example:
++//  %0 = util.buffer.subspan %src[%subspan_offset] ... -> {%subspan_length}
++//  %storage, %offset = util.buffer.storage %0
++// ->
++//  %storage, %raw_offset = util.buffer.storage %src
++//  %offset = arith.addi %raw_offset, %subspan_offset
++struct ReinterpretReinterpretOptimization : public OpRewritePattern<ReinterpretOp> {
++  using OpRewritePattern<ReinterpretOp>::OpRewritePattern;
++
++  LogicalResult matchAndRewrite(ReinterpretOp op,
++                                PatternRewriter &rewriter) const override {
++    Value input = op.getInput();
++    Operation *definingOp = input.getDefiningOp();
++    if (!definingOp)
++      return failure();
++
++    if (ReinterpretOp reinterpretOp = dyn_cast<ReinterpretOp>(definingOp)) {
++      rewriter.replaceOpWithNewOp<ReinterpretOp>(
++          op, op.getType(), reinterpretOp.getInput());
++      return success();
++    }
++
++    return failure();
++  }
++};
++
++struct StreamExportReinterpretOptimization : public OpRewritePattern<ReinterpretOp> {
++  using OpRewritePattern<ReinterpretOp>::OpRewritePattern;
++
++  LogicalResult matchAndRewrite(ReinterpretOp op,
++                                PatternRewriter &rewriter) const override {
++    Value input = op.getInput();
++    Operation *definingOp = input.getDefiningOp();
++    if (!definingOp)
++      return failure();
++
++    if (IREE::Stream::TensorExportOp exportOp = dyn_cast<IREE::Stream::TensorExportOp>(definingOp)) {
++      // TODO(trevor-m): only if reinterpret output type is a stream resource?
++      rewriter.replaceOp(op, exportOp.getSource());
++      return success();
++    }
++
++    return failure();
++  }
++};
++
++}  // namespace
++
++void ReinterpretOp::getCanonicalizationPatterns(RewritePatternSet &results,
++                                                MLIRContext *context) {
++  results.insert<ReinterpretReinterpretOptimization>(context);
++  results.insert<StreamExportReinterpretOptimization>(context);
++}
++
++
+ }  // namespace Util
+ }  // namespace IREE
+ }  // namespace iree_compiler
+diff --git a/compiler/src/iree/compiler/Dialect/Util/IR/UtilOps.cpp b/compiler/src/iree/compiler/Dialect/Util/IR/UtilOps.cpp
+index 68435412f15b..562ad5076e7a 100644
+--- a/compiler/src/iree/compiler/Dialect/Util/IR/UtilOps.cpp
++++ b/compiler/src/iree/compiler/Dialect/Util/IR/UtilOps.cpp
+@@ -1372,6 +1372,13 @@ void BufferStoreOp::setSubrangeOperand(unsigned operandIndex,
+   getLengthMutable().assign(operand.length);
+ }
+ 
++bool ReinterpretOp::areCastCompatible(TypeRange inputs, TypeRange outputs) {
++  if (inputs.size() != 1 || outputs.size() != 1)
++    return false;
++  // TODO(trevor-m): Improve this.
++  return true;
++}
++
+ }  // namespace Util
+ }  // namespace IREE
+ }  // namespace iree_compiler
+diff --git a/compiler/src/iree/compiler/Dialect/Util/IR/UtilOps.td b/compiler/src/iree/compiler/Dialect/Util/IR/UtilOps.td
+index 25565928a83a..b93488fb5206 100644
+--- a/compiler/src/iree/compiler/Dialect/Util/IR/UtilOps.td
++++ b/compiler/src/iree/compiler/Dialect/Util/IR/UtilOps.td
+@@ -15,6 +15,7 @@ include "mlir/IR/FunctionInterfaces.td"
+ include "mlir/IR/OpAsmInterface.td"
+ include "mlir/IR/SymbolInterfaces.td"
+ include "mlir/Interfaces/CallInterfaces.td"
++include "mlir/Interfaces/CastInterfaces.td"
+ include "mlir/Interfaces/ControlFlowInterfaces.td"
+ include "mlir/Interfaces/InferTypeOpInterface.td"
+ include "mlir/Interfaces/SideEffectInterfaces.td"
+@@ -1218,4 +1219,26 @@ def Util_StatusCheckOkOp : Util_Op<"status.check_ok"> {
+   ];
+ }
+ 
++//===----------------------------------------------------------------------===//
++// ReinterpretOp
++//===----------------------------------------------------------------------===//
++
++def ReinterpretOp : Util_Op<"reinterpret", [
++  DeclareOpInterfaceMethods<CastOpInterface>,
++  Pure
++]> {
++  let summary = "An reinterpret conversion from one type to another";
++  let description = [{
++    A cast.
++  }];
++
++  let arguments = (ins AnyType:$input);
++  let results = (outs AnyType:$output);
++  let assemblyFormat = [{
++    $input `:` type($input) `to` type($output) attr-dict
++  }];
++
++  let hasCanonicalizer = 1;
++}
++
+ #endif  // IREE_DIALECT_UTIL_IR_UTIL_OPS
+diff --git a/compiler/src/iree/compiler/Dialect/Util/IR/test/BUILD.bazel b/compiler/src/iree/compiler/Dialect/Util/IR/test/BUILD.bazel
+index 38ec2fb9af76..10e7857a30f1 100644
+--- a/compiler/src/iree/compiler/Dialect/Util/IR/test/BUILD.bazel
++++ b/compiler/src/iree/compiler/Dialect/Util/IR/test/BUILD.bazel
+@@ -29,6 +29,7 @@ iree_lit_test_suite(
+             "numeric_ops.mlir",
+             "range_folding.mlir",
+             "range_ops.mlir",
++            "reinterpret_folding.mlir"
+             "structural_folding.mlir",
+             "structural_ops.mlir",
+         ],
+diff --git a/compiler/src/iree/compiler/Dialect/Util/IR/test/CMakeLists.txt b/compiler/src/iree/compiler/Dialect/Util/IR/test/CMakeLists.txt
+index f7b18133744f..052be16c8cd2 100644
+--- a/compiler/src/iree/compiler/Dialect/Util/IR/test/CMakeLists.txt
++++ b/compiler/src/iree/compiler/Dialect/Util/IR/test/CMakeLists.txt
+@@ -27,6 +27,7 @@ iree_lit_test_suite(
+     "numeric_ops.mlir"
+     "range_folding.mlir"
+     "range_ops.mlir"
++    "reinterpret_folding.mlir"
+     "structural_folding.mlir"
+     "structural_ops.mlir"
+   TOOLS
+diff --git a/compiler/src/iree/compiler/Dialect/Util/IR/test/reinterpret_folding.mlir b/compiler/src/iree/compiler/Dialect/Util/IR/test/reinterpret_folding.mlir
+new file mode 100644
+index 000000000000..b64f9d8a9f39
+--- /dev/null
++++ b/compiler/src/iree/compiler/Dialect/Util/IR/test/reinterpret_folding.mlir
+@@ -0,0 +1,21 @@
++// RUN: iree-opt --split-input-file --canonicalize %s | iree-opt --split-input-file | FileCheck %s
++
++// CHECK-LABEL: @ReinterpretReinterpretOptimization
++func.func @ReinterpretReinterpretOptimization(%arg0: tensor<2xi32>) -> tensor<2xi32> {
++  // CHECK-NEXT: return %arg0
++  %0 = util.reinterpret %arg0 : tensor<2xi32> to tensor<2xui32>
++  %1 = util.reinterpret %0 : tensor<2xui32> to tensor<2xi32>
++  return %1 : tensor<2xi32>
++}
++
++// -----
++
++// CHECK-LABEL: @StreamExportReinterpretOptimization
++func.func @StreamExportReinterpretOptimization(%arg0: !stream.resource<*>, %arg1: index) -> !stream.resource<external> {
++  // CHECK-NEXT: %[[RESULT:.+]] = stream.async.transfer %arg0 : !stream.resource<*>{%arg1} -> !stream.resource<external>{%arg1}
++  %0 = stream.async.transfer %arg0 : !stream.resource<*>{%arg1} -> !stream.resource<external>{%arg1}
++  %1 = stream.tensor.export %0 : tensor<2xui32> in !stream.resource<external>{%arg1} -> tensor<2xui32>
++  %2 = util.reinterpret %1 : tensor<2xui32> to !stream.resource<external>
++  // CHECK-NEXT: return %[[RESULT]]
++  return %2: !stream.resource<external>
++}
+diff --git a/compiler/src/iree/compiler/InputConversion/MHLO/ConvertMHLOToLinalgExt.cpp b/compiler/src/iree/compiler/InputConversion/MHLO/ConvertMHLOToLinalgExt.cpp
+index 974e04e4eb32..2ea504c00a80 100644
+--- a/compiler/src/iree/compiler/InputConversion/MHLO/ConvertMHLOToLinalgExt.cpp
++++ b/compiler/src/iree/compiler/InputConversion/MHLO/ConvertMHLOToLinalgExt.cpp
+@@ -71,7 +71,7 @@ static std::optional<Value> materializeCast(OpBuilder &builder, Type toType,
+ 
+     if (castType != fromType)
+       fromValue =
+-          builder.create<UnrealizedConversionCastOp>(loc, castType, fromValue)
++          builder.create<IREE::Util::ReinterpretOp>(loc, castType, fromValue)
+               ->getResult(0);
+   }
+ 
+@@ -597,7 +597,7 @@ struct ConvertMHLOToLinalgExtPass
+         });
+     // We deliberately allow unrealized casts to persist. These should fall away
+     // when the rest of MHLO is converted.
+-    target.addLegalOp<UnrealizedConversionCastOp>();
++    target.addLegalOp<IREE::Util::ReinterpretOp>();
+ 
+     if (failed(applyPartialConversion(getOperation(), target,
+                                       std::move(patterns)))) {
+diff --git a/compiler/src/iree/compiler/InputConversion/MHLO/MHLOToLinalgOnTensors.cpp b/compiler/src/iree/compiler/InputConversion/MHLO/MHLOToLinalgOnTensors.cpp
+index 3197903018b9..8338f83ebb91 100644
+--- a/compiler/src/iree/compiler/InputConversion/MHLO/MHLOToLinalgOnTensors.cpp
++++ b/compiler/src/iree/compiler/InputConversion/MHLO/MHLOToLinalgOnTensors.cpp
+@@ -357,6 +357,42 @@ std::optional<Value> scalarToTensor(OpBuilder &builder, Type /*type*/,
+       .getResult();
+ }
+ 
++std::optional<Value> materializeReinterpret(OpBuilder& builder, Type resultType,
++                               ValueRange inputs,
++                               Location loc) {
++  if (inputs.size() != 1)
++    return std::nullopt;
++  // if (getElementTypeOrSelf(inputs.front().getType()).isUnsignedInteger() ||
++  //     getElementTypeOrSelf(resultType).isUnsignedInteger())
++  return builder.create<IREE::Util::ReinterpretOp>(loc, resultType, inputs)
++    .getResult();
++}
++
++std::optional<Value> materializeCastFromIllegal(OpBuilder& builder, Type type,
++                                                ValueRange inputs,
++                                                Location loc) {
++  Type fromType = getElementTypeOrSelf(inputs[0].getType());
++  Type toType = getElementTypeOrSelf(type);
++  if ((!fromType.isSignedInteger() && !fromType.isUnsignedInteger()) ||
++      !toType.isSignlessInteger())
++    return std::nullopt;
++  // Use reinterpet to do signless->signful conversions.
++  return builder.create<IREE::Util::ReinterpretOp>(loc, type, inputs[0])
++      ->getResult(0);
++}
++
++std::optional<Value> materializeCastToIllegal(OpBuilder& builder, Type type,
++                                              ValueRange inputs, Location loc) {
++  Type fromType = getElementTypeOrSelf(inputs[0].getType());
++  Type toType = getElementTypeOrSelf(type);
++  if (!fromType.isSignlessInteger() ||
++      (!toType.isSignedInteger() && !toType.isUnsignedInteger()))
++    return std::nullopt;
++  // Use reinterpet to do signless->signful conversions.
++  return builder.create<IREE::Util::ReinterpretOp>(loc, type, inputs[0])
++      ->getResult(0);
++}
++
+ struct ConvertMHLOToLinalgOnTensorsPass
+     : public ConvertMHLOToLinalgOnTensorsBase<
+           ConvertMHLOToLinalgOnTensorsPass> {
+@@ -372,7 +408,11 @@ struct ConvertMHLOToLinalgOnTensorsPass
+     MLIRContext *context = &getContext();
+ 
+     auto typeConverter = mhlo::createHloToLinalgTypeConverter();
++    //auto typeConverter = std::make_unique<LinalgTypeConverter>();
+     typeConverter->addArgumentMaterialization(scalarToTensor);
++    typeConverter->addArgumentMaterialization(materializeReinterpret);
++    typeConverter->addTargetMaterialization(materializeReinterpret);
++    typeConverter->addSourceMaterialization(materializeReinterpret);
+     // NOTE: not using corresponding setupMHLOToFlowPatterns because the entire
+     // MHLO dialects are marked illegal by this pass.
+     // TODO: Collapse/rework all of these patterns once the consolidation
+@@ -419,6 +459,11 @@ struct ConvertMHLOToLinalgOnTensorsPass
+     ConversionTarget target(getContext());
+ 
+     auto isIllegalType = [&](Type t) { return !typeConverter->isLegal(t); };
++    auto isIllegalFuncType = [&](Type t) {
++      // Allows unsigned integers for function inputs and outputs.
++      return !typeConverter->isLegal(t) &&
++             !getElementTypeOrSelf(t).isUnsignedInteger();
++    };
+     auto isLegallyTypedOp = [&](Operation *op) -> bool {
+       for (Type type : op->getResultTypes()) {
+         if (isIllegalType(type)) return false;
+@@ -435,18 +480,23 @@ struct ConvertMHLOToLinalgOnTensorsPass
+     // Functions must have legal types.
+     target.addDynamicallyLegalOp<func::FuncOp>([&](func::FuncOp funcOp) {
+       for (Type type : funcOp.getFunctionType().getInputs()) {
+-        if (isIllegalType(type)) return false;
++        if (isIllegalFuncType(type)) return false;
+       }
+       for (Type type : funcOp.getFunctionType().getResults()) {
+-        if (isIllegalType(type)) return false;
++        if (isIllegalFuncType(type)) return false;
+       }
+       for (Block &block : funcOp.getFunctionBody()) {
+         for (Type type : block.getArgumentTypes()) {
+-          if (isIllegalType(type)) return false;
++          if (isIllegalFuncType(type)) return false;
+         }
+       }
+       return true;
+     });
++    target.addDynamicallyLegalOp<func::ReturnOp>([&](func::ReturnOp op) {
++      return llvm::all_of(op.getOperandTypes(), [&](Type type) {
++          return !isIllegalFuncType(type);
++        });
++    });
+     target.addDynamicallyLegalOp<ml_program::GlobalOp>(
+         [&](ml_program::GlobalOp op) {
+           return typeConverter->isLegal(op.getType());
+@@ -455,6 +505,7 @@ struct ConvertMHLOToLinalgOnTensorsPass
+     // Let the rest fall through.
+     target.addLegalDialect<BuiltinDialect>();
+     target.addLegalDialect<IREE::LinalgExt::IREELinalgExtDialect>();
++    target.addLegalOp<IREE::Util::ReinterpretOp>();
+     target.markUnknownOpDynamicallyLegal(isLegallyTypedOp);
+ 
+     if (failed(applyPartialConversion(getOperation(), target,
+diff --git a/compiler/src/iree/compiler/InputConversion/MHLO/test/convert_mhlo_to_linalg_ext.mlir b/compiler/src/iree/compiler/InputConversion/MHLO/test/convert_mhlo_to_linalg_ext.mlir
+index 1504703c22a2..abdf86727749 100644
+--- a/compiler/src/iree/compiler/InputConversion/MHLO/test/convert_mhlo_to_linalg_ext.mlir
++++ b/compiler/src/iree/compiler/InputConversion/MHLO/test/convert_mhlo_to_linalg_ext.mlir
+@@ -34,14 +34,14 @@ func.func @sort_1d_ui(%arg0: tensor<128xui32>) -> (tensor<128xui32>) {
+ // CHECK-LABEL: func.func @sort_1d_ui(
+ // CHECK-SAME:      %[[ARG0:[a-zA-Z0-9]+]]
+ // CHECK-SAME:  )
+-// CHECK:         %[[CAST:.+]] = builtin.unrealized_conversion_cast %[[ARG0]] : tensor<128xui32> to tensor<128xi32>
++// CHECK:         %[[CAST:.+]] = util.reinterpret %[[ARG0]] : tensor<128xui32> to tensor<128xi32>
+ // CHECK:         %[[SORT:.+]] = iree_linalg_ext.sort
+ // CHECK-SAME:      dimension(0)
+ // CHECK-SAME:      outs(%[[CAST]] : tensor<128xi32>)
+ // CHECK:           ^bb0(%[[ARG1:.+]]: i32, %[[ARG2:.+]]: i32)
+ // CHECK:             %[[CMP:.+]] = arith.cmpi ugt, %[[ARG1]], %[[ARG2]]
+ // CHECK:             iree_linalg_ext.yield %[[CMP]]
+-// CHECK:         %[[RESULT:.+]] = builtin.unrealized_conversion_cast %[[SORT]] : tensor<128xi32> to tensor<128xui32>
++// CHECK:         %[[RESULT:.+]] = util.reinterpret %[[SORT]] : tensor<128xi32> to tensor<128xui32>
+ // CHECK:         return %[[RESULT]]
+ 
+ // -----
+@@ -154,7 +154,7 @@ func.func @sort_unsigned_cst_capture(%arg0: tensor<1x5xf32>) -> tensor<1x5xf32>
+ // CHECK-SAME:      %[[ARG0:[a-zA-Z0-9]+]]
+ // CHECK-SAME:  )
+ // CHECK:         %[[UI32:.+]] = mhlo.constant dense<2> : tensor<ui32>
+-// CHECK:         %[[CONVERSION_CAST_CST:.+]] = builtin.unrealized_conversion_cast %[[UI32]] : tensor<ui32> to tensor<i32>
++// CHECK:         %[[CONVERSION_CAST_CST:.+]] = util.reinterpret %[[UI32]] : tensor<ui32> to tensor<i32>
+ // CHECK:         %[[EXTRACT_CST:.+]] = tensor.extract %[[CONVERSION_CAST_CST]][] : tensor<i32>
+ // CHECK:         %[[SORT:.+]] = iree_linalg_ext.sort
+ // CHECK-SAME:      dimension(1)
+diff --git a/compiler/src/iree/compiler/InputConversion/MHLO/test/mhlo_to_linalg.mlir b/compiler/src/iree/compiler/InputConversion/MHLO/test/mhlo_to_linalg.mlir
+index a135925569d1..d46772278ccf 100644
+--- a/compiler/src/iree/compiler/InputConversion/MHLO/test/mhlo_to_linalg.mlir
++++ b/compiler/src/iree/compiler/InputConversion/MHLO/test/mhlo_to_linalg.mlir
+@@ -19,11 +19,12 @@ func.func @concatenate(%arg0: tensor<2x2xi32>, %arg1: tensor<2x4xi32>) -> tensor
+ 
+ // CHECK: ml_program.global private mutable @variable(dense<0> : tensor<2xi32>) : tensor<2xi32>
+ ml_program.global private mutable @variable(dense<0> : tensor<2xui32>) : tensor<2xui32>
+-// CHECK: func.func @global_types() -> tensor<2xi32>
++// CHECK: func.func @global_types() -> tensor<2xui32>
+ func.func @global_types() -> tensor<2xui32> {
+   // CHECK-NEXT: %[[VALUE:.+]] = ml_program.global_load @variable : tensor<2xi32>
+   %0 = ml_program.global_load @variable : tensor<2xui32>
+-  // CHECK: return %[[VALUE]] : tensor<2xi32>
++  // CHECK-NEXT: %[[CAST:.*]] = util.reinterpret %[[VALUE]] : tensor<2xi32> to tensor<2xui32>
++  // CHECK: return %[[CAST]] : tensor<2xui32>
+   return %0 : tensor<2xui32>
+ }
+ 
+@@ -37,3 +38,22 @@ func.func @optimization_barrier(%arg0: tensor<3x4xf32>, %arg1: tensor<4xi32>) ->
+   %0, %1 = "mhlo.optimization_barrier"(%arg0, %arg1) : (tensor<3x4xf32>, tensor<4xi32>) -> (tensor<3x4xf32>, tensor<4xi32>)
+   return %0, %1 : tensor<3x4xf32>, tensor<4xi32>
+ }
++
++// -----
++
++// CHECK: @unsigned_integer_input_output(%[[ARG0:.*]]: tensor<2x2xui32>, %[[ARG1:.*]]: tensor<2x2xui32>) -> tensor<2x2xui32>
++func.func @unsigned_integer_input_output(%arg0: tensor<2x2xui32>, %arg1: tensor<2x2xui32>) -> tensor<2x2xui32> {
++  // CHECK: %[[CAST0:.*]] = util.reinterpret %[[ARG0]] : tensor<2x2xui32> to tensor<2x2xi32>
++  // CHECK: %[[CAST1:.*]] = util.reinterpret %[[ARG1]] : tensor<2x2xui32> to tensor<2x2xi32>
++  // CHECK: %[[INIT:.*]] = tensor.empty() : tensor<2x2xi32> 
++  // CHECK: %[[LINALG:.*]] = linalg.generic
++  //  CHECK-SAME:       ins(%[[CAST0]], %[[CAST1]] : tensor<2x2xi32>, tensor<2x2xi32>
++  //  CHECK-SAME:       outs(%[[INIT]] : tensor<2x2xi32>)
++  // CHECK: ^bb0(%[[IN0:.*]]: i32, %[[IN1:.*]]: i32, %out: i32): 
++  // CHECK: %[[ADD:.*]] = arith.addi %[[IN0]], %[[IN1]] : i32
++  // CHECK: linalg.yield %[[ADD:.*]] : i32 
++  %0 = "mhlo.add"(%arg0, %arg1) : (tensor<2x2xui32>, tensor<2x2xui32>) -> tensor<2x2xui32>
++  // CHECK: %[[CAST_RESULT:.*]] = util.reinterpret %[[LINALG]] : tensor<2x2xi32> to tensor<2x2xui32>
++  // CHECK: return %[[CAST_RESULT]]
++  return %0 : tensor<2x2xui32>
++}
+
+From 4993d7a3a672014b4732402bc43f08e360ff6077 Mon Sep 17 00:00:00 2001
+From: Trevor Morris <tmorris@nvidia.com>
+Date: Mon, 17 Apr 2023 12:21:55 -0700
+Subject: [PATCH 2/8] Remove dependency on Stream dialect
+
+---
+ .../Util/Conversion/ConversionPatterns.cpp    | 19 ++++++++++--
+ .../Dialect/Util/IR/UtilOpFolders.cpp         | 31 +------------------
+ .../Util/IR/test/reinterpret_folding.mlir     | 12 -------
+ 3 files changed, 18 insertions(+), 44 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/Dialect/Util/Conversion/ConversionPatterns.cpp b/compiler/src/iree/compiler/Dialect/Util/Conversion/ConversionPatterns.cpp
+index 1118b5e14909..3808e9f9a298 100644
+--- a/compiler/src/iree/compiler/Dialect/Util/Conversion/ConversionPatterns.cpp
++++ b/compiler/src/iree/compiler/Dialect/Util/Conversion/ConversionPatterns.cpp
+@@ -27,6 +27,22 @@ namespace iree_compiler {
+ // Utilities
+ //===----------------------------------------------------------------------===//
+ 
++namespace {
++
++struct RemoveReinterpretOptimization : public OpRewritePattern<IREE::Util::ReinterpretOp> {
++  using OpRewritePattern<IREE::Util::ReinterpretOp>::OpRewritePattern;
++
++  LogicalResult matchAndRewrite(IREE::Util::ReinterpretOp op,
++                                PatternRewriter &rewriter) const override {
++    Value input = op.getInput();
++    rewriter.replaceOp(op, input);
++    return success();
++  }
++};
++
++}
++
++
+ void populateUtilConversionPatterns(MLIRContext *context,
+                                     TypeConverter &typeConverter,
+                                     RewritePatternSet &patterns) {
+@@ -34,8 +50,7 @@ void populateUtilConversionPatterns(MLIRContext *context,
+       .insert<GenericConvertTypesPattern<IREE::Util::OptimizationBarrierOp>>(
+           typeConverter, context);
+   patterns
+-      .insert<GenericConvertTypesPattern<IREE::Util::ReinterpretOp>>(
+-          typeConverter, context);
++      .insert<RemoveReinterpretOptimization>(context);
+ 
+   typeConverter.addConversion([&](IREE::Util::PtrType type,
+                                   SmallVectorImpl<Type> &results) {
+diff --git a/compiler/src/iree/compiler/Dialect/Util/IR/UtilOpFolders.cpp b/compiler/src/iree/compiler/Dialect/Util/IR/UtilOpFolders.cpp
+index f2b1673f6666..35fcf18ac4a7 100644
+--- a/compiler/src/iree/compiler/Dialect/Util/IR/UtilOpFolders.cpp
++++ b/compiler/src/iree/compiler/Dialect/Util/IR/UtilOpFolders.cpp
+@@ -5,7 +5,6 @@
+ // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ 
+ #include "iree/compiler/Dialect/Util/IR/UtilOps.h"
+-#include "iree/compiler/Dialect/Stream/IR/StreamOps.h"
+ #include "llvm/ADT/BitVector.h"
+ #include "llvm/ADT/EquivalenceClasses.h"
+ #include "llvm/ADT/SmallPtrSet.h"
+@@ -827,14 +826,7 @@ OpFoldResult BufferLoadOp::fold(FoldAdaptor operands) {
+ 
+ namespace {
+ 
+-// Folds subspan ranges into storage ranges.
+-//
+-// Example:
+-//  %0 = util.buffer.subspan %src[%subspan_offset] ... -> {%subspan_length}
+-//  %storage, %offset = util.buffer.storage %0
+-// ->
+-//  %storage, %raw_offset = util.buffer.storage %src
+-//  %offset = arith.addi %raw_offset, %subspan_offset
++// Replaces reinterpet(reinterpret(x, A), B) with reinterpret(x, B)
+ struct ReinterpretReinterpretOptimization : public OpRewritePattern<ReinterpretOp> {
+   using OpRewritePattern<ReinterpretOp>::OpRewritePattern;
+ 
+@@ -855,32 +847,11 @@ struct ReinterpretReinterpretOptimization : public OpRewritePattern<ReinterpretO
+   }
+ };
+ 
+-struct StreamExportReinterpretOptimization : public OpRewritePattern<ReinterpretOp> {
+-  using OpRewritePattern<ReinterpretOp>::OpRewritePattern;
+-
+-  LogicalResult matchAndRewrite(ReinterpretOp op,
+-                                PatternRewriter &rewriter) const override {
+-    Value input = op.getInput();
+-    Operation *definingOp = input.getDefiningOp();
+-    if (!definingOp)
+-      return failure();
+-
+-    if (IREE::Stream::TensorExportOp exportOp = dyn_cast<IREE::Stream::TensorExportOp>(definingOp)) {
+-      // TODO(trevor-m): only if reinterpret output type is a stream resource?
+-      rewriter.replaceOp(op, exportOp.getSource());
+-      return success();
+-    }
+-
+-    return failure();
+-  }
+-};
+-
+ }  // namespace
+ 
+ void ReinterpretOp::getCanonicalizationPatterns(RewritePatternSet &results,
+                                                 MLIRContext *context) {
+   results.insert<ReinterpretReinterpretOptimization>(context);
+-  results.insert<StreamExportReinterpretOptimization>(context);
+ }
+ 
+ 
+diff --git a/compiler/src/iree/compiler/Dialect/Util/IR/test/reinterpret_folding.mlir b/compiler/src/iree/compiler/Dialect/Util/IR/test/reinterpret_folding.mlir
+index b64f9d8a9f39..9b163288f279 100644
+--- a/compiler/src/iree/compiler/Dialect/Util/IR/test/reinterpret_folding.mlir
++++ b/compiler/src/iree/compiler/Dialect/Util/IR/test/reinterpret_folding.mlir
+@@ -7,15 +7,3 @@ func.func @ReinterpretReinterpretOptimization(%arg0: tensor<2xi32>) -> tensor<2x
+   %1 = util.reinterpret %0 : tensor<2xui32> to tensor<2xi32>
+   return %1 : tensor<2xi32>
+ }
+-
+-// -----
+-
+-// CHECK-LABEL: @StreamExportReinterpretOptimization
+-func.func @StreamExportReinterpretOptimization(%arg0: !stream.resource<*>, %arg1: index) -> !stream.resource<external> {
+-  // CHECK-NEXT: %[[RESULT:.+]] = stream.async.transfer %arg0 : !stream.resource<*>{%arg1} -> !stream.resource<external>{%arg1}
+-  %0 = stream.async.transfer %arg0 : !stream.resource<*>{%arg1} -> !stream.resource<external>{%arg1}
+-  %1 = stream.tensor.export %0 : tensor<2xui32> in !stream.resource<external>{%arg1} -> tensor<2xui32>
+-  %2 = util.reinterpret %1 : tensor<2xui32> to !stream.resource<external>
+-  // CHECK-NEXT: return %[[RESULT]]
+-  return %2: !stream.resource<external>
+-}
+
+From 4cc04f9037c38b178c7c43283e434b828a06b173 Mon Sep 17 00:00:00 2001
+From: Trevor Morris <tmorris@nvidia.com>
+Date: Thu, 20 Apr 2023 12:20:27 -0700
+Subject: [PATCH 3/8] Switch to tensor.bitcast
+
+---
+ .../Conversion/StandardToStream/Patterns.cpp  | 16 +++++++++
+ .../Util/Conversion/ConversionPatterns.cpp    | 18 ----------
+ .../Dialect/Util/IR/UtilOpFolders.cpp         | 35 -------------------
+ .../iree/compiler/Dialect/Util/IR/UtilOps.cpp |  7 ----
+ .../iree/compiler/Dialect/Util/IR/UtilOps.td  | 22 ------------
+ .../MHLO/ConvertMHLOToLinalgExt.cpp           |  4 +--
+ .../MHLO/MHLOToLinalgOnTensors.cpp            | 16 ++++-----
+ 7 files changed, 26 insertions(+), 92 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/Dialect/Stream/Conversion/StandardToStream/Patterns.cpp b/compiler/src/iree/compiler/Dialect/Stream/Conversion/StandardToStream/Patterns.cpp
+index 79cbadee54cb..b58eb26b58e1 100644
+--- a/compiler/src/iree/compiler/Dialect/Stream/Conversion/StandardToStream/Patterns.cpp
++++ b/compiler/src/iree/compiler/Dialect/Stream/Conversion/StandardToStream/Patterns.cpp
+@@ -17,6 +17,21 @@
+ namespace mlir {
+ namespace iree_compiler {
+ 
++namespace {
++
++struct RemoveBitcastOptimization : public OpRewritePattern<tensor::BitcastOp> {
++  using OpRewritePattern<tensor::BitcastOp>::OpRewritePattern;
++
++  LogicalResult matchAndRewrite(tensor::BitcastOp op,
++                                PatternRewriter &rewriter) const override {
++    Value input = op.getSource();
++    rewriter.replaceOp(op, input);
++    return success();
++  }
++};
++
++}  // namespace
++
+ void populateStandardConstantToStreamPatterns(
+     MLIRContext *context, ConversionTarget &conversionTarget,
+     TypeConverter &typeConverter, RewritePatternSet &patterns);
+@@ -41,6 +56,7 @@ void populateStandardToStreamConversionPatterns(
+                                            typeConverter, patterns);
+   populateStandardStructuralToStreamPatterns(context, conversionTarget,
+                                              typeConverter, patterns);
++  patterns.insert<RemoveBitcastOptimization>(context);
+ }
+ 
+ }  // namespace iree_compiler
+diff --git a/compiler/src/iree/compiler/Dialect/Util/Conversion/ConversionPatterns.cpp b/compiler/src/iree/compiler/Dialect/Util/Conversion/ConversionPatterns.cpp
+index 3808e9f9a298..3272f7d4d814 100644
+--- a/compiler/src/iree/compiler/Dialect/Util/Conversion/ConversionPatterns.cpp
++++ b/compiler/src/iree/compiler/Dialect/Util/Conversion/ConversionPatterns.cpp
+@@ -27,30 +27,12 @@ namespace iree_compiler {
+ // Utilities
+ //===----------------------------------------------------------------------===//
+ 
+-namespace {
+-
+-struct RemoveReinterpretOptimization : public OpRewritePattern<IREE::Util::ReinterpretOp> {
+-  using OpRewritePattern<IREE::Util::ReinterpretOp>::OpRewritePattern;
+-
+-  LogicalResult matchAndRewrite(IREE::Util::ReinterpretOp op,
+-                                PatternRewriter &rewriter) const override {
+-    Value input = op.getInput();
+-    rewriter.replaceOp(op, input);
+-    return success();
+-  }
+-};
+-
+-}
+-
+-
+ void populateUtilConversionPatterns(MLIRContext *context,
+                                     TypeConverter &typeConverter,
+                                     RewritePatternSet &patterns) {
+   patterns
+       .insert<GenericConvertTypesPattern<IREE::Util::OptimizationBarrierOp>>(
+           typeConverter, context);
+-  patterns
+-      .insert<RemoveReinterpretOptimization>(context);
+ 
+   typeConverter.addConversion([&](IREE::Util::PtrType type,
+                                   SmallVectorImpl<Type> &results) {
+diff --git a/compiler/src/iree/compiler/Dialect/Util/IR/UtilOpFolders.cpp b/compiler/src/iree/compiler/Dialect/Util/IR/UtilOpFolders.cpp
+index 35fcf18ac4a7..27a823a9abec 100644
+--- a/compiler/src/iree/compiler/Dialect/Util/IR/UtilOpFolders.cpp
++++ b/compiler/src/iree/compiler/Dialect/Util/IR/UtilOpFolders.cpp
+@@ -820,41 +820,6 @@ OpFoldResult BufferLoadOp::fold(FoldAdaptor operands) {
+   return {};
+ }
+ 
+-//===----------------------------------------------------------------------===//
+-// util.reinterpret
+-//===----------------------------------------------------------------------===//
+-
+-namespace {
+-
+-// Replaces reinterpet(reinterpret(x, A), B) with reinterpret(x, B)
+-struct ReinterpretReinterpretOptimization : public OpRewritePattern<ReinterpretOp> {
+-  using OpRewritePattern<ReinterpretOp>::OpRewritePattern;
+-
+-  LogicalResult matchAndRewrite(ReinterpretOp op,
+-                                PatternRewriter &rewriter) const override {
+-    Value input = op.getInput();
+-    Operation *definingOp = input.getDefiningOp();
+-    if (!definingOp)
+-      return failure();
+-
+-    if (ReinterpretOp reinterpretOp = dyn_cast<ReinterpretOp>(definingOp)) {
+-      rewriter.replaceOpWithNewOp<ReinterpretOp>(
+-          op, op.getType(), reinterpretOp.getInput());
+-      return success();
+-    }
+-
+-    return failure();
+-  }
+-};
+-
+-}  // namespace
+-
+-void ReinterpretOp::getCanonicalizationPatterns(RewritePatternSet &results,
+-                                                MLIRContext *context) {
+-  results.insert<ReinterpretReinterpretOptimization>(context);
+-}
+-
+-
+ }  // namespace Util
+ }  // namespace IREE
+ }  // namespace iree_compiler
+diff --git a/compiler/src/iree/compiler/Dialect/Util/IR/UtilOps.cpp b/compiler/src/iree/compiler/Dialect/Util/IR/UtilOps.cpp
+index 562ad5076e7a..68435412f15b 100644
+--- a/compiler/src/iree/compiler/Dialect/Util/IR/UtilOps.cpp
++++ b/compiler/src/iree/compiler/Dialect/Util/IR/UtilOps.cpp
+@@ -1372,13 +1372,6 @@ void BufferStoreOp::setSubrangeOperand(unsigned operandIndex,
+   getLengthMutable().assign(operand.length);
+ }
+ 
+-bool ReinterpretOp::areCastCompatible(TypeRange inputs, TypeRange outputs) {
+-  if (inputs.size() != 1 || outputs.size() != 1)
+-    return false;
+-  // TODO(trevor-m): Improve this.
+-  return true;
+-}
+-
+ }  // namespace Util
+ }  // namespace IREE
+ }  // namespace iree_compiler
+diff --git a/compiler/src/iree/compiler/Dialect/Util/IR/UtilOps.td b/compiler/src/iree/compiler/Dialect/Util/IR/UtilOps.td
+index b93488fb5206..f3abeb8fb8ff 100644
+--- a/compiler/src/iree/compiler/Dialect/Util/IR/UtilOps.td
++++ b/compiler/src/iree/compiler/Dialect/Util/IR/UtilOps.td
+@@ -1219,26 +1219,4 @@ def Util_StatusCheckOkOp : Util_Op<"status.check_ok"> {
+   ];
+ }
+ 
+-//===----------------------------------------------------------------------===//
+-// ReinterpretOp
+-//===----------------------------------------------------------------------===//
+-
+-def ReinterpretOp : Util_Op<"reinterpret", [
+-  DeclareOpInterfaceMethods<CastOpInterface>,
+-  Pure
+-]> {
+-  let summary = "An reinterpret conversion from one type to another";
+-  let description = [{
+-    A cast.
+-  }];
+-
+-  let arguments = (ins AnyType:$input);
+-  let results = (outs AnyType:$output);
+-  let assemblyFormat = [{
+-    $input `:` type($input) `to` type($output) attr-dict
+-  }];
+-
+-  let hasCanonicalizer = 1;
+-}
+-
+ #endif  // IREE_DIALECT_UTIL_IR_UTIL_OPS
+diff --git a/compiler/src/iree/compiler/InputConversion/MHLO/ConvertMHLOToLinalgExt.cpp b/compiler/src/iree/compiler/InputConversion/MHLO/ConvertMHLOToLinalgExt.cpp
+index 2ea504c00a80..bdbe72ff56ee 100644
+--- a/compiler/src/iree/compiler/InputConversion/MHLO/ConvertMHLOToLinalgExt.cpp
++++ b/compiler/src/iree/compiler/InputConversion/MHLO/ConvertMHLOToLinalgExt.cpp
+@@ -71,7 +71,7 @@ static std::optional<Value> materializeCast(OpBuilder &builder, Type toType,
+ 
+     if (castType != fromType)
+       fromValue =
+-          builder.create<IREE::Util::ReinterpretOp>(loc, castType, fromValue)
++          builder.create<tensor::BitcastOp>(loc, castType, fromValue)
+               ->getResult(0);
+   }
+ 
+@@ -597,7 +597,7 @@ struct ConvertMHLOToLinalgExtPass
+         });
+     // We deliberately allow unrealized casts to persist. These should fall away
+     // when the rest of MHLO is converted.
+-    target.addLegalOp<IREE::Util::ReinterpretOp>();
++    //target.addLegalOp<tensor::BitcastOp>();
+ 
+     if (failed(applyPartialConversion(getOperation(), target,
+                                       std::move(patterns)))) {
+diff --git a/compiler/src/iree/compiler/InputConversion/MHLO/MHLOToLinalgOnTensors.cpp b/compiler/src/iree/compiler/InputConversion/MHLO/MHLOToLinalgOnTensors.cpp
+index 8338f83ebb91..e20ae2aeb685 100644
+--- a/compiler/src/iree/compiler/InputConversion/MHLO/MHLOToLinalgOnTensors.cpp
++++ b/compiler/src/iree/compiler/InputConversion/MHLO/MHLOToLinalgOnTensors.cpp
+@@ -357,14 +357,14 @@ std::optional<Value> scalarToTensor(OpBuilder &builder, Type /*type*/,
+       .getResult();
+ }
+ 
+-std::optional<Value> materializeReinterpret(OpBuilder& builder, Type resultType,
++std::optional<Value> materializeBitcast(OpBuilder& builder, Type resultType,
+                                ValueRange inputs,
+                                Location loc) {
+   if (inputs.size() != 1)
+     return std::nullopt;
+   // if (getElementTypeOrSelf(inputs.front().getType()).isUnsignedInteger() ||
+   //     getElementTypeOrSelf(resultType).isUnsignedInteger())
+-  return builder.create<IREE::Util::ReinterpretOp>(loc, resultType, inputs)
++  return builder.create<tensor::BitcastOp>(loc, resultType, inputs)
+     .getResult();
+ }
+ 
+@@ -377,7 +377,7 @@ std::optional<Value> materializeCastFromIllegal(OpBuilder& builder, Type type,
+       !toType.isSignlessInteger())
+     return std::nullopt;
+   // Use reinterpet to do signless->signful conversions.
+-  return builder.create<IREE::Util::ReinterpretOp>(loc, type, inputs[0])
++  return builder.create<tensor::BitcastOp>(loc, type, inputs[0])
+       ->getResult(0);
+ }
+ 
+@@ -389,7 +389,7 @@ std::optional<Value> materializeCastToIllegal(OpBuilder& builder, Type type,
+       (!toType.isSignedInteger() && !toType.isUnsignedInteger()))
+     return std::nullopt;
+   // Use reinterpet to do signless->signful conversions.
+-  return builder.create<IREE::Util::ReinterpretOp>(loc, type, inputs[0])
++  return builder.create<tensor::BitcastOp>(loc, type, inputs[0])
+       ->getResult(0);
+ }
+ 
+@@ -410,9 +410,9 @@ struct ConvertMHLOToLinalgOnTensorsPass
+     auto typeConverter = mhlo::createHloToLinalgTypeConverter();
+     //auto typeConverter = std::make_unique<LinalgTypeConverter>();
+     typeConverter->addArgumentMaterialization(scalarToTensor);
+-    typeConverter->addArgumentMaterialization(materializeReinterpret);
+-    typeConverter->addTargetMaterialization(materializeReinterpret);
+-    typeConverter->addSourceMaterialization(materializeReinterpret);
++    typeConverter->addArgumentMaterialization(materializeBitcast);
++    typeConverter->addTargetMaterialization(materializeBitcast);
++    typeConverter->addSourceMaterialization(materializeBitcast);
+     // NOTE: not using corresponding setupMHLOToFlowPatterns because the entire
+     // MHLO dialects are marked illegal by this pass.
+     // TODO: Collapse/rework all of these patterns once the consolidation
+@@ -505,7 +505,7 @@ struct ConvertMHLOToLinalgOnTensorsPass
+     // Let the rest fall through.
+     target.addLegalDialect<BuiltinDialect>();
+     target.addLegalDialect<IREE::LinalgExt::IREELinalgExtDialect>();
+-    target.addLegalOp<IREE::Util::ReinterpretOp>();
++    target.addLegalOp<tensor::BitcastOp>();
+     target.markUnknownOpDynamicallyLegal(isLegallyTypedOp);
+ 
+     if (failed(applyPartialConversion(getOperation(), target,
+
+From 22c8a319ec10b80e731020e0ff5088b6c9912ca3 Mon Sep 17 00:00:00 2001
+From: Trevor Morris <tmorris@nvidia.com>
+Date: Thu, 20 Apr 2023 13:17:47 -0700
+Subject: [PATCH 4/8] Update tests
+
+---
+ .../src/iree/compiler/Dialect/Util/IR/test/BUILD.bazel   | 1 -
+ .../iree/compiler/Dialect/Util/IR/test/CMakeLists.txt    | 1 -
+ .../Dialect/Util/IR/test/reinterpret_folding.mlir        | 9 ---------
+ .../MHLO/test/convert_mhlo_to_linalg_ext.mlir            | 6 +++---
+ .../InputConversion/MHLO/test/mhlo_to_linalg.mlir        | 8 ++++----
+ 5 files changed, 7 insertions(+), 18 deletions(-)
+ delete mode 100644 compiler/src/iree/compiler/Dialect/Util/IR/test/reinterpret_folding.mlir
+
+diff --git a/compiler/src/iree/compiler/Dialect/Util/IR/test/BUILD.bazel b/compiler/src/iree/compiler/Dialect/Util/IR/test/BUILD.bazel
+index 10e7857a30f1..38ec2fb9af76 100644
+--- a/compiler/src/iree/compiler/Dialect/Util/IR/test/BUILD.bazel
++++ b/compiler/src/iree/compiler/Dialect/Util/IR/test/BUILD.bazel
+@@ -29,7 +29,6 @@ iree_lit_test_suite(
+             "numeric_ops.mlir",
+             "range_folding.mlir",
+             "range_ops.mlir",
+-            "reinterpret_folding.mlir"
+             "structural_folding.mlir",
+             "structural_ops.mlir",
+         ],
+diff --git a/compiler/src/iree/compiler/Dialect/Util/IR/test/CMakeLists.txt b/compiler/src/iree/compiler/Dialect/Util/IR/test/CMakeLists.txt
+index 052be16c8cd2..f7b18133744f 100644
+--- a/compiler/src/iree/compiler/Dialect/Util/IR/test/CMakeLists.txt
++++ b/compiler/src/iree/compiler/Dialect/Util/IR/test/CMakeLists.txt
+@@ -27,7 +27,6 @@ iree_lit_test_suite(
+     "numeric_ops.mlir"
+     "range_folding.mlir"
+     "range_ops.mlir"
+-    "reinterpret_folding.mlir"
+     "structural_folding.mlir"
+     "structural_ops.mlir"
+   TOOLS
+diff --git a/compiler/src/iree/compiler/Dialect/Util/IR/test/reinterpret_folding.mlir b/compiler/src/iree/compiler/Dialect/Util/IR/test/reinterpret_folding.mlir
+deleted file mode 100644
+index 9b163288f279..000000000000
+--- a/compiler/src/iree/compiler/Dialect/Util/IR/test/reinterpret_folding.mlir
++++ /dev/null
+@@ -1,9 +0,0 @@
+-// RUN: iree-opt --split-input-file --canonicalize %s | iree-opt --split-input-file | FileCheck %s
+-
+-// CHECK-LABEL: @ReinterpretReinterpretOptimization
+-func.func @ReinterpretReinterpretOptimization(%arg0: tensor<2xi32>) -> tensor<2xi32> {
+-  // CHECK-NEXT: return %arg0
+-  %0 = util.reinterpret %arg0 : tensor<2xi32> to tensor<2xui32>
+-  %1 = util.reinterpret %0 : tensor<2xui32> to tensor<2xi32>
+-  return %1 : tensor<2xi32>
+-}
+diff --git a/compiler/src/iree/compiler/InputConversion/MHLO/test/convert_mhlo_to_linalg_ext.mlir b/compiler/src/iree/compiler/InputConversion/MHLO/test/convert_mhlo_to_linalg_ext.mlir
+index abdf86727749..e05b990f6dd9 100644
+--- a/compiler/src/iree/compiler/InputConversion/MHLO/test/convert_mhlo_to_linalg_ext.mlir
++++ b/compiler/src/iree/compiler/InputConversion/MHLO/test/convert_mhlo_to_linalg_ext.mlir
+@@ -34,14 +34,14 @@ func.func @sort_1d_ui(%arg0: tensor<128xui32>) -> (tensor<128xui32>) {
+ // CHECK-LABEL: func.func @sort_1d_ui(
+ // CHECK-SAME:      %[[ARG0:[a-zA-Z0-9]+]]
+ // CHECK-SAME:  )
+-// CHECK:         %[[CAST:.+]] = util.reinterpret %[[ARG0]] : tensor<128xui32> to tensor<128xi32>
++// CHECK:         %[[CAST:.+]] = tensor.bitcast %[[ARG0]] : tensor<128xui32> to tensor<128xi32>
+ // CHECK:         %[[SORT:.+]] = iree_linalg_ext.sort
+ // CHECK-SAME:      dimension(0)
+ // CHECK-SAME:      outs(%[[CAST]] : tensor<128xi32>)
+ // CHECK:           ^bb0(%[[ARG1:.+]]: i32, %[[ARG2:.+]]: i32)
+ // CHECK:             %[[CMP:.+]] = arith.cmpi ugt, %[[ARG1]], %[[ARG2]]
+ // CHECK:             iree_linalg_ext.yield %[[CMP]]
+-// CHECK:         %[[RESULT:.+]] = util.reinterpret %[[SORT]] : tensor<128xi32> to tensor<128xui32>
++// CHECK:         %[[RESULT:.+]] = tensor.bitcast %[[SORT]] : tensor<128xi32> to tensor<128xui32>
+ // CHECK:         return %[[RESULT]]
+ 
+ // -----
+@@ -154,7 +154,7 @@ func.func @sort_unsigned_cst_capture(%arg0: tensor<1x5xf32>) -> tensor<1x5xf32>
+ // CHECK-SAME:      %[[ARG0:[a-zA-Z0-9]+]]
+ // CHECK-SAME:  )
+ // CHECK:         %[[UI32:.+]] = mhlo.constant dense<2> : tensor<ui32>
+-// CHECK:         %[[CONVERSION_CAST_CST:.+]] = util.reinterpret %[[UI32]] : tensor<ui32> to tensor<i32>
++// CHECK:         %[[CONVERSION_CAST_CST:.+]] = tensor.bitcast %[[UI32]] : tensor<ui32> to tensor<i32>
+ // CHECK:         %[[EXTRACT_CST:.+]] = tensor.extract %[[CONVERSION_CAST_CST]][] : tensor<i32>
+ // CHECK:         %[[SORT:.+]] = iree_linalg_ext.sort
+ // CHECK-SAME:      dimension(1)
+diff --git a/compiler/src/iree/compiler/InputConversion/MHLO/test/mhlo_to_linalg.mlir b/compiler/src/iree/compiler/InputConversion/MHLO/test/mhlo_to_linalg.mlir
+index d46772278ccf..b2001e16c620 100644
+--- a/compiler/src/iree/compiler/InputConversion/MHLO/test/mhlo_to_linalg.mlir
++++ b/compiler/src/iree/compiler/InputConversion/MHLO/test/mhlo_to_linalg.mlir
+@@ -23,7 +23,7 @@ ml_program.global private mutable @variable(dense<0> : tensor<2xui32>) : tensor<
+ func.func @global_types() -> tensor<2xui32> {
+   // CHECK-NEXT: %[[VALUE:.+]] = ml_program.global_load @variable : tensor<2xi32>
+   %0 = ml_program.global_load @variable : tensor<2xui32>
+-  // CHECK-NEXT: %[[CAST:.*]] = util.reinterpret %[[VALUE]] : tensor<2xi32> to tensor<2xui32>
++  // CHECK-NEXT: %[[CAST:.*]] = tensor.bitcast %[[VALUE]] : tensor<2xi32> to tensor<2xui32>
+   // CHECK: return %[[CAST]] : tensor<2xui32>
+   return %0 : tensor<2xui32>
+ }
+@@ -43,8 +43,8 @@ func.func @optimization_barrier(%arg0: tensor<3x4xf32>, %arg1: tensor<4xi32>) ->
+ 
+ // CHECK: @unsigned_integer_input_output(%[[ARG0:.*]]: tensor<2x2xui32>, %[[ARG1:.*]]: tensor<2x2xui32>) -> tensor<2x2xui32>
+ func.func @unsigned_integer_input_output(%arg0: tensor<2x2xui32>, %arg1: tensor<2x2xui32>) -> tensor<2x2xui32> {
+-  // CHECK: %[[CAST0:.*]] = util.reinterpret %[[ARG0]] : tensor<2x2xui32> to tensor<2x2xi32>
+-  // CHECK: %[[CAST1:.*]] = util.reinterpret %[[ARG1]] : tensor<2x2xui32> to tensor<2x2xi32>
++  // CHECK: %[[CAST0:.*]] = tensor.bitcast %[[ARG0]] : tensor<2x2xui32> to tensor<2x2xi32>
++  // CHECK: %[[CAST1:.*]] = tensor.bitcast %[[ARG1]] : tensor<2x2xui32> to tensor<2x2xi32>
+   // CHECK: %[[INIT:.*]] = tensor.empty() : tensor<2x2xi32> 
+   // CHECK: %[[LINALG:.*]] = linalg.generic
+   //  CHECK-SAME:       ins(%[[CAST0]], %[[CAST1]] : tensor<2x2xi32>, tensor<2x2xi32>
+@@ -53,7 +53,7 @@ func.func @unsigned_integer_input_output(%arg0: tensor<2x2xui32>, %arg1: tensor<
+   // CHECK: %[[ADD:.*]] = arith.addi %[[IN0]], %[[IN1]] : i32
+   // CHECK: linalg.yield %[[ADD:.*]] : i32 
+   %0 = "mhlo.add"(%arg0, %arg1) : (tensor<2x2xui32>, tensor<2x2xui32>) -> tensor<2x2xui32>
+-  // CHECK: %[[CAST_RESULT:.*]] = util.reinterpret %[[LINALG]] : tensor<2x2xi32> to tensor<2x2xui32>
++  // CHECK: %[[CAST_RESULT:.*]] = tensor.bitcast %[[LINALG]] : tensor<2x2xi32> to tensor<2x2xui32>
+   // CHECK: return %[[CAST_RESULT]]
+   return %0 : tensor<2x2xui32>
+ }
+
+From a97bfb06026770c6c5c5042a60c54ad864ac6c5a Mon Sep 17 00:00:00 2001
+From: Trevor Morris <tmorris@nvidia.com>
+Date: Mon, 1 May 2023 13:31:51 -0700
+Subject: [PATCH 5/8] Clean up
+
+---
+ .../iree/compiler/Dialect/Util/IR/UtilOps.td  |  1 -
+ .../MHLO/ConvertMHLOToLinalgExt.cpp           |  3 ---
+ .../MHLO/MHLOToLinalgOnTensors.cpp            | 22 +++++--------------
+ 3 files changed, 5 insertions(+), 21 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/Dialect/Util/IR/UtilOps.td b/compiler/src/iree/compiler/Dialect/Util/IR/UtilOps.td
+index f3abeb8fb8ff..25565928a83a 100644
+--- a/compiler/src/iree/compiler/Dialect/Util/IR/UtilOps.td
++++ b/compiler/src/iree/compiler/Dialect/Util/IR/UtilOps.td
+@@ -15,7 +15,6 @@ include "mlir/IR/FunctionInterfaces.td"
+ include "mlir/IR/OpAsmInterface.td"
+ include "mlir/IR/SymbolInterfaces.td"
+ include "mlir/Interfaces/CallInterfaces.td"
+-include "mlir/Interfaces/CastInterfaces.td"
+ include "mlir/Interfaces/ControlFlowInterfaces.td"
+ include "mlir/Interfaces/InferTypeOpInterface.td"
+ include "mlir/Interfaces/SideEffectInterfaces.td"
+diff --git a/compiler/src/iree/compiler/InputConversion/MHLO/ConvertMHLOToLinalgExt.cpp b/compiler/src/iree/compiler/InputConversion/MHLO/ConvertMHLOToLinalgExt.cpp
+index bdbe72ff56ee..1d4ed27a27a1 100644
+--- a/compiler/src/iree/compiler/InputConversion/MHLO/ConvertMHLOToLinalgExt.cpp
++++ b/compiler/src/iree/compiler/InputConversion/MHLO/ConvertMHLOToLinalgExt.cpp
+@@ -595,9 +595,6 @@ struct ConvertMHLOToLinalgExtPass
+         [](mhlo::ComplexOp complexOp) {
+           return !isInBodyOfLinalgExtOps(complexOp);
+         });
+-    // We deliberately allow unrealized casts to persist. These should fall away
+-    // when the rest of MHLO is converted.
+-    //target.addLegalOp<tensor::BitcastOp>();
+ 
+     if (failed(applyPartialConversion(getOperation(), target,
+                                       std::move(patterns)))) {
+diff --git a/compiler/src/iree/compiler/InputConversion/MHLO/MHLOToLinalgOnTensors.cpp b/compiler/src/iree/compiler/InputConversion/MHLO/MHLOToLinalgOnTensors.cpp
+index e20ae2aeb685..bd9b536bae4e 100644
+--- a/compiler/src/iree/compiler/InputConversion/MHLO/MHLOToLinalgOnTensors.cpp
++++ b/compiler/src/iree/compiler/InputConversion/MHLO/MHLOToLinalgOnTensors.cpp
+@@ -357,17 +357,6 @@ std::optional<Value> scalarToTensor(OpBuilder &builder, Type /*type*/,
+       .getResult();
+ }
+ 
+-std::optional<Value> materializeBitcast(OpBuilder& builder, Type resultType,
+-                               ValueRange inputs,
+-                               Location loc) {
+-  if (inputs.size() != 1)
+-    return std::nullopt;
+-  // if (getElementTypeOrSelf(inputs.front().getType()).isUnsignedInteger() ||
+-  //     getElementTypeOrSelf(resultType).isUnsignedInteger())
+-  return builder.create<tensor::BitcastOp>(loc, resultType, inputs)
+-    .getResult();
+-}
+-
+ std::optional<Value> materializeCastFromIllegal(OpBuilder& builder, Type type,
+                                                 ValueRange inputs,
+                                                 Location loc) {
+@@ -376,7 +365,7 @@ std::optional<Value> materializeCastFromIllegal(OpBuilder& builder, Type type,
+   if ((!fromType.isSignedInteger() && !fromType.isUnsignedInteger()) ||
+       !toType.isSignlessInteger())
+     return std::nullopt;
+-  // Use reinterpet to do signless->signful conversions.
++  // Use bitcast to do signless->signful conversions.
+   return builder.create<tensor::BitcastOp>(loc, type, inputs[0])
+       ->getResult(0);
+ }
+@@ -388,7 +377,7 @@ std::optional<Value> materializeCastToIllegal(OpBuilder& builder, Type type,
+   if (!fromType.isSignlessInteger() ||
+       (!toType.isSignedInteger() && !toType.isUnsignedInteger()))
+     return std::nullopt;
+-  // Use reinterpet to do signless->signful conversions.
++  // Use bitcast to do signless->signful conversions.
+   return builder.create<tensor::BitcastOp>(loc, type, inputs[0])
+       ->getResult(0);
+ }
+@@ -408,11 +397,10 @@ struct ConvertMHLOToLinalgOnTensorsPass
+     MLIRContext *context = &getContext();
+ 
+     auto typeConverter = mhlo::createHloToLinalgTypeConverter();
+-    //auto typeConverter = std::make_unique<LinalgTypeConverter>();
+     typeConverter->addArgumentMaterialization(scalarToTensor);
+-    typeConverter->addArgumentMaterialization(materializeBitcast);
+-    typeConverter->addTargetMaterialization(materializeBitcast);
+-    typeConverter->addSourceMaterialization(materializeBitcast);
++    typeConverter->addArgumentMaterialization(materializeCastFromIllegal);
++    typeConverter->addTargetMaterialization(materializeCastFromIllegal);
++    typeConverter->addSourceMaterialization(materializeCastToIllegal);
+     // NOTE: not using corresponding setupMHLOToFlowPatterns because the entire
+     // MHLO dialects are marked illegal by this pass.
+     // TODO: Collapse/rework all of these patterns once the consolidation
+
+From d50c6b785f89ba1e287bb7c22d93e171383ded0d Mon Sep 17 00:00:00 2001
+From: Trevor Morris <tmorris@nvidia.com>
+Date: Wed, 10 May 2023 15:40:02 -0700
+Subject: [PATCH 6/8] Remove to stream patterns
+
+---
+ .../Conversion/StandardToStream/Patterns.cpp     | 16 ----------------
+ 1 file changed, 16 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/Dialect/Stream/Conversion/StandardToStream/Patterns.cpp b/compiler/src/iree/compiler/Dialect/Stream/Conversion/StandardToStream/Patterns.cpp
+index b58eb26b58e1..79cbadee54cb 100644
+--- a/compiler/src/iree/compiler/Dialect/Stream/Conversion/StandardToStream/Patterns.cpp
++++ b/compiler/src/iree/compiler/Dialect/Stream/Conversion/StandardToStream/Patterns.cpp
+@@ -17,21 +17,6 @@
+ namespace mlir {
+ namespace iree_compiler {
+ 
+-namespace {
+-
+-struct RemoveBitcastOptimization : public OpRewritePattern<tensor::BitcastOp> {
+-  using OpRewritePattern<tensor::BitcastOp>::OpRewritePattern;
+-
+-  LogicalResult matchAndRewrite(tensor::BitcastOp op,
+-                                PatternRewriter &rewriter) const override {
+-    Value input = op.getSource();
+-    rewriter.replaceOp(op, input);
+-    return success();
+-  }
+-};
+-
+-}  // namespace
+-
+ void populateStandardConstantToStreamPatterns(
+     MLIRContext *context, ConversionTarget &conversionTarget,
+     TypeConverter &typeConverter, RewritePatternSet &patterns);
+@@ -56,7 +41,6 @@ void populateStandardToStreamConversionPatterns(
+                                            typeConverter, patterns);
+   populateStandardStructuralToStreamPatterns(context, conversionTarget,
+                                              typeConverter, patterns);
+-  patterns.insert<RemoveBitcastOptimization>(context);
+ }
+ 
+ }  // namespace iree_compiler
+
+From 75f8dfeec026ef5a6898ccf7f117085cad76e1ef Mon Sep 17 00:00:00 2001
+From: Trevor Morris <tmorris@nvidia.com>
+Date: Wed, 10 May 2023 15:42:05 -0700
+Subject: [PATCH 7/8] Fix formatting
+
+---
+ .../MHLO/ConvertMHLOToLinalgExt.cpp               |  5 ++---
+ .../MHLO/MHLOToLinalgOnTensors.cpp                | 15 ++++++---------
+ 2 files changed, 8 insertions(+), 12 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/InputConversion/MHLO/ConvertMHLOToLinalgExt.cpp b/compiler/src/iree/compiler/InputConversion/MHLO/ConvertMHLOToLinalgExt.cpp
+index 1d4ed27a27a1..0c901dadd60f 100644
+--- a/compiler/src/iree/compiler/InputConversion/MHLO/ConvertMHLOToLinalgExt.cpp
++++ b/compiler/src/iree/compiler/InputConversion/MHLO/ConvertMHLOToLinalgExt.cpp
+@@ -70,9 +70,8 @@ static std::optional<Value> materializeCast(OpBuilder &builder, Type toType,
+       castType = shapedType.clone(castType);
+ 
+     if (castType != fromType)
+-      fromValue =
+-          builder.create<tensor::BitcastOp>(loc, castType, fromValue)
+-              ->getResult(0);
++      fromValue = builder.create<tensor::BitcastOp>(loc, castType, fromValue)
++                      ->getResult(0);
+   }
+ 
+   if (fromType.getRank() != 0) return fromValue;
+diff --git a/compiler/src/iree/compiler/InputConversion/MHLO/MHLOToLinalgOnTensors.cpp b/compiler/src/iree/compiler/InputConversion/MHLO/MHLOToLinalgOnTensors.cpp
+index bd9b536bae4e..7322b600f26e 100644
+--- a/compiler/src/iree/compiler/InputConversion/MHLO/MHLOToLinalgOnTensors.cpp
++++ b/compiler/src/iree/compiler/InputConversion/MHLO/MHLOToLinalgOnTensors.cpp
+@@ -357,7 +357,7 @@ std::optional<Value> scalarToTensor(OpBuilder &builder, Type /*type*/,
+       .getResult();
+ }
+ 
+-std::optional<Value> materializeCastFromIllegal(OpBuilder& builder, Type type,
++std::optional<Value> materializeCastFromIllegal(OpBuilder &builder, Type type,
+                                                 ValueRange inputs,
+                                                 Location loc) {
+   Type fromType = getElementTypeOrSelf(inputs[0].getType());
+@@ -366,11 +366,10 @@ std::optional<Value> materializeCastFromIllegal(OpBuilder& builder, Type type,
+       !toType.isSignlessInteger())
+     return std::nullopt;
+   // Use bitcast to do signless->signful conversions.
+-  return builder.create<tensor::BitcastOp>(loc, type, inputs[0])
+-      ->getResult(0);
++  return builder.create<tensor::BitcastOp>(loc, type, inputs[0])->getResult(0);
+ }
+ 
+-std::optional<Value> materializeCastToIllegal(OpBuilder& builder, Type type,
++std::optional<Value> materializeCastToIllegal(OpBuilder &builder, Type type,
+                                               ValueRange inputs, Location loc) {
+   Type fromType = getElementTypeOrSelf(inputs[0].getType());
+   Type toType = getElementTypeOrSelf(type);
+@@ -378,8 +377,7 @@ std::optional<Value> materializeCastToIllegal(OpBuilder& builder, Type type,
+       (!toType.isSignedInteger() && !toType.isUnsignedInteger()))
+     return std::nullopt;
+   // Use bitcast to do signless->signful conversions.
+-  return builder.create<tensor::BitcastOp>(loc, type, inputs[0])
+-      ->getResult(0);
++  return builder.create<tensor::BitcastOp>(loc, type, inputs[0])->getResult(0);
+ }
+ 
+ struct ConvertMHLOToLinalgOnTensorsPass
+@@ -481,9 +479,8 @@ struct ConvertMHLOToLinalgOnTensorsPass
+       return true;
+     });
+     target.addDynamicallyLegalOp<func::ReturnOp>([&](func::ReturnOp op) {
+-      return llvm::all_of(op.getOperandTypes(), [&](Type type) {
+-          return !isIllegalFuncType(type);
+-        });
++      return llvm::all_of(op.getOperandTypes(),
++                          [&](Type type) { return !isIllegalFuncType(type); });
+     });
+     target.addDynamicallyLegalOp<ml_program::GlobalOp>(
+         [&](ml_program::GlobalOp op) {
+
+From a499439d98b587fc2ae729d6609450f66071cb02 Mon Sep 17 00:00:00 2001
+From: Trevor Morris <tmorris@nvidia.com>
+Date: Wed, 10 May 2023 18:08:57 -0700
+Subject: [PATCH 8/8] Fix failing tests
+
+---
+ .../MHLO/MHLOToLinalgOnTensors.cpp            | 12 ++++++++
+ .../MHLO/test/broadcasting.mlir               | 20 ++++++++-----
+ .../MHLO/test/convert_collective_ops.mlir     |  3 +-
+ .../MHLO/test/convert_structural_types.mlir   | 29 ++++++++++++-------
+ 4 files changed, 45 insertions(+), 19 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/InputConversion/MHLO/MHLOToLinalgOnTensors.cpp b/compiler/src/iree/compiler/InputConversion/MHLO/MHLOToLinalgOnTensors.cpp
+index 7322b600f26e..dce9642895de 100644
+--- a/compiler/src/iree/compiler/InputConversion/MHLO/MHLOToLinalgOnTensors.cpp
++++ b/compiler/src/iree/compiler/InputConversion/MHLO/MHLOToLinalgOnTensors.cpp
+@@ -482,6 +482,18 @@ struct ConvertMHLOToLinalgOnTensorsPass
+       return llvm::all_of(op.getOperandTypes(),
+                           [&](Type type) { return !isIllegalFuncType(type); });
+     });
++    target.addDynamicallyLegalOp<func::CallOp>([&](func::CallOp op) {
++      return llvm::all_of(op.getOperandTypes(),
++                          [&](Type type) { return !isIllegalFuncType(type); });
++    });
++    target.addDynamicallyLegalOp<cf::CondBranchOp>([&](cf::CondBranchOp op) {
++      return llvm::all_of(op.getOperandTypes(),
++                          [&](Type type) { return !isIllegalFuncType(type); });
++    });
++    target.addDynamicallyLegalOp<cf::BranchOp>([&](cf::BranchOp op) {
++      return llvm::all_of(op.getOperandTypes(),
++                          [&](Type type) { return !isIllegalFuncType(type); });
++    });
+     target.addDynamicallyLegalOp<ml_program::GlobalOp>(
+         [&](ml_program::GlobalOp op) {
+           return typeConverter->isLegal(op.getType());
+diff --git a/compiler/src/iree/compiler/InputConversion/MHLO/test/broadcasting.mlir b/compiler/src/iree/compiler/InputConversion/MHLO/test/broadcasting.mlir
+index 39da1653db3a..e9fac89a60cc 100644
+--- a/compiler/src/iree/compiler/InputConversion/MHLO/test/broadcasting.mlir
++++ b/compiler/src/iree/compiler/InputConversion/MHLO/test/broadcasting.mlir
+@@ -409,14 +409,16 @@ func.func @fallbackDynamicReshape(%arg0 : tensor<4x?x3x?xui32>, %arg1 : tensor<5
+   // CHECK-DAG: %[[C4:.*]] = arith.constant 4 : index
+   // CHECK-DAG: %[[C2:.*]] = arith.constant 2 : index
+   // CHECK-DAG: %[[C1:.*]] = arith.constant 1 : index
++  // CHECK-DAG: %[[CAST_ARG:.*]] = tensor.bitcast %arg0 : tensor<4x?x3x?xui32> to tensor<4x?x3x?xi32>
+   // CHECK-DAG: %[[RESULT_D1:.*]] = tensor.extract %arg1[%[[C1]]] : tensor<5xindex>
+   // CHECK-DAG: %[[RESULT_D2:.*]] = tensor.extract %arg1[%[[C2]]] : tensor<5xindex>
+   // CHECK-DAG: %[[RESULT_D4:.*]] = tensor.extract %arg1[%[[C4]]] : tensor<5xindex>
+-  // CHECK-DAG: %[[ARG_D1:.*]] = tensor.dim %arg0, %[[C1]] : tensor<4x?x3x?xi32>
+-  // CHECK-DAG: %[[ARG_D3:.*]] = tensor.dim %arg0, %[[C3]] : tensor<4x?x3x?xi32>
+-  // CHECK-DAG: %[[RESULT:.*]] = flow.tensor.reshape %arg0 : tensor<4x?x3x?xi32>{%[[ARG_D1]], %[[ARG_D3]]} -> tensor<12x?x?x1x?xi32>{%[[RESULT_D1]], %[[RESULT_D2]], %[[RESULT_D4]]}
++  // CHECK-DAG: %[[ARG_D1:.*]] = tensor.dim %[[CAST_ARG]], %[[C1]] : tensor<4x?x3x?xi32>
++  // CHECK-DAG: %[[ARG_D3:.*]] = tensor.dim %[[CAST_ARG]], %[[C3]] : tensor<4x?x3x?xi32>
++  // CHECK-DAG: %[[RESULT:.*]] = flow.tensor.reshape %[[CAST_ARG]] : tensor<4x?x3x?xi32>{%[[ARG_D1]], %[[ARG_D3]]} -> tensor<12x?x?x1x?xi32>{%[[RESULT_D1]], %[[RESULT_D2]], %[[RESULT_D4]]}
+   %0 = "mhlo.dynamic_reshape"(%arg0, %arg1) : (tensor<4x?x3x?xui32>, tensor<5xindex>) -> tensor<12x?x?x1x?xui32>
+-  // CHECK: return %[[RESULT]]
++  // CHECK-DAG: %[[CAST_RESULT:.*]] = tensor.bitcast %[[RESULT]] : tensor<12x?x?x1x?xi32> to tensor<12x?x?x1x?xui32>
++  // CHECK: return %[[CAST_RESULT]]
+   return %0 : tensor<12x?x?x1x?xui32>
+ }
+ 
+@@ -427,16 +429,18 @@ func.func @fallbackDynamicReshapeInt(%arg0 : tensor<4x?x3x?xui32>, %arg1 : tenso
+   // CHECK-DAG: %[[C1:.*]] = arith.constant 1 : index
+   // CHECK-DAG: %[[C2:.*]] = arith.constant 2 : index
+   // CHECK-DAG: %[[C4:.*]] = arith.constant 4 : index
++  // CHECK-DAG: %[[CAST_ARG:.*]] = tensor.bitcast %arg0 : tensor<4x?x3x?xui32> to tensor<4x?x3x?xi32>
+   // CHECK-DAG: %[[D1:.*]] = tensor.extract %arg1[%[[C1]]] : tensor<5xi32>
+   // CHECK-DAG: %[[D2:.*]] = tensor.extract %arg1[%[[C2]]] : tensor<5xi32>
+   // CHECK-DAG: %[[D4:.*]] = tensor.extract %arg1[%[[C4]]] : tensor<5xi32>
+   // CHECK-DAG: %[[RESULT_D1:.*]] = arith.index_cast %[[D1]] : i32 to index
+   // CHECK-DAG: %[[RESULT_D2:.*]] = arith.index_cast %[[D2]] : i32 to index
+   // CHECK-DAG: %[[RESULT_D4:.*]] = arith.index_cast %[[D4]] : i32 to index
+-  // CHECK-DAG: %[[ARG_D1:.*]] = tensor.dim %arg0, %[[C1]] : tensor<4x?x3x?xi32>
+-  // CHECK-DAG: %[[ARG_D3:.*]] = tensor.dim %arg0, %[[C3]] : tensor<4x?x3x?xi32>
+-  // CHECK-DAG: %[[RESULT:.*]] = flow.tensor.reshape %arg0 : tensor<4x?x3x?xi32>{%[[ARG_D1]], %[[ARG_D3]]} -> tensor<12x?x?x1x?xi32>{%[[RESULT_D1]], %[[RESULT_D2]], %[[RESULT_D4]]}
++  // CHECK-DAG: %[[ARG_D1:.*]] = tensor.dim %[[CAST_ARG]], %[[C1]] : tensor<4x?x3x?xi32>
++  // CHECK-DAG: %[[ARG_D3:.*]] = tensor.dim %[[CAST_ARG]], %[[C3]] : tensor<4x?x3x?xi32>
++  // CHECK-DAG: %[[RESULT:.*]] = flow.tensor.reshape %[[CAST_ARG]] : tensor<4x?x3x?xi32>{%[[ARG_D1]], %[[ARG_D3]]} -> tensor<12x?x?x1x?xi32>{%[[RESULT_D1]], %[[RESULT_D2]], %[[RESULT_D4]]}
+   %0 = "mhlo.dynamic_reshape"(%arg0, %arg1) : (tensor<4x?x3x?xui32>, tensor<5xi32>) -> tensor<12x?x?x1x?xui32>
+-  // CHECK: return %[[RESULT]]
++  // CHECK-DAG: %[[CAST_RESULT:.*]] = tensor.bitcast %[[RESULT]] : tensor<12x?x?x1x?xi32> to tensor<12x?x?x1x?xui32>
++  // CHECK: return %[[CAST_RESULT]]
+   return %0 : tensor<12x?x?x1x?xui32>
+ }
+diff --git a/compiler/src/iree/compiler/InputConversion/MHLO/test/convert_collective_ops.mlir b/compiler/src/iree/compiler/InputConversion/MHLO/test/convert_collective_ops.mlir
+index f08df5d54969..b7a093659c85 100644
+--- a/compiler/src/iree/compiler/InputConversion/MHLO/test/convert_collective_ops.mlir
++++ b/compiler/src/iree/compiler/InputConversion/MHLO/test/convert_collective_ops.mlir
+@@ -6,7 +6,8 @@ func.func @replica_id() -> tensor<ui32> {
+   // CHECK-DAG: [[RANK:%.+]] = flow.channel.rank [[CHANNEL]] : index
+   // CHECK-DAG: [[CAST:%.+]] = arith.index_castui [[RANK]] : index to i32
+   // CHECK-DAG: [[TENSOR:%.+]] = tensor.from_elements [[CAST]] : tensor<i32>
+-  // CHECK-DAG: return [[TENSOR]] : tensor<i32>
++  // CHECK-DAG: [[BITCAST:%.+]] = tensor.bitcast [[TENSOR]] : tensor<i32> to tensor<ui32> 
++  // CHECK-DAG: return [[BITCAST]] : tensor<ui32>
+   %id = mhlo.replica_id : tensor<ui32>
+   return %id : tensor<ui32>
+ }
+diff --git a/compiler/src/iree/compiler/InputConversion/MHLO/test/convert_structural_types.mlir b/compiler/src/iree/compiler/InputConversion/MHLO/test/convert_structural_types.mlir
+index 964b5a174059..73455e737e11 100644
+--- a/compiler/src/iree/compiler/InputConversion/MHLO/test/convert_structural_types.mlir
++++ b/compiler/src/iree/compiler/InputConversion/MHLO/test/convert_structural_types.mlir
+@@ -2,24 +2,33 @@
+ 
+ // CHECK-LABEL: @func_cfg_conversion
+ module @func_cfg_conversion {
+-  // CHECK: func.func @caller(%arg0: tensor<2xi32>, %arg1: i1) -> tensor<2xi32>
++  // CHECK: func.func @caller(%arg0: tensor<2xui32>, %arg1: i1) -> tensor<2xui32>
+   func.func @caller(%arg0: tensor<2xui32>, %arg1 : i1) -> tensor<2xui32> {
+-    // CHECK: %[[RESULT:.*]] = call @callee(%arg0, %arg1) : (tensor<2xi32>, i1) -> tensor<2xi32>
++    // CHECK: %[[RESULT:.*]] = call @callee(%arg0, %arg1) : (tensor<2xui32>, i1) -> tensor<2xui32>
+     %1 = call @callee(%arg0, %arg1) : (tensor<2xui32>, i1) -> tensor<2xui32>
+-    // CHECK: return %[[RESULT]] : tensor<2xi32>
++    // CHECK: return %[[RESULT]] : tensor<2xui32>
+     return %1 : tensor<2xui32>
+   }
+ 
+-  // CHECK: func.func @callee(%arg0: tensor<2xi32>, %arg1: i1) -> tensor<2xi32>
++  // CHECK: func.func @callee(%arg0: tensor<2xui32>, %arg1: i1) -> tensor<2xui32>
+   func.func @callee(%arg0: tensor<2xui32>, %arg1: i1) -> tensor<2xui32> {
+-    // CHECK: cf.cond_br %arg1, ^bb1(%arg0 : tensor<2xi32>), ^bb2(%arg0 : tensor<2xi32>)
++    // CHECK: cf.cond_br %arg1, ^bb1(%arg0 : tensor<2xui32>), ^bb2(%arg0 : tensor<2xui32>)
+     cf.cond_br %arg1, ^bb1(%arg0 : tensor<2xui32>), ^bb2(%arg0 : tensor<2xui32>)
+-  // CHECK: ^bb1(%[[BB1_PHI:.*]]: tensor<2xi32>)
++  // CHECK: ^bb1(%[[BB1_PHI:.*]]: tensor<2xui32>)
+   ^bb1(%phi0 : tensor<2xui32>) :
+-    // CHECK: cf.br ^bb2(%[[BB1_PHI]] : tensor<2xi32>)
+-    cf.br ^bb2(%phi0 : tensor<2xui32>)
+-  // CHECK: ^bb2(%[[BB2_PHI:.*]]: tensor<2xi32>)
++    // CHECK: tensor.bitcast %[[BB1_PHI]] : tensor<2xui32> to tensor<2xi32> 
++    // CHECK: %[[BB1_PHI_ADD:.*]] = linalg.generic
++    // CHECK: %[[BB1_PHI_ADD_CAST:.*]] = tensor.bitcast %[[BB1_PHI_ADD]] : tensor<2xi32> to tensor<2xui32> 
++    // CHECK: cf.br ^bb2(%[[BB1_PHI_ADD_CAST]] : tensor<2xui32>)
++    %0 = "mhlo.add"(%phi0, %phi0) : (tensor<2xui32>, tensor<2xui32>) -> tensor<2xui32>
++    cf.br ^bb2(%0 : tensor<2xui32>)
++  // CHECK: ^bb2(%[[BB2_PHI:.*]]: tensor<2xui32>)
+   ^bb2(%phi1 : tensor<2xui32>):
+-    return %phi1 : tensor<2xui32>
++    // CHECK: tensor.bitcast %[[BB2_PHI]] : tensor<2xui32> to tensor<2xi32> 
++    // CHECK: %[[BB2_PHI_ADD:.*]] = linalg.generic
++    // CHECK: %[[BB2_PHI_ADD_CAST:.*]] = tensor.bitcast %[[BB2_PHI_ADD]] : tensor<2xi32> to tensor<2xui32> 
++    // CHECK: return %[[BB2_PHI_ADD_CAST]] : tensor<2xui32>
++    %1 = "mhlo.add"(%phi1, %phi1) : (tensor<2xui32>, tensor<2xui32>) -> tensor<2xui32>
++    return %1 : tensor<2xui32>
+   }
+ }

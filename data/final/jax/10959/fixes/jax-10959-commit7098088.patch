@@ -1,0 +1,57 @@
+From 7098088f4eb15cf750398889e4341dbc15cda1b3 Mon Sep 17 00:00:00 2001
+From: Skye Wanderman-Milne <skyewm@google.com>
+Date: Tue, 14 Jun 2022 16:43:38 -0700
+Subject: [PATCH] Add jax.config.jax_default_device to jax in-memory cache key
+
+This fixes a case where we'd get a cache hit when evaluating a
+primitive (e.g. jnp.ones) even if the default device was changed,
+causing the default device to not take effect.
+
+PiperOrigin-RevId: 454986939
+---
+ jax/_src/config.py |  2 +-
+ tests/api_test.py  | 18 ++++++++++++++++++
+ 2 files changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/jax/_src/config.py b/jax/_src/config.py
+index d66aa3036ef5..6d0043100df3 100644
+--- a/jax/_src/config.py
++++ b/jax/_src/config.py
+@@ -394,7 +394,7 @@ def _trace_context(self):
+     the C++ JIT state, which is handled separately."""
+     return (self.x64_enabled, self.jax_numpy_rank_promotion,
+             self.jax_default_matmul_precision, self.jax_dynamic_shapes,
+-            self.jax_numpy_dtype_promotion)
++            self.jax_numpy_dtype_promotion, self.jax_default_device)
+ 
+ class NoDefault: pass
+ no_default = NoDefault()
+diff --git a/tests/api_test.py b/tests/api_test.py
+index a4ac4f6936ec..1d7d9e026a2e 100644
+--- a/tests/api_test.py
++++ b/tests/api_test.py
+@@ -3349,6 +3349,24 @@ def test_default_backend(self):
+     first_local_device = api.local_devices()[0]
+     self.assertEqual(first_local_device.platform, api.default_backend())
+ 
++  @jtu.skip_on_devices("cpu")
++  def test_default_device(self):
++    system_default_device = jnp.zeros(2).device()
++    test_device = jax.devices("cpu")[-1]
++
++    # Sanity check creating array using system default device
++    self.assertEqual(jnp.ones(1).device(), system_default_device)
++
++    # Create array with default_device set
++    with jax.default_device(test_device):
++      # Hits cached primitive path
++      self.assertEqual(jnp.ones(1).device(), test_device)
++      # Uncached
++      self.assertEqual(jnp.zeros((1, 2)).device(), test_device)
++
++    # Test that we can reset to system default device
++    self.assertEqual(jnp.ones(1).device(), system_default_device)
++
+   def test_dunder_jax_array(self):
+     # https://github.com/google/jax/pull/4725
+ 

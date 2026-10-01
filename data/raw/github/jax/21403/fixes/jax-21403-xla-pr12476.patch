@@ -1,0 +1,71 @@
+From a9e6e733b54ba7165b50c245fc3eecef5659e3f5 Mon Sep 17 00:00:00 2001
+From: Bixia Zheng <bixia@google.com>
+Date: Wed, 15 May 2024 13:57:38 -0700
+Subject: [PATCH] [xla:spmd] Fix a problem in generating code for concat that
+ requires padding.
+
+When an internal concat operand requires padding, previously, we don't zero out
+the padded elements and the generated code produces incorrect results.
+
+Fix two existing tests.
+
+PiperOrigin-RevId: 634066344
+---
+ xla/service/spmd/spmd_partitioner.cc      |  3 ++-
+ xla/service/spmd/spmd_partitioner_test.cc | 12 ++++++++++--
+ 2 files changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/xla/service/spmd/spmd_partitioner.cc b/xla/service/spmd/spmd_partitioner.cc
+index d0cc58af4e341..2d99310671f39 100644
+--- a/xla/service/spmd/spmd_partitioner.cc
++++ b/xla/service/spmd/spmd_partitioner.cc
+@@ -2581,7 +2581,8 @@ Status SpmdPartitioningVisitor::HandleConcatenate(HloInstruction* hlo) {
+   int64_t offset = 0;
+   auto state = MakePartitioningState();
+   for (HloInstruction* operand : hlo->operands()) {
+-    auto spmd_operand = GetPartitionedHlo(operand).Reshard(sharding).hlo();
++    auto spmd_operand =
++        GetPartitionedHlo(operand).Reshard(sharding).PadWithZero().hlo();
+     std::vector<HloInstruction*> start_indices(
+         hlo->shape().rank(), b_.AddInstruction(HloInstruction::CreateConstant(
+                                  LiteralUtil::Zero(S32))));
+diff --git a/xla/service/spmd/spmd_partitioner_test.cc b/xla/service/spmd/spmd_partitioner_test.cc
+index 406580a9ad302..e542984ae1315 100644
+--- a/xla/service/spmd/spmd_partitioner_test.cc
++++ b/xla/service/spmd/spmd_partitioner_test.cc
+@@ -2207,13 +2207,17 @@ ENTRY entry {
+       AllOf(op::Copy(op::DynamicSlice(op::Pad(op::Parameter(), op::Constant()),
+                                       op::Constant(), op::Reshape())),
+             op::Shape("f32[14,129]"));
++  auto param0_adjusted =
++      AllOf(op::Select(op::Compare(op::Add(), op::Broadcast(op::Constant())),
++                       param0, op::Broadcast(op::Constant())),
++            op::Shape("f32[14,129]"));
+   auto param1 = AllOf(op::Copy(op::DynamicSlice(op::Parameter(), op::Constant(),
+                                                 op::Reshape())),
+                       op::Shape("f32[14,58]"));
+   EXPECT_THAT(root, AllOf(op::DynamicSlice(
+                               AllOf(op::AllReduce(op::DynamicUpdateSlice(
+                                         op::DynamicUpdateSlice(
+-                                            op::Broadcast(), param0,
++                                            op::Broadcast(), param0_adjusted,
+                                             op::Constant(), op::Multiply()),
+                                         param1, op::Constant(), op::Add())),
+                                     op::Shape("f32[14,374]")),
+@@ -2238,11 +2242,15 @@ ENTRY entry {
+ 
+   const auto root = module->entry_computation()->root_instruction();
+   auto param0 = AllOf(op::Parameter(0), op::Shape("f32[7,129]"));
++  auto param0_adjusted =
++      AllOf(op::Select(op::Compare(op::Add(), op::Broadcast(op::Constant())),
++                       param0, op::Broadcast(op::Constant())),
++            op::Shape("f32[7,129]"));
+   auto param1 = AllOf(op::Parameter(1), op::Shape("f32[7,58]"));
+   EXPECT_THAT(root, AllOf(op::DynamicSlice(
+                               AllOf(op::AllReduce(op::DynamicUpdateSlice(
+                                         op::DynamicUpdateSlice(
+-                                            op::Broadcast(), param0,
++                                            op::Broadcast(), param0_adjusted,
+                                             op::Constant(), op::Multiply()),
+                                         param1, op::Constant(), op::Add())),
+                                     op::Shape("f32[7,374]")),

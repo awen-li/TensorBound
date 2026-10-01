@@ -1,0 +1,180 @@
+From bc15967933f3b0a172b8f24e8773f2f2e43f3188 Mon Sep 17 00:00:00 2001
+From: Yash Katariya <yashkatariya@google.com>
+Date: Mon, 19 Aug 2024 15:10:00 -0700
+Subject: [PATCH] If input layouts are specified via `in_shardings` to `jit`
+ and the array that the jitted function is called with is uncommitted, reshard
+ the input array to the layout specified by the user.
+
+Not doing the resharding, leads to incorrect outputs on GPU and a crash on TPU which is not good.
+
+Fixes: https://github.com/google/jax/issues/23100
+PiperOrigin-RevId: 665000157
+---
+ xla/python/BUILD         |  2 ++
+ xla/python/pjit.cc       | 49 ++++++++++++++++++++++++++++++++--------
+ xla/python/xla_client.py |  2 +-
+ 3 files changed, 42 insertions(+), 11 deletions(-)
+
+diff --git a/xla/python/BUILD b/xla/python/BUILD
+index 75103eb697e46..9999ab6fd2cfd 100644
+--- a/xla/python/BUILD
++++ b/xla/python/BUILD
+@@ -754,11 +754,13 @@ cc_library(
+         "@com_google_absl//absl/types:span",
+         "@nanobind",
+         "@local_config_python//:python_headers",  # buildcleaner: keep
++        "//xla:shape_util",
+         "//xla:util",
+         "//xla/pjrt:exceptions",
+         "//xla/pjrt:lru_cache",
+         "//xla/pjrt:pjrt_client",
+         "//xla/pjrt:pjrt_future",
++        "//xla/pjrt:pjrt_layout",
+         "//xla/pjrt:status_casters",
+         "//xla/python/ifrt",
+         "//xla/tsl/concurrency:ref_count",
+diff --git a/xla/python/pjit.cc b/xla/python/pjit.cc
+index 51a7bb7ff976a..6bbe898eba48f 100644
+--- a/xla/python/pjit.cc
++++ b/xla/python/pjit.cc
+@@ -46,8 +46,10 @@ limitations under the License.
+ #include "nanobind/stl/string.h"  // IWYU pragma: keep
+ #include "nanobind/stl/string_view.h"  // IWYU pragma: keep
+ #include "nanobind/stl/vector.h"  // IWYU pragma: keep
++#include "xla/layout.h"
+ #include "xla/pjrt/exceptions.h"
+ #include "xla/pjrt/lru_cache.h"
++#include "xla/pjrt/pjrt_layout.h"
+ #include "xla/python/ifrt/array.h"
+ #include "xla/python/ifrt/device.h"
+ #include "xla/python/ifrt/memory.h"
+@@ -90,6 +92,7 @@ struct PjitCacheEntry {
+   // Bitvector of kept arguments from Jaxpr DCE pass. Used to drop some `args`
+   // in PjitFunction::Call before calling into compiled computation.
+   std::vector<bool> kept_var_bitvec;
++  std::vector<nb::object> in_device_local_layouts;
+ 
+   // Ensures a single thread performs the compilation for a given executable.
+   //
+@@ -351,11 +354,12 @@ PjitFunction::PjitFunction(
+ PjitFunction::~PjitFunction() { GetGlobalPjitFunctionStore().Erase(this); }
+ 
+ void CallShardArgFallback(
+-    nb::handle arg, nb::handle sharding, const nb::callable& fallback,
++    nb::handle arg, nb::handle sharding, nb::handle layout,
++    const nb::callable& fallback,
+     std::vector<tsl::RCReference<xla::ifrt::Array>>& num_args_arrays,
+     std::vector<nb::object>& keep_alive_objects) {
+   tsl::profiler::TraceMe traceme("cpp_pjit_shard_arg_fallback");
+-  auto py_array_or_bufs = fallback(arg, sharding);
++  auto py_array_or_bufs = fallback(arg, sharding, layout);
+   auto py_array = nb::cast<xla::PyArray>(py_array_or_bufs);
+   num_args_arrays.push_back(tsl::FormRef(py_array.ifrt_array()));
+   keep_alive_objects.push_back(std::move(py_array_or_bufs));
+@@ -368,6 +372,7 @@ PrepareIfrtInputs(const xla::PyLoadedExecutable& executable,
+                   absl::Span<nb::object const> flat_dynamic_args,
+                   bool enable_x64, const std::vector<bool>& kept_args,
+                   const std::vector<nb::object>& in_shardings,
++                  const std::vector<nb::object>& in_device_local_layouts,
+                   const nb::callable& shard_arg_fallback,
+                   std::vector<nb::object>& keep_alive_objects) {
+   const auto& addressable_devices =
+@@ -401,11 +406,13 @@ PrepareIfrtInputs(const xla::PyLoadedExecutable& executable,
+     ++dce_i;
+ 
+     const nb::object& arg = flat_dynamic_args[i];
++    const nb::object& in_device_local_layout =
++        in_device_local_layouts[dce_index];
+ 
+     auto transfer_guard_formatter = [] { return std::string(""); };
+ 
+     if (arg.type().ptr() != xla::PyArray::type().ptr()) {
+-      if (data_device != nullptr) {
++      if (data_device != nullptr && in_device_local_layout.is_none()) {
+         TF_RETURN_IF_ERROR(
+             jax::ApplyTransferGuardToHostToDevice(transfer_guard_formatter));
+         TF_ASSIGN_OR_RETURN(
+@@ -426,8 +433,8 @@ PrepareIfrtInputs(const xla::PyLoadedExecutable& executable,
+         continue;
+       } else {
+         CallShardArgFallback(arg.ptr(), in_shardings[dce_index],
+-                             shard_arg_fallback, num_args_arrays,
+-                             keep_alive_objects);
++                             in_device_local_layout, shard_arg_fallback,
++                             num_args_arrays, keep_alive_objects);
+         continue;
+       }
+     }
+@@ -442,17 +449,31 @@ PrepareIfrtInputs(const xla::PyLoadedExecutable& executable,
+     DCHECK(py_array.committed() ||
+            (!py_array.committed() && sharding_num_devices == 1));
+ 
++    if (!in_device_local_layout.is_none()) {
++      TF_ASSIGN_OR_RETURN(auto arr_layout, py_array.ifrt_array()->layout());
++      xla::Layout in_xc_layout = nb::cast<xla::Layout>(
++          in_device_local_layout.attr("_to_xla_layout")(py_array.dtype()));
++      if (in_xc_layout != GetXlaLayoutUnsafe(arr_layout)) {
++        CallShardArgFallback(arg.ptr(), in_shardings[dce_index],
++                             in_device_local_layout, shard_arg_fallback,
++                             num_args_arrays, keep_alive_objects);
++        continue;
++      }
++    }
++
+     if (sharding.type().ptr() == jax::PmapSharding::type().ptr()) {
++      CHECK(in_device_local_layout.is_none());
+       CallShardArgFallback(arg.ptr(), in_shardings[dce_index],
+-                           shard_arg_fallback, num_args_arrays,
+-                           keep_alive_objects);
++                           in_device_local_layout, shard_arg_fallback,
++                           num_args_arrays, keep_alive_objects);
+       continue;
+     }
+ 
+     if (py_array.num_shards() != addressable_devices.size()) {
++      CHECK(in_device_local_layout.is_none());
+       CallShardArgFallback(arg.ptr(), in_shardings[dce_index],
+-                           shard_arg_fallback, num_args_arrays,
+-                           keep_alive_objects);
++                           in_device_local_layout, shard_arg_fallback,
++                           num_args_arrays, keep_alive_objects);
+       continue;
+     }
+ 
+@@ -659,7 +680,8 @@ absl::StatusOr<nb::object> PjitFunction::Call(nb::handle callable,
+   auto num_args_arrays = PrepareIfrtInputs(
+       *cache_entry->executable, flat_dynamic_args,
+       call_signature.jax_enable_x64, cache_entry->kept_var_bitvec,
+-      cache_entry->in_shardings, shard_arg_fallback_, keep_alive_objects);
++      cache_entry->in_shardings, cache_entry->in_device_local_layouts,
++      shard_arg_fallback_, keep_alive_objects);
+ 
+   if (!num_args_arrays.ok()) {
+     VLOG(2) << "Failed to prepare IFRT inputs: " << num_args_arrays.status();
+@@ -821,6 +843,13 @@ void PjitFunction::PopulateCacheEntry(PjitCacheEntry& cache_entry,
+   for (nb::handle k : kept_var_bitvec) {
+     cache_entry.kept_var_bitvec.push_back(nb::cast<bool>(k));
+   }
++
++  nb::sequence in_device_local_layouts =
++      fastpath_data.attr("in_device_local_layouts");
++  cache_entry.in_device_local_layouts.reserve(nb::len(in_device_local_layouts));
++  for (nb::handle dll : in_device_local_layouts) {
++    cache_entry.in_device_local_layouts.push_back(nb::borrow(dll));
++  }
+ }
+ 
+ // Helper function used by the tp_clear GC method.
+diff --git a/xla/python/xla_client.py b/xla/python/xla_client.py
+index 04cddf2646b2e..294f109a8d8f7 100644
+--- a/xla/python/xla_client.py
++++ b/xla/python/xla_client.py
+@@ -50,7 +50,7 @@
+ 
+ # Just an internal arbitrary increasing number to help with backward-compatible
+ # changes. In JAX, reference this via jax._src.lib.xla_extension_version.
+-_version = 281
++_version = 282
+ 
+ # Version number for MLIR:Python components.
+ mlir_api_version = 57

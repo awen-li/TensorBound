@@ -1,0 +1,262 @@
+From 026ab07107f6596a6b28bf4990a93659d2c0bcab Mon Sep 17 00:00:00 2001
+From: "haojiang.lh" <haojiang.lh@alibaba-inc.com>
+Date: Wed, 12 Aug 2026 14:16:02 +0800
+Subject: [PATCH 1/2] [inductor] Fix mix-order reduction dropping writes to
+ NonOwningLayout outputs
+
+When the output buffer of a mix-order-fused reduction is a view into
+another buffer's storage (ir.NonOwningLayout, e.g. the grads of chunk()-ed
+slices of a shared parameter assembled into one buffer by cat), the
+final-reduce codegen in _codegen_mix_order_reduction emitted
+
+    buf3 = workspace_0[...].view(nsplit, rnumel).sum(dim=0).view(...)
+
+which rebinds the Python variable to a fresh standalone tensor. The
+reinterpret_tensor alias into the shared buffer emitted by mark_run() is
+discarded, so the corresponding region of the shared buffer is never
+written and the returned gradient contains uninitialized (or bitwise-stale)
+memory.
+
+This silently corrupted the second norm's shift/scale gradients for the
+DiT/AdaLN scale_shift_table pattern (chained modulated LayerNorms with
+modulation vectors chunked from one shared parameter), a regression
+introduced when mix-order reduction became default-enabled in 2.10.
+
+Fix: when the buffer has NonOwningLayout, emit the allocation for the view
+(idempotent) and write through it with copy_() instead of rebinding the
+name.
+
+Fixes #193061
+
+This PR was authored with the assistance of an AI coding assistant; the
+change and tests were reviewed and verified by the submitter on H20 GPUs
+(repro from the issue: all cases pass; test/inductor/test_mix_order_reduction.py:
+277 passed).
+---
+ test/inductor/test_mix_order_reduction.py | 38 +++++++++++++++++++++++
+ torch/_inductor/codegen/simd.py           | 27 +++++++++++-----
+ 2 files changed, 58 insertions(+), 7 deletions(-)
+
+diff --git a/test/inductor/test_mix_order_reduction.py b/test/inductor/test_mix_order_reduction.py
+index 60c59a3a3c85e..5f7de010434f9 100644
+--- a/test/inductor/test_mix_order_reduction.py
++++ b/test/inductor/test_mix_order_reduction.py
+@@ -828,6 +828,44 @@ def f(xs, w, bias, eps):
+         # a single mix order reduction kernel get shared
+         FileCheck().check_count("MixOrderReductionGrid", 1, exactly=True).run(wrapper)
+ 
++    @parametrize("split_reductions", (False, True))
++    def test_chained_modulated_norm_shared_table(self, split_reductions):
++        """
++        Regression test for https://github.com/pytorch/pytorch/issues/193061
++
++        The grads of the chunk()-ed shared table assemble into one buffer via
++        cat, so the mix-order reduction outputs have NonOwningLayout. The
++        final reduction must write through the view instead of rebinding the
++        name, otherwise the second norm's slice grads are never written.
++        """
++        if not inductor_config.triton.mix_order_reduction:
++            self.skipTest("Mix order reduction not enabled")
++
++        M, N = 32768, 512
++        eps = 1e-6
++
++        def f(x, table):
++            mods = table.chunk(4, dim=1)
++            for i in range(2):
++                shift, scale = mods[2 * i], mods[2 * i + 1]
++                x = x + (F.layer_norm(x, x.shape[-1:], eps=eps) * (1 + scale) + shift)
++            return x.square().mean()
++
++        x = torch.randn(1, M, N, device=GPU_TYPE)
++        table = torch.randn(1, 4, N, device=GPU_TYPE, requires_grad=True)
++
++        (ref_grad,) = torch.autograd.grad(f(x, table), table)
++        act = torch.compile(
++            f,
++            options={
++                "split_reductions": split_reductions,
++            },
++        )(x, table)
++        (act_grad,) = torch.autograd.grad(act, table)
++
++        self.assertTrue(metrics.codegen_mix_order_reduction > 0)
++        torch.testing.assert_close(ref_grad, act_grad, atol=1e-4, rtol=1e-4)
++
+     @inductor_config.patch(split_reductions=False)
+     def test_dont_fuse_nodes_that_introduce_producer_consumer_rel(self):
+         """
+diff --git a/torch/_inductor/codegen/simd.py b/torch/_inductor/codegen/simd.py
+index 146737c5e272c..a4efd31433f2e 100644
+--- a/torch/_inductor/codegen/simd.py
++++ b/torch/_inductor/codegen/simd.py
+@@ -2967,7 +2967,9 @@ def _bench(candidate_split_size):
+             opname = reduction_type2op.get(
+                 partial_accum.reduction_type, partial_accum.reduction_type
+             )
+-            final_reduce = f"{buffer_name} = {ws_name}[{start} : {end}].view({nsplit}, {rnumel}).{opname}(dim=0)"
++            reduced = (
++                f"{ws_name}[{start} : {end}].view({nsplit}, {rnumel}).{opname}(dim=0)"
++            )
+ 
+             # Restore the exact original shape via .view() to handle keepdim
+             # and multi-dimensional reductions correctly.
+@@ -2978,16 +2980,27 @@ def _bench(candidate_split_size):
+                     for s in buffer.get_layout().size
+                 ]
+                 final_shape_str = f"[{', '.join(final_shape)}]"
+-                final_reduce += f".view({final_shape_str})"
++                reduced += f".view({final_shape_str})"
+ 
+             # The workspace tensor is in torch.float, need a cast if the buffer is
+             # not.
+             if (buffer_dtype := V.graph.get_dtype(buffer_name)) != torch.float:
+-                final_reduce += f".to({buffer_dtype})"
+-            V.graph.wrapper_code.writeline(final_reduce)
+-            # mark the buffer as allocated, so we don't try to allocate
+-            # it again when it's later used
+-            V.graph.wrapper_code.allocated.add(buffer_name)
++                reduced += f".to({buffer_dtype})"
++
++            if isinstance(buffer, ir.Buffer) and isinstance(
++                buffer.get_output_spec(), ir.NonOwningLayout
++            ):
++                # The buffer is a view into another buffer's storage (e.g. a
++                # cat destination). Rebinding the name would leave the
++                # underlying region never written; write through the view
++                # instead. See https://github.com/pytorch/pytorch/issues/193061
++                V.graph.wrapper_code.codegen_allocation(buffer)
++                V.graph.wrapper_code.writeline(f"{buffer_name}.copy_({reduced})")
++            else:
++                V.graph.wrapper_code.writeline(f"{buffer_name} = {reduced}")
++                # mark the buffer as allocated, so we don't try to allocate
++                # it again when it's later used
++                V.graph.wrapper_code.allocated.add(buffer_name)
+ 
+         kernel.deallocate_workspaces()
+ 
+
+From abb93fb9d96ab6f21fe6499ea532529d3bac81a1 Mon Sep 17 00:00:00 2001
+From: "haojiang.lh" <haojiang.lh@alibaba-inc.com>
+Date: Thu, 13 Aug 2026 09:39:14 +0800
+Subject: [PATCH 2/2] Address review: explicit spec dispatch, loud fallback,
+ FileCheck in test
+
+- Dispatch on the output spec explicitly: NonOwningLayout writes through
+  the view; only plain FixedLayout/FlexibleLayout keep the rebinding path;
+  anything else (e.g. MutationLayoutSHOULDREMOVE, CommBufferLayout) raises
+  AssertionError instead of silently dropping the write.
+- Skip buffers in removed_buffers to avoid a NameError from copy_ after
+  codegen_allocation emits nothing.
+- Replace the dead `buffer is not None` / isinstance guards with a loud
+  AssertionError.
+- Move the .to(dtype) cast to the rebinding path only; copy_() converts
+  dtype itself.
+- Test: capture the backward wrapper and FileCheck the .copy_(workspace_
+  write-through, assert no rebinding from the workspace, and use
+  assertEqual on the mix-order metric count.
+---
+ test/inductor/test_mix_order_reduction.py | 10 ++++-
+ torch/_inductor/codegen/simd.py           | 48 ++++++++++++++---------
+ 2 files changed, 38 insertions(+), 20 deletions(-)
+
+diff --git a/test/inductor/test_mix_order_reduction.py b/test/inductor/test_mix_order_reduction.py
+index 5f7de010434f9..eefb77fd09e4f 100644
+--- a/test/inductor/test_mix_order_reduction.py
++++ b/test/inductor/test_mix_order_reduction.py
+@@ -861,9 +861,15 @@ def f(x, table):
+                 "split_reductions": split_reductions,
+             },
+         )(x, table)
+-        (act_grad,) = torch.autograd.grad(act, table)
++        (act_grad,), (wrapper,) = utils.run_and_get_code(
++            lambda: torch.autograd.grad(act, table)
++        )
+ 
+-        self.assertTrue(metrics.codegen_mix_order_reduction > 0)
++        self.assertEqual(metrics.codegen_mix_order_reduction, 1)
++        # the slice grads alias the shared cat buffer: the final reduction
++        # must be written through the view, never bound to a fresh tensor
++        FileCheck().check(".copy_(workspace_").run(wrapper)
++        self.assertNotIn("= workspace_", wrapper)
+         torch.testing.assert_close(ref_grad, act_grad, atol=1e-4, rtol=1e-4)
+ 
+     @inductor_config.patch(split_reductions=False)
+diff --git a/torch/_inductor/codegen/simd.py b/torch/_inductor/codegen/simd.py
+index a4efd31433f2e..55d2c657eec6e 100644
+--- a/torch/_inductor/codegen/simd.py
++++ b/torch/_inductor/codegen/simd.py
+@@ -2956,6 +2956,8 @@ def _bench(candidate_split_size):
+         )
+         for idx, partial_accum in enumerate(kernel.saved_partial_accumulate):
+             buffer_name = partial_accum.buffer_name
++            if buffer_name in V.graph.removed_buffers:
++                continue
+ 
+             stride_str = f"({nsplit}) * ({rnumel})"
+             start = f"{idx} * {stride_str}"
+@@ -2971,36 +2973,46 @@ def _bench(candidate_split_size):
+                 f"{ws_name}[{start} : {end}].view({nsplit}, {rnumel}).{opname}(dim=0)"
+             )
+ 
+-            # Restore the exact original shape via .view() to handle keepdim
+-            # and multi-dimensional reductions correctly.
+             buffer = V.graph.get_buffer(buffer_name)
+-            if buffer is not None:
+-                final_shape = [
+-                    V.graph.wrapper_code.codegen_python_sizevar(s)
+-                    for s in buffer.get_layout().size
+-                ]
+-                final_shape_str = f"[{', '.join(final_shape)}]"
+-                reduced += f".view({final_shape_str})"
++            if not isinstance(buffer, ir.Buffer):
++                raise AssertionError(type(buffer))
+ 
+-            # The workspace tensor is in torch.float, need a cast if the buffer is
+-            # not.
+-            if (buffer_dtype := V.graph.get_dtype(buffer_name)) != torch.float:
+-                reduced += f".to({buffer_dtype})"
++            # Restore the exact original shape via .view() to handle keepdim
++            # and multi-dimensional reductions correctly.
++            final_shape = [
++                V.graph.wrapper_code.codegen_python_sizevar(s)
++                for s in buffer.get_layout().size
++            ]
++            reduced += f".view([{', '.join(final_shape)}])"
+ 
+-            if isinstance(buffer, ir.Buffer) and isinstance(
+-                buffer.get_output_spec(), ir.NonOwningLayout
+-            ):
++            spec = buffer.get_output_spec()
++            if isinstance(spec, ir.NonOwningLayout):
+                 # The buffer is a view into another buffer's storage (e.g. a
+                 # cat destination). Rebinding the name would leave the
+                 # underlying region never written; write through the view
+-                # instead. See https://github.com/pytorch/pytorch/issues/193061
++                # instead. copy_() also handles any dtype conversion from the
++                # torch.float workspace.
++                # See https://github.com/pytorch/pytorch/issues/193061
+                 V.graph.wrapper_code.codegen_allocation(buffer)
+                 V.graph.wrapper_code.writeline(f"{buffer_name}.copy_({reduced})")
+-            else:
++            elif type(spec) in (ir.FixedLayout, ir.FlexibleLayout):
++                # The workspace tensor is in torch.float, need a cast if the
++                # buffer is not.
++                if (buffer_dtype := V.graph.get_dtype(buffer_name)) != torch.float:
++                    reduced += f".to({buffer_dtype})"
+                 V.graph.wrapper_code.writeline(f"{buffer_name} = {reduced}")
+                 # mark the buffer as allocated, so we don't try to allocate
+                 # it again when it's later used
+                 V.graph.wrapper_code.allocated.add(buffer_name)
++            else:
++                # Rebinding the name silently drops the write for any spec
++                # that must be written through rather than bound (e.g.
++                # MutationLayoutSHOULDREMOVE, CommBufferLayout). Fail loudly
++                # rather than producing wrong results.
++                raise AssertionError(
++                    f"unsupported mix-order reduction output spec "
++                    f"{type(spec).__name__} for {buffer_name}"
++                )
+ 
+         kernel.deallocate_workspaces()
+ 

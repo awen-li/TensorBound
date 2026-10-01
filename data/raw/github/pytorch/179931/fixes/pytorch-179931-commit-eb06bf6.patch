@@ -1,0 +1,68 @@
+From eb06bf6cf11001a4beccba9d9a6a3f28a8e54d71 Mon Sep 17 00:00:00 2001
+From: Liqiang Lu <liqiangxl@gmail.com>
+Date: Tue, 21 Apr 2026 23:40:04 +0000
+Subject: [PATCH] [inductor] Fix stride mismatch for user-visible reductions
+ (#180197)
+
+Fixes https://github.com/pytorch/pytorch/issues/179931
+
+Don't set `dislike_padding` on user-visible reduction nodes in `mark_nodes_dislike_padding` since it may lead to stride conflict with earlier `is_contiguous_storage_and_layout`
+
+Pull Request resolved: https://github.com/pytorch/pytorch/pull/180197
+Approved by: https://github.com/jansel
+---
+ test/inductor/test_padding.py | 19 +++++++++++++++++++
+ torch/_inductor/graph.py      | 10 +++++++++-
+ 2 files changed, 28 insertions(+), 1 deletion(-)
+
+diff --git a/test/inductor/test_padding.py b/test/inductor/test_padding.py
+index c67bde87a369b..fc961bb654e7e 100644
+--- a/test/inductor/test_padding.py
++++ b/test/inductor/test_padding.py
+@@ -908,6 +908,25 @@ def test_dynamic_shape_padding(self, shape, alignment_bytes, enable_pad):
+         )
+         self.assertEqual(result.stride(), expected_stride)
+ 
++    def test_reduction_comprehensive_padding_stride(self):
++        """Comprehensive padding should not cause stride mismatches for
++        user-visible reductions.
++
++        Regression test for https://github.com/pytorch/pytorch/issues/179931
++        """
++
++        def program(x):
++            y = torch.nn.functional.adaptive_avg_pool2d(x, 7)
++            return y.flatten(1).sum(dim=-1)
++
++        x = torch.randn(4, 2049, 8, 8, dtype=torch.float32, device=GPU_TYPE)
++        eager = program(x.clone())
++
++        with config.patch({"comprehensive_padding": True}):
++            compiled = torch.compile(program, backend="inductor")(x.clone())
++
++        self.assertEqual(eager, compiled)
++
+ 
+ if __name__ == "__main__":
+     if HAS_GPU:
+diff --git a/torch/_inductor/graph.py b/torch/_inductor/graph.py
+index c774772494545..29a26a6c29fcf 100644
+--- a/torch/_inductor/graph.py
++++ b/torch/_inductor/graph.py
+@@ -329,7 +329,15 @@ def _get_overload_packet(
+                     prior.meta["dislike_padding"] = True
+         # We only want to mark output nodes. So, move it after the above prior nodes process.
+         if not config.pad_outputs and cur in extended_user_visible_nodes:
+-            cur.meta["dislike_padding"] = True
++            # Reductions (ops_like_padding) produce new output buffers with
++            # fresh strides, so their output stride constraint is already
++            # enforced by allow_padding=False in as_exact_strides. Setting
++            # dislike_padding here would suppress input padding during
++            # freeze, causing a stride mismatch when an earlier lowering
++            # step (e.g. is_contiguous_storage_and_layout) already mutated
++            # the input layout to padded strides.
++            if op not in ops_like_padding:
++                cur.meta["dislike_padding"] = True
+ 
+ 
+ def is_mkldnn_conv(node: Node) -> bool:

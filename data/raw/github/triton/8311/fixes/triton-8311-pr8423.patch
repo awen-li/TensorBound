@@ -1,0 +1,133 @@
+From 668771284d207ee6b462960642baca9d37f8d97f Mon Sep 17 00:00:00 2001
+From: Thomas Raoux <thomas.raoux@openai.com>
+Date: Fri, 10 Oct 2025 10:00:11 -0700
+Subject: [PATCH 1/2] [BACKEND] Prevent reordering local_load across
+ side-effecting op
+
+---
+ .../Transforms/ReorderInstructions.cpp        | 33 +++++++++++++++++++
+ test/TritonGPU/reorder-instructions.mlir      | 32 ++++++++++++++++++
+ 2 files changed, 65 insertions(+)
+
+diff --git a/lib/Dialect/TritonGPU/Transforms/ReorderInstructions.cpp b/lib/Dialect/TritonGPU/Transforms/ReorderInstructions.cpp
+index 038587bc5584..9afd7e95aba1 100644
+--- a/lib/Dialect/TritonGPU/Transforms/ReorderInstructions.cpp
++++ b/lib/Dialect/TritonGPU/Transforms/ReorderInstructions.cpp
+@@ -40,6 +40,37 @@ static bool willIncreaseRegisterPressure(Operation *op) {
+   return false;
+ }
+ 
++// Return true if it has side effects that are either unknown or writes.
++static bool hasWriteSideEffect(Operation *op) {
++  auto effects = getEffectsRecursively(op);
++  if (!effects)
++    return false;
++  return llvm::any_of(*effects, [](MemoryEffects::EffectInstance effect) {
++    return !isa<MemoryEffects::Read, MemoryEffects::Allocate,
++                MemoryEffects::Free>(effect.getEffect());
++  });
++}
++
++// Return true if there is a write side effect on any path between start and end
++// ops. This assumes start dominates end.
++static bool crossWriteSideEffectingOp(Operation *start, Operation *end) {
++  auto ancestor = start->getBlock()->findAncestorOpInBlock(*end);
++  // Couldn't find an ancestor in the same block, conservatively assume true.
++  if (!ancestor)
++    return true;
++  Operation *nextOp = start->getNextNode();
++  while (nextOp) {
++    if (nextOp == ancestor)
++      return false;
++
++    if ((hasWriteSideEffect(nextOp)))
++      return true;
++    nextOp = nextOp->getNextNode();
++  }
++  assert(false && "op doesn't dominate other");
++  return true;
++}
++
+ class TritonGPUReorderInstructionsPass
+     : public impl::TritonGPUReorderInstructionsBase<
+           TritonGPUReorderInstructionsPass> {
+@@ -135,6 +166,8 @@ class TritonGPUReorderInstructionsPass
+       // after the conversion to OpIdx=0.
+       if (!dom.dominates(op.getOperation(), AOp.getOperation()))
+         return;
++      if (crossWriteSideEffectingOp(op, AOp))
++        return;
+       moveAfter(op, AOp);
+     });
+     return;
+diff --git a/test/TritonGPU/reorder-instructions.mlir b/test/TritonGPU/reorder-instructions.mlir
+index e5bbbdaaab22..8e0942d414e2 100644
+--- a/test/TritonGPU/reorder-instructions.mlir
++++ b/test/TritonGPU/reorder-instructions.mlir
+@@ -96,6 +96,38 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32}
+ 
+ // -----
+ 
++// CHECK-LABEL: sink_convert_idx_1_negative
++//       CHECK: ttg.local_load %{{.*}} : !ttg.memdesc<32x32xf32, #{{.*}}, #smem> -> tensor<32x32xf32, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 1}>>
++//       CHECK: ttng.arrive_barrier
++//       CHECK: ttg.local_load %{{.*}} : !ttg.memdesc<32x32xf32, #{{.*}}, #smem> -> tensor<32x32xf32, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 1}>>
++//       CHECK: tt.dot
++#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [32, 1], warpsPerCTA = [1, 4], order = [0, 1]}>
++#mma = #ttg.nvidia_mma<{versionMajor = 2, versionMinor = 0, warpsPerCTA = [2, 2], instrShape = [16, 8]}>
++#shared = #ttg.swizzled_shared<{vec = 8, perPhase = 1, maxPhase = 4, order = [0, 1]}>
++#shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
++#smem = #ttg.shared_memory
++module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
++  tt.func public @sink_convert_idx_1_negative(%arg0: tensor<32x32x!tt.ptr<f32>, #blocked>) {
++    %bar = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
++    %true = arith.constant true
++    %cst = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #mma>
++    %B = tt.load %arg0 : tensor<32x32x!tt.ptr<f32>, #blocked>
++    %BS = ttg.local_alloc %B : (tensor<32x32xf32, #blocked>) -> !ttg.memdesc<32x32xf32, #shared, #smem>
++    %BD = ttg.local_load %BS : !ttg.memdesc<32x32xf32, #shared, #smem> -> tensor<32x32xf32, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 1}>>
++    %cst_0 = arith.constant dense<1.230000e+02> : tensor<32x32xf32, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 1}>>
++    %A = tt.load %arg0 : tensor<32x32x!tt.ptr<f32>, #blocked>
++    %AS = ttg.local_alloc %A : (tensor<32x32xf32, #blocked>) -> !ttg.memdesc<32x32xf32, #shared, #smem>
++    ttng.arrive_barrier %bar, 2, %true : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
++    %AD = ttg.local_load %AS : !ttg.memdesc<32x32xf32, #shared, #smem> -> tensor<32x32xf32, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 1}>>
++    %12 = tt.dot %AD, %BD, %cst : tensor<32x32xf32, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 1}>> * tensor<32x32xf32, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 1}>> -> tensor<32x32xf32, #mma>
++    %13 = ttg.convert_layout %12 : tensor<32x32xf32, #mma> -> tensor<32x32xf32, #blocked>
++    tt.store %arg0, %13 : tensor<32x32x!tt.ptr<f32>, #blocked>
++    tt.return
++  }
++}
++
++// -----
++
+ // check that we don't sink convert_layout if it has multi users
+ // CHECK-LABEL: convert_cannot_sink
+ //       CHECK: ttg.local_load %{{.*}} : !ttg.memdesc<32x32xf32, #shared, #smem> -> tensor<32x32xf32, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 1}>>
+
+From af926218e4f5e7d846ef3583f957493d80aee8ee Mon Sep 17 00:00:00 2001
+From: Thomas Raoux <thomas.raoux@openai.com>
+Date: Fri, 10 Oct 2025 11:02:29 -0700
+Subject: [PATCH 2/2] fix ordering of checks
+
+---
+ lib/Dialect/TritonGPU/Transforms/ReorderInstructions.cpp | 5 ++---
+ 1 file changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/lib/Dialect/TritonGPU/Transforms/ReorderInstructions.cpp b/lib/Dialect/TritonGPU/Transforms/ReorderInstructions.cpp
+index 9afd7e95aba1..456a40f48d5b 100644
+--- a/lib/Dialect/TritonGPU/Transforms/ReorderInstructions.cpp
++++ b/lib/Dialect/TritonGPU/Transforms/ReorderInstructions.cpp
+@@ -60,11 +60,10 @@ static bool crossWriteSideEffectingOp(Operation *start, Operation *end) {
+     return true;
+   Operation *nextOp = start->getNextNode();
+   while (nextOp) {
+-    if (nextOp == ancestor)
+-      return false;
+-
+     if ((hasWriteSideEffect(nextOp)))
+       return true;
++    if (nextOp == ancestor)
++      return false;
+     nextOp = nextOp->getNextNode();
+   }
+   assert(false && "op doesn't dominate other");

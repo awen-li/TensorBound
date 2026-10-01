@@ -1,0 +1,40 @@
+From 45c8cf269609f637dd2385d09521d0ec6cbc5fa0 Mon Sep 17 00:00:00 2001
+From: Ben Vanik <ben.vanik@gmail.com>
+Date: Mon, 8 Jul 2024 17:14:49 -0700
+Subject: [PATCH] Actually implement bytecode verifier IREE_VM_VERIFY_REG_ANY.
+ This enables branch and variadic operand verification. It only verifies that
+ the referenced registers are in the declared range and that there will be no
+ out-of-bounds access of the register files at runtime. It will not catch
+ correctness issues (but the verifier isn't intended to).
+
+Fixes #14313.
+---
+ runtime/src/iree/vm/bytecode/verifier.c | 15 ++++++++++++---
+ 1 file changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/runtime/src/iree/vm/bytecode/verifier.c b/runtime/src/iree/vm/bytecode/verifier.c
+index 602a3f1c30b1..2c1c62679cd6 100644
+--- a/runtime/src/iree/vm/bytecode/verifier.c
++++ b/runtime/src/iree/vm/bytecode/verifier.c
+@@ -506,9 +506,18 @@ iree_status_t iree_vm_bytecode_function_verify(
+                             "ref register ordinal %u out of range %u",       \
+                             (ordinal), verify_state->ref_register_count);    \
+   }
+-#define IREE_VM_VERIFY_REG_ANY(ordinal)                               \
+-  if (IREE_UNLIKELY(((ordinal) & IREE_REF_REGISTER_TYPE_BIT) == 0)) { \
+-  } else {                                                            \
++#define IREE_VM_VERIFY_REG_ANY(ordinal)                                       \
++  if (((ordinal) & IREE_REF_REGISTER_TYPE_BIT) != 0) {                        \
++    int32_t ref_ordinal = (ordinal) & IREE_REF_REGISTER_MASK;                 \
++    if (IREE_UNLIKELY(ref_ordinal >= verify_state->ref_register_count)) {     \
++      return iree_make_status(IREE_STATUS_OUT_OF_RANGE,                       \
++                              "ref register ordinal %u out of range %u",      \
++                              ref_ordinal, verify_state->ref_register_count); \
++    }                                                                         \
++  } else if (IREE_UNLIKELY((ordinal) >= verify_state->i32_register_count)) {  \
++    return iree_make_status(IREE_STATUS_OUT_OF_RANGE,                         \
++                            "i32 register ordinal %u out of range %u",        \
++                            (ordinal), verify_state->i32_register_count);     \
+   }
+ 
+ #define VM_VerifyConstI8(name)             \

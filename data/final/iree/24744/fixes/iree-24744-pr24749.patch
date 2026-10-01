@@ -1,0 +1,208 @@
+From ddcd004bfd8cd89fea3abf740d5cb53df1076a45 Mon Sep 17 00:00:00 2001
+From: Federico Bruzzone <federico.bruzzone.i@gmail.com>
+Date: Thu, 23 Jul 2026 10:04:34 +0200
+Subject: [PATCH 1/3] [Codegen][LLVMCPU] Hoist in-loop stack alloca
+
+Signed-off-by: Federico Bruzzone <federico.bruzzone.i@gmail.com>
+---
+ .../compiler/Codegen/LLVMCPU/DispatchABI.cpp  | 11 +++++++
+ .../Codegen/LLVMCPU/test/convert_to_llvm.mlir | 32 +++++++++++++++++++
+ 2 files changed, 43 insertions(+)
+
+diff --git a/compiler/src/iree/compiler/Codegen/LLVMCPU/DispatchABI.cpp b/compiler/src/iree/compiler/Codegen/LLVMCPU/DispatchABI.cpp
+index 6e499651151e..27c5953de98b 100644
+--- a/compiler/src/iree/compiler/Codegen/LLVMCPU/DispatchABI.cpp
++++ b/compiler/src/iree/compiler/Codegen/LLVMCPU/DispatchABI.cpp
+@@ -992,6 +992,17 @@ Value HALDispatchABI::loadProcessorData(Operation *forOp, OpBuilder &builder) {
+   // To get a pointer to the processor data we need to track pointers all the
+   // way from the environment argument. This is redundant with loadFieldValue
+   // but that returns values instead.
++  //
++  // `forOp` here may be a call inside a loop, so if we built these ops at the
++  // caller's insertion point we'd re-run the stack allocation on every loop
++  // iteration with nothing to ever pop it back off, overflowing the stack for
++  // large iteration counts (#24744). Build them in the enclosing function's
++  // entry block instead, where they only run once.
++  auto funcOp = forOp->getParentOfType<LLVM::LLVMFuncOp>();
++  assert(funcOp && "usage requires an enclosing LLVMFuncOp");
++  OpBuilder::InsertionGuard guard(builder);
++  builder.setInsertionPointToStart(&funcOp.getFunctionBody().front());
++
+   auto loc = forOp->getLoc();
+   auto environmentPtrValue =
+       buildArgDI(forOp, /*argNum=*/0, getLocalArgument(forOp, 0), "environment",
+diff --git a/compiler/src/iree/compiler/Codegen/LLVMCPU/test/convert_to_llvm.mlir b/compiler/src/iree/compiler/Codegen/LLVMCPU/test/convert_to_llvm.mlir
+index 1049e3201b8c..9dae431e59df 100644
+--- a/compiler/src/iree/compiler/Codegen/LLVMCPU/test/convert_to_llvm.mlir
++++ b/compiler/src/iree/compiler/Codegen/LLVMCPU/test/convert_to_llvm.mlir
+@@ -43,6 +43,38 @@ module {
+ 
+ // -----
+ 
++#executable_target = #hal.executable.target<"llvm-cpu", "embedded-elf-arm_64", {cpu_features = "+dotprod", target_triple = "aarch64-none-elf"}>
++module {
++  func.func private @default_cconv_with_extra_fields_in_loop(memref<f32>, i32, f64) -> (f32) attributes {
++      hal.import.bitcode = true,
++      hal.import.cconv = 0 : i32,
++      hal.import.fields = ["processor_data", "processor_id"],
++      llvm.bareptr = true
++  }
++  func.func @loop_caller() attributes {hal.executable.target = #executable_target} {
++    %lb = arith.constant 0 : index
++    %ub = arith.constant 1024 : index
++    %step = arith.constant 1 : index
++    %c0 = arith.constant 42 : i32
++    %c1 = arith.constant 42.0 : f64
++    %0 = memref.alloca() : memref<f32>
++    scf.for %i = %lb to %ub step %step {
++      %1 = func.call @default_cconv_with_extra_fields_in_loop(%0, %c0, %c1) : (memref<f32>, i32, f64) -> (f32)
++    }
++    return
++  }
++}
++//      CHECK: llvm.func @loop_caller
++//  CHECK-NOT:   ^{{.+}}:
++//      CHECK:   %[[PATCHED_DATA:.+]] = llvm.alloca %{{.+}} x i64
++//      CHECK:   llvm.br ^[[LOOP:.+]](
++//      CHECK: ^[[LOOP]]
++//  CHECK-NOT:   llvm.alloca
++//      CHECK:   llvm.call @default_cconv_with_extra_fields_in_loop
++// CHECK-SAME:       %[[PATCHED_DATA]]
++
++// -----
++
+ #pipeline_layout = #hal.pipeline.layout<bindings = [
+   #hal.pipeline.binding<storage_buffer>,
+   #hal.pipeline.binding<storage_buffer>
+
+From 0601f58382678b81a30b435ef208f2e479dcdaf0 Mon Sep 17 00:00:00 2001
+From: Federico Bruzzone <federico.bruzzone.i@gmail.com>
+Date: Thu, 23 Jul 2026 13:09:45 +0200
+Subject: [PATCH 2/3] Address some comments
+
+Signed-off-by: Federico Bruzzone <federico.bruzzone.i@gmail.com>
+---
+ .../src/iree/compiler/Codegen/LLVMCPU/DispatchABI.cpp  | 10 +++++-----
+ .../compiler/Codegen/LLVMCPU/test/convert_to_llvm.mlir |  3 +++
+ 2 files changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/Codegen/LLVMCPU/DispatchABI.cpp b/compiler/src/iree/compiler/Codegen/LLVMCPU/DispatchABI.cpp
+index 27c5953de98b..eb7d1ee7279b 100644
+--- a/compiler/src/iree/compiler/Codegen/LLVMCPU/DispatchABI.cpp
++++ b/compiler/src/iree/compiler/Codegen/LLVMCPU/DispatchABI.cpp
+@@ -993,11 +993,11 @@ Value HALDispatchABI::loadProcessorData(Operation *forOp, OpBuilder &builder) {
+   // way from the environment argument. This is redundant with loadFieldValue
+   // but that returns values instead.
+   //
+-  // `forOp` here may be a call inside a loop, so if we built these ops at the
+-  // caller's insertion point we'd re-run the stack allocation on every loop
+-  // iteration with nothing to ever pop it back off, overflowing the stack for
+-  // large iteration counts (#24744). Build them in the enclosing function's
+-  // entry block instead, where they only run once.
++  // `forOp` here is the call itself, which may sit inside a loop, so if we
++  // built these ops at its insertion point we'd re-run the stack allocation
++  // on every loop iteration with nothing to ever pop it back off, overflowing
++  // the stack for large iteration counts (#24744). Build them in the
++  // enclosing function's entry block instead, where they only run once.
+   auto funcOp = forOp->getParentOfType<LLVM::LLVMFuncOp>();
+   assert(funcOp && "usage requires an enclosing LLVMFuncOp");
+   OpBuilder::InsertionGuard guard(builder);
+diff --git a/compiler/src/iree/compiler/Codegen/LLVMCPU/test/convert_to_llvm.mlir b/compiler/src/iree/compiler/Codegen/LLVMCPU/test/convert_to_llvm.mlir
+index 9dae431e59df..a2724b9896a7 100644
+--- a/compiler/src/iree/compiler/Codegen/LLVMCPU/test/convert_to_llvm.mlir
++++ b/compiler/src/iree/compiler/Codegen/LLVMCPU/test/convert_to_llvm.mlir
+@@ -66,7 +66,10 @@ module {
+ }
+ //      CHECK: llvm.func @loop_caller
+ //  CHECK-NOT:   ^{{.+}}:
++//      CHECK:   %[[ENV_DATA:.+]] = llvm.getelementptr inbounds %arg0[4]
++//  CHECK-NOT:   ^{{.+}}:
+ //      CHECK:   %[[PATCHED_DATA:.+]] = llvm.alloca %{{.+}} x i64
++//  CHECK-NOT:   ^{{.+}}:
+ //      CHECK:   llvm.br ^[[LOOP:.+]](
+ //      CHECK: ^[[LOOP]]
+ //  CHECK-NOT:   llvm.alloca
+
+From 52f63aca335cc2642b6df7415e289b5094badf4b Mon Sep 17 00:00:00 2001
+From: Federico Bruzzone <federico.bruzzone.i@gmail.com>
+Date: Thu, 23 Jul 2026 17:20:22 +0200
+Subject: [PATCH 3/3] Address Ege comments
+
+Signed-off-by: Federico Bruzzone <federico.bruzzone.i@gmail.com>
+---
+ .../compiler/Codegen/LLVMCPU/DispatchABI.cpp  |  3 ++
+ .../Codegen/LLVMCPU/test/convert_to_llvm.mlir | 40 ++++++++++++++-----
+ 2 files changed, 32 insertions(+), 11 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/Codegen/LLVMCPU/DispatchABI.cpp b/compiler/src/iree/compiler/Codegen/LLVMCPU/DispatchABI.cpp
+index eb7d1ee7279b..4c04a5d478e6 100644
+--- a/compiler/src/iree/compiler/Codegen/LLVMCPU/DispatchABI.cpp
++++ b/compiler/src/iree/compiler/Codegen/LLVMCPU/DispatchABI.cpp
+@@ -998,6 +998,9 @@ Value HALDispatchABI::loadProcessorData(Operation *forOp, OpBuilder &builder) {
+   // on every loop iteration with nothing to ever pop it back off, overflowing
+   // the stack for large iteration counts (#24744). Build them in the
+   // enclosing function's entry block instead, where they only run once.
++  // The computation only depends on the function's `environment`
++  // argument and static target attributes, so it can safely move to the
++  // enclosing function's entry block instead, where it only runs once.
+   auto funcOp = forOp->getParentOfType<LLVM::LLVMFuncOp>();
+   assert(funcOp && "usage requires an enclosing LLVMFuncOp");
+   OpBuilder::InsertionGuard guard(builder);
+diff --git a/compiler/src/iree/compiler/Codegen/LLVMCPU/test/convert_to_llvm.mlir b/compiler/src/iree/compiler/Codegen/LLVMCPU/test/convert_to_llvm.mlir
+index a2724b9896a7..e3bfe93e5225 100644
+--- a/compiler/src/iree/compiler/Codegen/LLVMCPU/test/convert_to_llvm.mlir
++++ b/compiler/src/iree/compiler/Codegen/LLVMCPU/test/convert_to_llvm.mlir
+@@ -43,6 +43,13 @@ module {
+ 
+ // -----
+ 
++// Regression test for #24744: a `hal.import.bitcode` call requesting
++// "processor_data" (e.g. a ukernel call) gets a local `i64` buffer allocated
++// to patch in statically-known CPU-feature bits. If that alloca were built at the call
++// site instead of the function entry block, it would re-execute on every
++// loop iteration without ever popping the stack back off, overflowing it for
++// large iteration counts. Checks each of the 4 blocks below: the alloca must
++// be in the entry block and must not reappear in the loop body.
+ #executable_target = #hal.executable.target<"llvm-cpu", "embedded-elf-arm_64", {cpu_features = "+dotprod", target_triple = "aarch64-none-elf"}>
+ module {
+   func.func private @default_cconv_with_extra_fields_in_loop(memref<f32>, i32, f64) -> (f32) attributes {
+@@ -64,17 +71,28 @@ module {
+     return
+   }
+ }
+-//      CHECK: llvm.func @loop_caller
+-//  CHECK-NOT:   ^{{.+}}:
+-//      CHECK:   %[[ENV_DATA:.+]] = llvm.getelementptr inbounds %arg0[4]
+-//  CHECK-NOT:   ^{{.+}}:
+-//      CHECK:   %[[PATCHED_DATA:.+]] = llvm.alloca %{{.+}} x i64
+-//  CHECK-NOT:   ^{{.+}}:
+-//      CHECK:   llvm.br ^[[LOOP:.+]](
+-//      CHECK: ^[[LOOP]]
+-//  CHECK-NOT:   llvm.alloca
+-//      CHECK:   llvm.call @default_cconv_with_extra_fields_in_loop
+-// CHECK-SAME:       %[[PATCHED_DATA]]
++//       CHECK: llvm.func @loop_caller
++// Entry block: the processor-data patch buffer is built once, here.
++//   CHECK-NOT:   ^{{.+}}:
++//       CHECK:   %[[ENV_DATA:.+]] = llvm.getelementptr inbounds %arg0[{{[0-9]+}}]
++//   CHECK-NOT:   ^{{.+}}:
++//       CHECK:   %[[PATCHED_DATA:.+]] = llvm.alloca %{{.+}} x i64
++//   CHECK-NOT:   ^{{.+}}:
++//       CHECK:   llvm.load %[[ENV_DATA]]
++//   CHECK-NOT:   ^{{.+}}:
++//       CHECK:   llvm.br ^[[HEADER:.+]](
++// Loop header: just the trip-count check.
++//       CHECK: ^[[HEADER]]
++//       CHECK:   llvm.cond_br %{{.+}}, ^[[BODY:.+]], ^[[EXIT:.+]]
++// Loop body: reuses the entry-block buffer; no fresh alloca here.
++//       CHECK: ^[[BODY]]
++//   CHECK-NOT:   llvm.alloca
++//       CHECK:   llvm.call @default_cconv_with_extra_fields_in_loop
++//  CHECK-SAME:       %[[PATCHED_DATA]]
++//       CHECK:   llvm.br ^[[HEADER]]
++// Loop exit.
++//       CHECK: ^[[EXIT]]
++//       CHECK:   llvm.return
+ 
+ // -----
+ 

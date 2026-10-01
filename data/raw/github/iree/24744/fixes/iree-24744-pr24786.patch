@@ -1,0 +1,209 @@
+From 92ab6203eac113b7632dadeb78ecbce796086a82 Mon Sep 17 00:00:00 2001
+From: Ege Beysel <beyselege@gmail.com>
+Date: Wed, 5 Aug 2026 15:41:35 +0000
+Subject: [PATCH 1/3] [Codegen][LLVMCPU] Split loadProcessorData: hoist only
+ the alloca (#24744)
+
+35b2070 (#24749) fixed unbounded stack growth by moving the whole
+loadProcessorData CPU-feature patch buffer construction to the function entry
+block. But that also hoisted the feature-bit or/store away from the ukernel
+call, and once the ukernel inlines, LLVM can no longer store-to-load forward the
+forced feature bits into the ukernel's runtime feature check across the
+enclosing loop, so the mmt4d/pack tile-func select never devirtualizes and the
+microkernel is left out-of-line.
+
+Split the two concerns: reserve only the alloca (the stack slot, the actual
+cause of #24744) in the entry block, but keep the feature-bit patch at the call
+site. The stores re-run per iteration but allocate no stack, so the stack stays
+bounded while the forced bits remain adjacent to the (inlined) load and fold as
+before, restoring devirtualization.
+
+Signed-off-by: Ege Beysel <beyselege@gmail.com>
+---
+ .../compiler/Codegen/LLVMCPU/DispatchABI.cpp  | 35 ++++++++++---------
+ .../Codegen/LLVMCPU/test/convert_to_llvm.mlir | 20 ++++++-----
+ 2 files changed, 29 insertions(+), 26 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/Codegen/LLVMCPU/DispatchABI.cpp b/compiler/src/iree/compiler/Codegen/LLVMCPU/DispatchABI.cpp
+index 4c04a5d478e6..eac00c684050 100644
+--- a/compiler/src/iree/compiler/Codegen/LLVMCPU/DispatchABI.cpp
++++ b/compiler/src/iree/compiler/Codegen/LLVMCPU/DispatchABI.cpp
+@@ -957,10 +957,22 @@ Value HALDispatchABI::updateProcessorDataFromTargetAttr(
+   MLIRContext *context = forOp->getContext();
+   auto ptrType = LLVM::LLVMPointerType::get(context);
+   auto i64Ty = builder.getI64Type();
+-  Value arraySize = LLVM::ConstantOp::create(
+-      builder, loc, i64Ty, builder.getI64IntegerAttr(ProcessorDataCapacity));
+-  Value alloca = LLVM::AllocaOp::create(builder, loc, ptrType, i64Ty, arraySize,
+-                                        /*alignment=*/sizeof(uint64_t));
++  // Move the stack allocation to the entry point of the block (#24744).
++  // The feature-bit patching below stays at the call site, since that keeps it
++  // visible to store-to-load forwarding after the ukernel is inlined and
++  // tile-function devirtualization relies on that to fold its runtime feature
++  // check.
++  Value alloca;
++  {
++    auto funcOp = forOp->getParentOfType<LLVM::LLVMFuncOp>();
++    assert(funcOp && "usage requires an enclosing LLVMFuncOp");
++    OpBuilder::InsertionGuard guard(builder);
++    builder.setInsertionPointToStart(&funcOp.getFunctionBody().front());
++    Value arraySize = LLVM::ConstantOp::create(
++        builder, loc, i64Ty, builder.getI64IntegerAttr(ProcessorDataCapacity));
++    alloca = LLVM::AllocaOp::create(builder, loc, ptrType, i64Ty, arraySize,
++                                    /*alignment=*/sizeof(uint64_t));
++  }
+   // Load the 0-th value.
+   Value srcData0 =
+       LLVM::LoadOp::create(builder, loc, i64Ty, processorDataPtrValue);
+@@ -993,19 +1005,8 @@ Value HALDispatchABI::loadProcessorData(Operation *forOp, OpBuilder &builder) {
+   // way from the environment argument. This is redundant with loadFieldValue
+   // but that returns values instead.
+   //
+-  // `forOp` here is the call itself, which may sit inside a loop, so if we
+-  // built these ops at its insertion point we'd re-run the stack allocation
+-  // on every loop iteration with nothing to ever pop it back off, overflowing
+-  // the stack for large iteration counts (#24744). Build them in the
+-  // enclosing function's entry block instead, where they only run once.
+-  // The computation only depends on the function's `environment`
+-  // argument and static target attributes, so it can safely move to the
+-  // enclosing function's entry block instead, where it only runs once.
+-  auto funcOp = forOp->getParentOfType<LLVM::LLVMFuncOp>();
+-  assert(funcOp && "usage requires an enclosing LLVMFuncOp");
+-  OpBuilder::InsertionGuard guard(builder);
+-  builder.setInsertionPointToStart(&funcOp.getFunctionBody().front());
+-
++  // The feature-bit patching stays at the call-site to enable proper ukernel
++  // inlining.
+   auto loc = forOp->getLoc();
+   auto environmentPtrValue =
+       buildArgDI(forOp, /*argNum=*/0, getLocalArgument(forOp, 0), "environment",
+diff --git a/compiler/src/iree/compiler/Codegen/LLVMCPU/test/convert_to_llvm.mlir b/compiler/src/iree/compiler/Codegen/LLVMCPU/test/convert_to_llvm.mlir
+index e3bfe93e5225..9f85eebcf3a3 100644
+--- a/compiler/src/iree/compiler/Codegen/LLVMCPU/test/convert_to_llvm.mlir
++++ b/compiler/src/iree/compiler/Codegen/LLVMCPU/test/convert_to_llvm.mlir
+@@ -48,8 +48,9 @@ module {
+ // to patch in statically-known CPU-feature bits. If that alloca were built at the call
+ // site instead of the function entry block, it would re-execute on every
+ // loop iteration without ever popping the stack back off, overflowing it for
+-// large iteration counts. Checks each of the 4 blocks below: the alloca must
+-// be in the entry block and must not reappear in the loop body.
++// large iteration counts. So the alloca must be in the entry block and must not
++// reappear in the loop body. Only the alloca is hoisted, though: the feature-bit
++// patch itself stays at the call site.
+ #executable_target = #hal.executable.target<"llvm-cpu", "embedded-elf-arm_64", {cpu_features = "+dotprod", target_triple = "aarch64-none-elf"}>
+ module {
+   func.func private @default_cconv_with_extra_fields_in_loop(memref<f32>, i32, f64) -> (f32) attributes {
+@@ -71,22 +72,23 @@ module {
+     return
+   }
+ }
+-//       CHECK: llvm.func @loop_caller
+-// Entry block: the processor-data patch buffer is built once, here.
+-//   CHECK-NOT:   ^{{.+}}:
+-//       CHECK:   %[[ENV_DATA:.+]] = llvm.getelementptr inbounds %arg0[{{[0-9]+}}]
++//       CHECK: llvm.func @loop_caller(%[[ARG0:.+]]: {{.*}}llvm.ptr{{.*}}, %[[ARG1:.+]]: {{.*}}llvm.ptr{{.*}}, %[[ARG2:.+]]: {{.*}}llvm.ptr{{.*}})
++// Entry block: only the patch buffer's stack slot is reserved here, once.
+ //   CHECK-NOT:   ^{{.+}}:
+ //       CHECK:   %[[PATCHED_DATA:.+]] = llvm.alloca %{{.+}} x i64
+ //   CHECK-NOT:   ^{{.+}}:
+-//       CHECK:   llvm.load %[[ENV_DATA]]
+-//   CHECK-NOT:   ^{{.+}}:
+ //       CHECK:   llvm.br ^[[HEADER:.+]](
+ // Loop header: just the trip-count check.
+ //       CHECK: ^[[HEADER]]
+ //       CHECK:   llvm.cond_br %{{.+}}, ^[[BODY:.+]], ^[[EXIT:.+]]
+-// Loop body: reuses the entry-block buffer; no fresh alloca here.
++// Loop body: no fresh alloca; the feature-bit patch stays here, storing into the
++// entry-block buffer right before the call.
+ //       CHECK: ^[[BODY]]
+ //   CHECK-NOT:   llvm.alloca
++//       CHECK:   %[[ENV_DATA:.+]] = llvm.getelementptr inbounds %[[ARG0]]
++//       CHECK:   %[[SRC0:.+]] = llvm.load %[[ENV_DATA]]
++//       CHECK:   %[[PATCHED0:.+]] = llvm.or %[[SRC0]], %{{.+}}
++//       CHECK:   llvm.store %[[PATCHED0]], %[[PATCHED_DATA]]
+ //       CHECK:   llvm.call @default_cconv_with_extra_fields_in_loop
+ //  CHECK-SAME:       %[[PATCHED_DATA]]
+ //       CHECK:   llvm.br ^[[HEADER]]
+
+From 2eced49068d606dd6f4441258c8c55d5a7827c8e Mon Sep 17 00:00:00 2001
+From: Ege Beysel <beyselege@gmail.com>
+Date: Thu, 13 Aug 2026 11:48:40 +0000
+Subject: [PATCH 2/3] adress comments
+
+Signed-off-by: Ege Beysel <beyselege@gmail.com>
+---
+ .../src/iree/compiler/Codegen/LLVMCPU/test/convert_to_llvm.mlir  | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/compiler/src/iree/compiler/Codegen/LLVMCPU/test/convert_to_llvm.mlir b/compiler/src/iree/compiler/Codegen/LLVMCPU/test/convert_to_llvm.mlir
+index 9f85eebcf3a3..a7099a7d4a95 100644
+--- a/compiler/src/iree/compiler/Codegen/LLVMCPU/test/convert_to_llvm.mlir
++++ b/compiler/src/iree/compiler/Codegen/LLVMCPU/test/convert_to_llvm.mlir
+@@ -89,6 +89,7 @@ module {
+ //       CHECK:   %[[SRC0:.+]] = llvm.load %[[ENV_DATA]]
+ //       CHECK:   %[[PATCHED0:.+]] = llvm.or %[[SRC0]], %{{.+}}
+ //       CHECK:   llvm.store %[[PATCHED0]], %[[PATCHED_DATA]]
++//   CHECK-NOT:   llvm.alloca
+ //       CHECK:   llvm.call @default_cconv_with_extra_fields_in_loop
+ //  CHECK-SAME:       %[[PATCHED_DATA]]
+ //       CHECK:   llvm.br ^[[HEADER]]
+
+From 41e9ade7761b753db19cdd48795832202187d3c9 Mon Sep 17 00:00:00 2001
+From: Ege Beysel <beyselege@gmail.com>
+Date: Thu, 13 Aug 2026 15:48:01 +0000
+Subject: [PATCH 3/3] address comments v2
+
+Signed-off-by: Ege Beysel <beyselege@gmail.com>
+---
+ .../src/iree/compiler/Codegen/LLVMCPU/DispatchABI.cpp | 11 ++++++-----
+ .../Codegen/LLVMCPU/test/convert_to_llvm.mlir         |  8 ++++----
+ 2 files changed, 10 insertions(+), 9 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/Codegen/LLVMCPU/DispatchABI.cpp b/compiler/src/iree/compiler/Codegen/LLVMCPU/DispatchABI.cpp
+index eac00c684050..d6e993a0f96f 100644
+--- a/compiler/src/iree/compiler/Codegen/LLVMCPU/DispatchABI.cpp
++++ b/compiler/src/iree/compiler/Codegen/LLVMCPU/DispatchABI.cpp
+@@ -957,11 +957,12 @@ Value HALDispatchABI::updateProcessorDataFromTargetAttr(
+   MLIRContext *context = forOp->getContext();
+   auto ptrType = LLVM::LLVMPointerType::get(context);
+   auto i64Ty = builder.getI64Type();
+-  // Move the stack allocation to the entry point of the block (#24744).
+-  // The feature-bit patching below stays at the call site, since that keeps it
+-  // visible to store-to-load forwarding after the ukernel is inlined and
+-  // tile-function devirtualization relies on that to fold its runtime feature
+-  // check.
++  // The stack allocation goes into the entry point of the block.
++  // The compile-time cpu features are patched onto `cpu_data` from the target
++  // environment. That should happen in the loop body, so that the compile-time
++  // cpu features are visible to the post-link LLVM optimizations that would
++  // fold the microkernel tile size selection logic that checks these, and the
++  // selection happens at compile-time.
+   Value alloca;
+   {
+     auto funcOp = forOp->getParentOfType<LLVM::LLVMFuncOp>();
+diff --git a/compiler/src/iree/compiler/Codegen/LLVMCPU/test/convert_to_llvm.mlir b/compiler/src/iree/compiler/Codegen/LLVMCPU/test/convert_to_llvm.mlir
+index a7099a7d4a95..501ca10ed339 100644
+--- a/compiler/src/iree/compiler/Codegen/LLVMCPU/test/convert_to_llvm.mlir
++++ b/compiler/src/iree/compiler/Codegen/LLVMCPU/test/convert_to_llvm.mlir
+@@ -49,8 +49,8 @@ module {
+ // site instead of the function entry block, it would re-execute on every
+ // loop iteration without ever popping the stack back off, overflowing it for
+ // large iteration counts. So the alloca must be in the entry block and must not
+-// reappear in the loop body. Only the alloca is hoisted, though: the feature-bit
+-// patch itself stays at the call site.
++// reappear in the loop body, the cpu feature patching itself should be in the loop body
++// next to the call.
+ #executable_target = #hal.executable.target<"llvm-cpu", "embedded-elf-arm_64", {cpu_features = "+dotprod", target_triple = "aarch64-none-elf"}>
+ module {
+   func.func private @default_cconv_with_extra_fields_in_loop(memref<f32>, i32, f64) -> (f32) attributes {
+@@ -81,8 +81,8 @@ module {
+ // Loop header: just the trip-count check.
+ //       CHECK: ^[[HEADER]]
+ //       CHECK:   llvm.cond_br %{{.+}}, ^[[BODY:.+]], ^[[EXIT:.+]]
+-// Loop body: no fresh alloca; the feature-bit patch stays here, storing into the
+-// entry-block buffer right before the call.
++// Loop body: no fresh alloca; the compile-time cpu features are patched onto the target
++// environment here in the loop body, storing into the entry-block buffer right before the call.
+ //       CHECK: ^[[BODY]]
+ //   CHECK-NOT:   llvm.alloca
+ //       CHECK:   %[[ENV_DATA:.+]] = llvm.getelementptr inbounds %[[ARG0]]

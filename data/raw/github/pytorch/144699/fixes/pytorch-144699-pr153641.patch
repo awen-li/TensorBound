@@ -1,0 +1,67 @@
+From a66ac077fd539bd3fdea95b2866595803ca19a0a Mon Sep 17 00:00:00 2001
+From: drisspg <drisspguessous@gmail.com>
+Date: Thu, 1 May 2025 17:05:51 -0700
+Subject: [PATCH] [FlexAttention] explicilty create grad_q w/ strides (#152641)
+
+Fixes: #147463
+
+There is a mismatch between inductor's lowering for empty_like and it does not match the behavior of eager. The strides do not match preserve format
+
+https://github.com/pytorch/pytorch/issues/144699
+
+Pull Request resolved: https://github.com/pytorch/pytorch/pull/152641
+Approved by: https://github.com/xmfan
+
+(cherry picked from commit a6ea63a841ca45dbaf1fae392c4d0d8450a3c567)
+---
+ torch/_higher_order_ops/flex_attention.py |  5 +++--
+ torch/_inductor/kernel/flex_attention.py  | 10 ++++++++--
+ 2 files changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/torch/_higher_order_ops/flex_attention.py b/torch/_higher_order_ops/flex_attention.py
+index ca8ccb435c66d..411794d1d8c9b 100644
+--- a/torch/_higher_order_ops/flex_attention.py
++++ b/torch/_higher_order_ops/flex_attention.py
+@@ -780,11 +780,12 @@ def sdpa_dense_backward(
+ ]:
+     from torch._dynamo._trace_wrapped_higher_order_op import TransformGetItemToIndex
+ 
+-    Bq, _, _, qk_head_dim = query.shape
++    Bq, Hq, seq_len_q, qk_head_dim = query.shape
+     Bkv, Hkv, seq_len_kv, v_head_dim = value.shape
+ 
+     # Get outputs before calling repeat interleave and permute to input stride orders
+-    actual_grad_query = torch.empty_like(query)
++    actual_grad_query = query.new_empty((Bq, Hq, seq_len_q, qk_head_dim))
++    actual_grad_query = _permute_strides(actual_grad_query, query.stride())
+ 
+     actual_grad_key = key.new_empty((Bq, Hkv, seq_len_kv, qk_head_dim))
+     actual_grad_key = _permute_strides(actual_grad_key, key.stride())
+diff --git a/torch/_inductor/kernel/flex_attention.py b/torch/_inductor/kernel/flex_attention.py
+index 6f6bfce40884d..4a3abe58d9f92 100644
+--- a/torch/_inductor/kernel/flex_attention.py
++++ b/torch/_inductor/kernel/flex_attention.py
+@@ -38,7 +38,6 @@
+     _full,
+     check_and_broadcast_indices,
+     empty,
+-    empty_like,
+     empty_strided,
+     expand,
+     index_output_size_and_inner_fn,
+@@ -2524,7 +2523,14 @@ def flex_attention_backward(*args, **kwargs):
+     grad_lse_exp2, delta = maybe_realize([grad_lse_exp2, delta])
+ 
+     # # see NOTE:[TritonTemplates with multiple outputs]
+-    grad_query = empty_like(query)
++    query_size = [Bq, Hq, seq_len_q, qk_head_dim]
++    grad_query_strides = infer_dense_strides(query_size, query.get_stride())
++    grad_query = empty_strided(
++        query_size,
++        stride=[sympy.sympify(s) for s in grad_query_strides],
++        dtype=query.get_dtype(),
++        device=query.get_device(),
++    )
+ 
+     # Construct output layout with stride order matching value
+     value_size = [Bq, Hkv, seq_len_kv, v_head_dim]

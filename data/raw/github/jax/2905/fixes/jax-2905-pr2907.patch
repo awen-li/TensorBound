@@ -1,0 +1,108 @@
+From 857b0bb40969e6a802e6d2bcf3b8bcbdfc98d701 Mon Sep 17 00:00:00 2001
+From: Matthew Johnson <mattjj@google.com>
+Date: Thu, 30 Apr 2020 13:50:32 -0700
+Subject: [PATCH 1/2] revise xla.device_put device logic, fixes #2905
+
+---
+ jax/interpreters/xla.py    | 17 ++++++++++++-----
+ tests/multibackend_test.py | 18 ++++++++++++++++++
+ 2 files changed, 30 insertions(+), 5 deletions(-)
+
+diff --git a/jax/interpreters/xla.py b/jax/interpreters/xla.py
+index aae0f8f3c212..10a7e37d1dbc 100644
+--- a/jax/interpreters/xla.py
++++ b/jax/interpreters/xla.py
+@@ -16,7 +16,7 @@
+ from collections import defaultdict
+ import itertools as it
+ import operator as op
+-from typing import Any, Callable, Dict, Sequence, Type
++from typing import Any, Callable, Dict, Sequence, Type, Optional
+ 
+ from absl import logging
+ import numpy as onp
+@@ -920,16 +920,23 @@ def _device_put_device_array(x, device):
+   return _force(x).device_buffer
+ device_put_handlers[DeviceArray] = _device_put_device_array
+ 
+-def _copy_device_array_to_device(x, device):
+-  if is_device_constant(x):
++def _copy_device_array_to_device(x: DeviceArray, device: Optional[xc.Device]):
++  if device is None:
++    # no copying to be done because there's no target specified
++    return x
++  elif is_device_constant(x):
++    # create a new DeviceArray with the same lazy expr, no copying
+     return DeviceArray(x.aval, device, x._lazy_expr, DeviceConstant(device))
+   elif xb.get_device_backend(device).platform == x.device_buffer.platform():
+-    if device is None or x.device_buffer.device() == device:
++    # source and target platforms are the same
++    if x.device_buffer.device() == device:
++      # no copying to be done because source equals target
+       return x
+     else:
++      # move the buffer with a device-to-device copy
+       moved_buf = x.device_buffer.copy_to_device(device)
+   else:
+-    # Buffers from different XLA backends are passed through the host.
++    # buffers from different XLA backends are passed through the host.
+     backend = xb.get_device_backend(device)
+     moved_buf = backend.buffer_from_pyval(x.device_buffer.to_py(), device)
+   return DeviceArray(x.aval, device, x._lazy_expr, moved_buf)
+diff --git a/tests/multibackend_test.py b/tests/multibackend_test.py
+index 33c3c3484001..22808e5c0fb3 100644
+--- a/tests/multibackend_test.py
++++ b/tests/multibackend_test.py
+@@ -171,6 +171,24 @@ def my_sin(x): return np.sin(x)
+     result4 = api.jit(my_sin, backend="cpu")(2)
+     self.assertEqual(result4.device_buffer.device(), cpus[0])
+ 
++  @jtu.skip_on_devices("cpu")  # test only makes sense on non-cpu backends
++  def test_indexing(self):
++    # https://github.com/google/jax/issues/2905
++    cpus = api.devices("cpu")
++
++    x = api.device_put(onp.ones(2), cpus[0])
++    y = x[0]
++    self.assertEqual(y.device_buffer.device(), cpus[0])
++
++  @jtu.skip_on_devices("cpu")  # test only makes sense on non-cpu backends
++  def test_sum(self):
++    # https://github.com/google/jax/issues/2905
++    cpus = api.devices("cpu")
++
++    x = api.device_put(onp.ones(2), cpus[0])
++    y = x.sum()
++    self.assertEqual(y.device_buffer.device(), cpus[0])
++
+ 
+ if __name__ == "__main__":
+   absltest.main()
+
+From dadfa67ae4b7c938c8f0c2ff15969c455fb1166e Mon Sep 17 00:00:00 2001
+From: Matthew Johnson <mattjj@google.com>
+Date: Thu, 30 Apr 2020 14:02:16 -0700
+Subject: [PATCH 2/2] remove test of behavior we don't want
+
+Previously, we were testing that for a DeviceArray x, writing
+jax.device_put(x) would evaluate to a DeviceArray *on the default
+device*. Instead, we should be happy with just returning the same
+DeviceArray without any movement.
+---
+ tests/api_test.py | 3 ---
+ 1 file changed, 3 deletions(-)
+
+diff --git a/tests/api_test.py b/tests/api_test.py
+index 3a21e428c351..d4470bd261bf 100644
+--- a/tests/api_test.py
++++ b/tests/api_test.py
+@@ -323,9 +323,6 @@ def test_device_put_across_platforms(self):
+       x = api.device_put(val, device=cpu_device)
+       self.assertEqual(x.device_buffer.device(), cpu_device)
+ 
+-    y = api.device_put(x)
+-    self.assertEqual(y.device_buffer.device(), default_device)
+-
+   def test_jit_on_all_devices(self):
+     # Verifies we can run the same computation on every device present, even
+     # if they are, for example, different models of GPU.

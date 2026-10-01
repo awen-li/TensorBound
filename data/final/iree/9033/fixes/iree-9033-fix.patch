@@ -1,0 +1,83 @@
+From 52e2fd8f554db42b2e4052a17b3a7351dbe940fd Mon Sep 17 00:00:00 2001
+From: Stella Laurenzo <stellaraccident@gmail.com>
+Date: Sat, 7 May 2022 18:34:09 -0700
+Subject: [PATCH] Makes buffers retain the backing device allocator.
+
+Since the device allocator often lives for the life of whatever is being done, this was not being caught. But some Python uses were hitting it. Added a Python test to catch regressions at that level (which should also catch various Python ref-counting issues). I'm not sure if there is a great place to put a C test of this kind.
+
+Fixes #9033
+---
+ .../python/iree/runtime/array_interop_test.py | 20 +++++++++++++++++++
+ runtime/src/iree/hal/buffer.c                 | 12 +++++++++++
+ 2 files changed, 32 insertions(+)
+
+diff --git a/runtime/bindings/python/iree/runtime/array_interop_test.py b/runtime/bindings/python/iree/runtime/array_interop_test.py
+index 032f2968c694..8f04e1dfecfa 100644
+--- a/runtime/bindings/python/iree/runtime/array_interop_test.py
++++ b/runtime/bindings/python/iree/runtime/array_interop_test.py
+@@ -5,6 +5,7 @@
+ # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ 
+ import copy
++import gc
+ import numpy as np
+ import unittest
+ 
+@@ -19,6 +20,25 @@ def setUp(self):
+     self.device = self.driver.create_default_device()
+     self.allocator = self.device.allocator
+ 
++  def testGcShutdownFiasco(self):
++    init_ary = np.zeros([3, 4], dtype=np.int32) + 2
++    ary = iree.runtime.asdevicearray(self.device, init_ary)
++
++    # Drop all references to backing objects in reverse order to try to
++    # trigger heap use-after-free on bad shutdown order.
++    self.allocator = None
++    gc.collect()
++    self.device = None
++    gc.collect()
++    self.driver = None
++    gc.collect()
++
++    # Now drop the ary and make sure nothing crashes (which would indicate
++    # a reference counting problem of some kind): The array should retain
++    # everything that it needs to stay live.
++    ary = None
++    gc.collect()
++
+   def testMetadataAttributes(self):
+     init_ary = np.zeros([3, 4], dtype=np.int32) + 2
+     ary = iree.runtime.asdevicearray(self.device, init_ary)
+diff --git a/runtime/src/iree/hal/buffer.c b/runtime/src/iree/hal/buffer.c
+index 3af50a618d2e..651fe26ff4d7 100644
+--- a/runtime/src/iree/hal/buffer.c
++++ b/runtime/src/iree/hal/buffer.c
+@@ -194,6 +194,11 @@ IREE_API_EXPORT void iree_hal_buffer_initialize(
+   buffer->allowed_access = allowed_access;
+   buffer->allowed_usage = allowed_usage;
+ 
++  // Retain the backing allocator.
++  if (IREE_LIKELY(device_allocator)) {
++    iree_hal_allocator_retain(device_allocator);
++  }
++
+   // Retain the base allocated buffer if it's unique from the buffer we are
+   // initializing.
+   if (allocated_buffer != buffer) {
+@@ -215,8 +220,15 @@ IREE_API_EXPORT void iree_hal_buffer_recycle(iree_hal_buffer_t* buffer) {
+ 
+ IREE_API_EXPORT void iree_hal_buffer_destroy(iree_hal_buffer_t* buffer) {
+   if (IREE_LIKELY(buffer)) {
++    iree_hal_allocator_t* device_allocator_to_release =
++        buffer->device_allocator;
+     IREE_HAL_VTABLE_DISPATCH(buffer, iree_hal_buffer, destroy)
+     (buffer);
++
++    // Release backing allocator, only after unused.
++    if (IREE_LIKELY(device_allocator_to_release)) {
++      iree_hal_allocator_release(device_allocator_to_release);
++    }
+   }
+ }
+ 

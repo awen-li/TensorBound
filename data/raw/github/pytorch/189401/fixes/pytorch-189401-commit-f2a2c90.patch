@@ -1,0 +1,188 @@
+From f2a2c90de1455c8b3d6fb90f880523a9a301b0c0 Mon Sep 17 00:00:00 2001
+From: "Guan-Ming (Wesley) Chiu"
+ <105915352+guan404ming@users.noreply.github.com>
+Date: Tue, 28 Jul 2026 19:36:58 +0000
+Subject: [PATCH] [Inductor] Fix view lowering dropping the view on raw IR
+ nodes (#191127)
+
+## Related Issue
+
+Fixes #189401
+
+## Why
+
+- Compiled `torch.mm` on a transposed input silently returned wrong numbers
+- A clone workaround forced extra copies instead of fixing the cause
+
+## How
+
+- `.data` on a `ReinterpretView` returns the base storage and drops the transposed layout, so `View.create` re-derived indices against contiguous strides
+- Keep the view when the `view` lowering receives a raw IR node, and widen its annotation to `IRNode`
+- Drop the `L.clone` workaround in `tuned_mm`, which only masked the bug by turning the operand into a `Pointwise`
+- The lowering-level fix is chosen over wrapping at the call site because `view(ConstantBuffer)` previously raised `AttributeError`
+
+## Test
+
+```
+python test/inductor/test_mmdecomp.py
+python test/inductor/test_torchinductor.py
+```
+
+On an RTX 5090: `test_mmdecomp` is 210 passed with the fix and 54 failed without it. `test_torchinductor` is 3036 tests with one pre-existing failure (`test_tmp_not_defined_issue3_cpu`, fails on main too).
+
+The transposed test now covers lhs/rhs/both and asserts `decompose_mm_pointwise` fired, so it can no longer pass vacuously.
+
+This PR was authored with the assistance of Claude.
+
+Pull Request resolved: https://github.com/pytorch/pytorch/pull/191127
+Approved by: https://github.com/eellison, https://github.com/mlazos
+---
+ test/inductor/test_mmdecomp.py                | 43 ++++++++++++++++---
+ torch/_inductor/codegen/cpp_gemm_template.py  |  2 +-
+ .../_inductor/codegen/cpp_template_kernel.py  |  2 +-
+ torch/_inductor/kernel/mm.py                  |  5 ---
+ torch/_inductor/lowering.py                   |  7 ++-
+ 5 files changed, 43 insertions(+), 16 deletions(-)
+
+diff --git a/test/inductor/test_mmdecomp.py b/test/inductor/test_mmdecomp.py
+index 4227f0c7b435a..5cd864b6dc2ad 100644
+--- a/test/inductor/test_mmdecomp.py
++++ b/test/inductor/test_mmdecomp.py
+@@ -6,6 +6,7 @@
+ import torch
+ from torch._inductor import config
+ from torch._inductor.decomposition import bmm as decomp_bmm, mm
++from torch._inductor.utils import fresh_cache
+ from torch._subclasses.fake_tensor import FakeTensorMode
+ from torch.fx.experimental.symbolic_shapes import (
+     DimDynamic,
+@@ -147,13 +148,19 @@ def test_simple_mm(self, device, dtype):
+     def test_small_mm_pointwise(self, device, dtype, m, k, n):
+         if device == "cpu":
+             self.skipTest("small-dim mm pointwise is GPU-only")
++        from torch._dynamo.utils import counters
++
++        counters.clear()
++        torch._dynamo.reset()
+         atol = {torch.float32: 1e-4, torch.float16: 1e-2, torch.bfloat16: 1e-1}[dtype]
+         rtol = {torch.float32: 1.3e-5, torch.float16: 1e-2, torch.bfloat16: 1.6e-2}[
+             dtype
+         ]
+         t1 = rand_math_tensor((m, k), dtype=dtype, device=device)
+         t2 = rand_math_tensor((k, n), dtype=dtype, device=device)
+-        run_comp_nocomp(torch_mm, t1, t2, rtol=rtol, atol=atol)
++        with fresh_cache():
++            run_comp_nocomp(torch_mm, t1, t2, rtol=rtol, atol=atol)
++        self.assertEqual(counters["inductor"]["decompose_mm_pointwise"], 1)
+ 
+     @unittest.skipIf(not HAS_GPU, "GPU tests require triton")
+     @parametrize(
+@@ -164,20 +171,42 @@ def test_small_mm_pointwise(self, device, dtype, m, k, n):
+     )
+     @parametrize("m", [256, 4096])
+     @parametrize("k,n", [(2, 3), (3, 4), (4, 4)])
+-    def test_small_mm_pointwise_transposed(self, device, dtype, m, k, n):
++    @parametrize("transpose", ["lhs", "rhs", "both"])
++    def test_small_mm_pointwise_transposed(self, device, dtype, m, k, n, transpose):
+         if device == "cpu":
+             self.skipTest("small-dim mm pointwise is GPU-only")
++        from torch._dynamo.utils import counters
++
++        counters.clear()
++        torch._dynamo.reset()
+         atol = {torch.float32: 1e-4, torch.float16: 1e-2, torch.bfloat16: 1e-1}[dtype]
+         rtol = {torch.float32: 1.3e-5, torch.float16: 1e-2, torch.bfloat16: 1.6e-2}[
+             dtype
+         ]
+-        t1 = rand_math_tensor((m, k), dtype=dtype, device=device)
+-        t2 = rand_math_tensor((n, k), dtype=dtype, device=device)
++        if transpose == "lhs":
++            t1 = rand_math_tensor((k, m), dtype=dtype, device=device)
++            t2 = rand_math_tensor((k, n), dtype=dtype, device=device)
++
++            def fn(a, b):
++                return torch.mm(a.T, b)
++
++        elif transpose == "rhs":
++            t1 = rand_math_tensor((m, k), dtype=dtype, device=device)
++            t2 = rand_math_tensor((n, k), dtype=dtype, device=device)
++
++            def fn(a, b):
++                return torch.mm(a, b.T)
++
++        else:
++            t1 = rand_math_tensor((k, m), dtype=dtype, device=device)
++            t2 = rand_math_tensor((n, k), dtype=dtype, device=device)
+ 
+-        def mm_with_transpose(a, b):
+-            return torch.mm(a, b.T)
++            def fn(a, b):
++                return torch.mm(a.T, b.T)
+ 
+-        run_comp_nocomp(mm_with_transpose, t1, t2, rtol=rtol, atol=atol)
++        with fresh_cache():
++            run_comp_nocomp(fn, t1, t2, rtol=rtol, atol=atol)
++        self.assertEqual(counters["inductor"]["decompose_mm_pointwise"], 1)
+ 
+     @unittest.skipIf(not HAS_GPU, "GPU tests require triton")
+     def test_small_mm_no_pointwise_for_large_dims(self, device):
+diff --git a/torch/_inductor/codegen/cpp_gemm_template.py b/torch/_inductor/codegen/cpp_gemm_template.py
+index 2d96234b52e4c..7fc76e61d3ce0 100644
+--- a/torch/_inductor/codegen/cpp_gemm_template.py
++++ b/torch/_inductor/codegen/cpp_gemm_template.py
+@@ -1370,7 +1370,7 @@ def block_weight(cls, W, new_size, padding):
+                 permute_size[-2], permute_size[-3] = permute_size[-3], permute_size[-2]
+                 blocked_w = L.constant_pad_nd(W, (0, padding))
+                 blocked_w = L.permute(
+-                    L.view(blocked_w, permute_size),  # type: ignore[arg-type]
++                    L.view(blocked_w, permute_size),
+                     permute_dims,
+                 )
+         else:
+diff --git a/torch/_inductor/codegen/cpp_template_kernel.py b/torch/_inductor/codegen/cpp_template_kernel.py
+index effe5aef24c01..6d1f14bea3de8 100644
+--- a/torch/_inductor/codegen/cpp_template_kernel.py
++++ b/torch/_inductor/codegen/cpp_template_kernel.py
+@@ -184,7 +184,7 @@ def select(self, node, dim: int, idx: int) -> ir.ReinterpretView:
+     def view(self, node, sizes: list[Any]) -> ir.IRNode:
+         node = wrap_with_tensorbox(node)
+         sizes = parse_expr_with_index_symbols(sizes)
+-        return L.view(node, sizes).data  # type: ignore[arg-type]
++        return L.view(node, sizes).data
+ 
+     def permute(self, node, dims):
+         node = wrap_with_tensorbox(node)
+diff --git a/torch/_inductor/kernel/mm.py b/torch/_inductor/kernel/mm.py
+index 84ebd725db045..723e00d3a223f 100644
+--- a/torch/_inductor/kernel/mm.py
++++ b/torch/_inductor/kernel/mm.py
+@@ -393,11 +393,6 @@ def _to_dtype(x):
+ 
+     if out_dtype is None and _use_small_mm_pointwise(m, k, n, layout):
+         counters["inductor"]["decompose_mm_pointwise"] += 1
+-        # Clone both to force contiguous strides (#189401): unrolled sum
+-        # reduction computes wrong indices for transposed views. Clone both
+-        # rather than detecting the transposed side; scheduler fuses the copy.
+-        mat1 = L.clone(mat1)
+-        mat2 = L.clone(mat2)
+         mat1 = L.unsqueeze(mat1, -1)
+         mat2 = L.unsqueeze(mat2, 0)
+         return L.sum_(L.mul(mat1, mat2), axis=1)
+diff --git a/torch/_inductor/lowering.py b/torch/_inductor/lowering.py
+index 695d3ff1482b4..dd3d476eeb358 100644
+--- a/torch/_inductor/lowering.py
++++ b/torch/_inductor/lowering.py
+@@ -1535,8 +1535,11 @@ def inner_fn(index):
+ @register_lowering(aten._unsafe_view, type_promotion_kind=None)
+ @register_lowering(aten.view, type_promotion_kind=None)
+ @register_lowering(aten.reshape, type_promotion_kind=None)
+-def view(x: TensorBox, sizes: Sequence[sympy.Expr]) -> TensorBox:
+-    return TensorBox(View.create(x.data, sizes))
++def view(x: ir.IRNode, sizes: Sequence[sympy.Expr]) -> TensorBox:
++    # post-mm_args operands are raw ReinterpretView/StorageBox nodes, and taking
++    # .data on those would drop the view itself
++    data = x.data if isinstance(x, TensorBox) else x
++    return TensorBox(View.create(data, sizes))
+ 
+ 
+ @register_lowering(aten.permute, type_promotion_kind=None)

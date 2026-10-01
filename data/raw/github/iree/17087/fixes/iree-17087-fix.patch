@@ -1,0 +1,113 @@
+From a423c213d32f794d8d117b544ba0708391c58a2f Mon Sep 17 00:00:00 2001
+From: Ben Vanik <ben.vanik@gmail.com>
+Date: Tue, 23 Apr 2024 09:11:08 -0700
+Subject: [PATCH] Prevent stream.async.update folding unless confirmed safe.
+ This makes the folder more conservative by only allowing updates of entire
+ target tensors to fold when we know the target has value semantics (it's not
+ tied to any other value). This does potentially lead to more copies that
+ could otherwise be elided but is safer and still simple enough to be in a
+ folder vs. what a pass would do with full analysis.
+
+Progress on #17087.
+---
+ .../Dialect/Stream/IR/StreamOpFolders.cpp     | 33 ++++++++++++++++---
+ .../Dialect/Stream/IR/test/async_folding.mlir | 26 ++++++++++++---
+ 2 files changed, 51 insertions(+), 8 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/Dialect/Stream/IR/StreamOpFolders.cpp b/compiler/src/iree/compiler/Dialect/Stream/IR/StreamOpFolders.cpp
+index 0294b40917cf..d0ac9e4cc551 100644
+--- a/compiler/src/iree/compiler/Dialect/Stream/IR/StreamOpFolders.cpp
++++ b/compiler/src/iree/compiler/Dialect/Stream/IR/StreamOpFolders.cpp
+@@ -1327,6 +1327,7 @@ void TensorFillOp::getCanonicalizationPatterns(RewritePatternSet &results,
+ 
+ OpFoldResult TensorUpdateOp::fold(FoldAdaptor operands) {
+   // TODO(benvanik): fold if target_size == update_size and affinity/lifetime.
++  // NOTE: must preserve in-place external storage ala AsyncUpdateOp.
+   return {};
+ }
+ 
+@@ -1707,12 +1708,36 @@ void AsyncFillOp::getCanonicalizationPatterns(RewritePatternSet &results,
+ // stream.async.update
+ //===----------------------------------------------------------------------===//
+ 
++// Returns true if |value| has known value semantics (it's produced locally
++// and is safe to drop mutations on if there are no observers).
++static bool hasValueSemantics(Value value) {
++  // Can't analyze function arguments (though we could add arg attrs to indicate
++  // value semantics).
++  auto *definingOp = value.getDefiningOp();
++  if (!definingOp)
++    return false;
++
++  // If produced by a tied op then see if the particular result is tied.
++  if (auto tiedOp = dyn_cast<IREE::Util::TiedOpInterface>(definingOp)) {
++    if (tiedOp.getTiedResultOperand(value))
++      return false;
++  }
++
++  // To be conservative we only allow stream dialect ops that produce the
++  // resource as we know they all indicate value semantics when non-tied - ops
++  // from other dialects may not.
++  if (!definingOp->hasTrait<OpTrait::IREE::Stream::AsyncPhaseOp>())
++    return false;
++
++  return true;
++}
++
+ OpFoldResult AsyncUpdateOp::fold(FoldAdaptor operands) {
++  // If updating the entire target then just replace with the update.
++  // NOTE: we have to ensure the target is known to have value semantics as
++  // otherwise the update may be performing an update of an external resource.
+   if (getUpdateSize() == getTargetSize() &&
+-      getUpdate().getType() == getType()) {
+-    // If updating the entire target then just replace with the update.
+-    // Note that this breaks copy-on-write semantics but will be fixed up during
+-    // canonicalization if needed.
++      getUpdate().getType() == getType() && hasValueSemantics(getTarget())) {
+     return getUpdate();
+   }
+   return {};
+diff --git a/compiler/src/iree/compiler/Dialect/Stream/IR/test/async_folding.mlir b/compiler/src/iree/compiler/Dialect/Stream/IR/test/async_folding.mlir
+index 8b8642957db6..64ae8f3a2591 100644
+--- a/compiler/src/iree/compiler/Dialect/Stream/IR/test/async_folding.mlir
++++ b/compiler/src/iree/compiler/Dialect/Stream/IR/test/async_folding.mlir
+@@ -259,17 +259,35 @@ util.func private @CoalesceAdjacentFills(%arg0: !stream.resource<*>, %arg1: inde
+ 
+ // -----
+ 
+-// CHECK-LABEL: @FoldAsyncUpdateOp
+-util.func private @FoldAsyncUpdateOp(%arg0: !stream.resource<*>, %arg1: !stream.resource<*>, %arg2: index) -> !stream.resource<*> {
++// If we can't analyze the resources we can't fold as the update may be required
++// to preserve an in-place update of an external resource.
++
++// CHECK-LABEL: @DontFoldNonLocalAsyncUpdateOp
++util.func private @DontFoldNonLocalAsyncUpdateOp(%arg0: !stream.resource<*>, %arg1: !stream.resource<*>, %arg2: index) -> !stream.resource<*> {
+   %c0 = arith.constant 0 : index
+-  // CHECK-NOT: stream.async.update
++  // CHECK: stream.async.update
+   %0 = stream.async.update %arg1, %arg0[%c0 to %arg2] : !stream.resource<*>{%arg2} -> %arg0 as !stream.resource<*>{%arg2}
+-  // CHECK: util.return %arg1
+   util.return %0 : !stream.resource<*>
+ }
+ 
+ // -----
+ 
++// We can only fold when we prove that the target has value semantics.
++
++// CHECK-LABEL: @FoldLocalAsyncUpdateOp
++util.func private @FoldLocalAsyncUpdateOp(%arg0: !stream.resource<*>, %arg1: index) -> !stream.resource<*> {
++  %c0 = arith.constant 0 : index
++  %c123_i32 = arith.constant 123 : i32
++  // CHECK-NOT: stream.async.splat
++  %splat = stream.async.splat %c123_i32 : i32 -> !stream.resource<*>{%arg1}
++  // CHECK-NOT: stream.async.update
++  %update = stream.async.update %arg0, %splat[%c0 to %arg1] : !stream.resource<*>{%arg1} -> %result as !stream.resource<*>{%arg1}
++  // CHECK: util.return %arg0
++  util.return %update : !stream.resource<*>
++}
++
++// -----
++
+ // CHECK-LABEL: @CombineSplatUpdateFromToFill
+ util.func private @CombineSplatUpdateFromToFill(%arg0: !stream.resource<*>, %arg1: index) -> !stream.resource<*> {
+   %c0 = arith.constant 0 : index

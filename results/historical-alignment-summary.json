@@ -1,0 +1,184 @@
+{
+  "cause_units": 149,
+  "repair_commit_count": 406,
+  "validated_public_commit_count": 406,
+  "support_dimension_counts": {
+    "landed_patch": 149,
+    "regression_test": 117,
+    "developer_diagnosis": 89,
+    "source_contrast": 149,
+    "public_reproduction_evidence": 53
+  },
+  "strongest_supported_definition": "landed patch AND source contrast AND (regression test OR attributed developer diagnosis)",
+  "strongest_supported_causes": 136,
+  "unresolved_pre_fix_revisions": 0,
+  "distributions": {
+    "relation_family": {
+      "full": {
+        "value--storage/layout": 37,
+        "value--operation/identity": 23,
+        "operation--execution context": 22,
+        "operation--completion": 21,
+        "storage--ownership/lifetime": 16,
+        "value--shared storage": 14,
+        "value--representation": 13,
+        "logical value--storage content": 3
+      },
+      "strongest_supported": {
+        "value--storage/layout": 35,
+        "operation--completion": 19,
+        "value--operation/identity": 19,
+        "operation--execution context": 18,
+        "storage--ownership/lifetime": 15,
+        "value--shared storage": 14,
+        "value--representation": 13,
+        "logical value--storage content": 3
+      }
+    },
+    "transition_family": {
+      "full": {
+        "representation or layout change": 37,
+        "identity or index remapping": 31,
+        "ordering or completion handoff": 23,
+        "placement or context change": 23,
+        "ownership or lifetime change": 16,
+        "storage, alias, or mutation change": 15,
+        "initialization or content update": 4
+      },
+      "strongest_supported": {
+        "representation or layout change": 36,
+        "identity or index remapping": 27,
+        "ordering or completion handoff": 21,
+        "placement or context change": 19,
+        "storage, alias, or mutation change": 15,
+        "ownership or lifetime change": 14,
+        "initialization or content update": 4
+      }
+    },
+    "obligation_family": {
+      "full": {
+        "happens-before ordering": 20,
+        "index and offset preservation": 18,
+        "identity correspondence": 16,
+        "ownership and lifetime": 13,
+        "placement and context consistency": 13,
+        "representation fidelity": 11,
+        "alias independence": 11,
+        "layout compatibility": 11,
+        "range and alignment safety": 10,
+        "policy and configuration propagation": 7,
+        "transformation equivalence": 7,
+        "initialization before publication": 4,
+        "completion and progress": 4,
+        "resource and capability agreement": 3,
+        "value semantics preservation": 1
+      },
+      "strongest_supported": {
+        "happens-before ordering": 18,
+        "index and offset preservation": 17,
+        "identity correspondence": 14,
+        "ownership and lifetime": 12,
+        "layout compatibility": 11,
+        "alias independence": 11,
+        "placement and context consistency": 11,
+        "representation fidelity": 11,
+        "range and alignment safety": 8,
+        "policy and configuration propagation": 6,
+        "transformation equivalence": 6,
+        "completion and progress": 4,
+        "resource and capability agreement": 3,
+        "initialization before publication": 3,
+        "value semantics preservation": 1
+      }
+    },
+    "failure_mode": {
+      "full": {
+        "missing eligibility check": 37,
+        "incorrect mapping or translation": 35,
+        "lost or omitted relation": 32,
+        "unsound assumption or inference": 19,
+        "premature or unordered transition": 10,
+        "missing ordering or enforcement": 8,
+        "omitted operation": 5,
+        "premature invalidation or stale state": 3
+      },
+      "strongest_supported": {
+        "missing eligibility check": 37,
+        "incorrect mapping or translation": 30,
+        "lost or omitted relation": 30,
+        "unsound assumption or inference": 19,
+        "premature or unordered transition": 8,
+        "missing ordering or enforcement": 7,
+        "omitted operation": 3,
+        "premature invalidation or stale state": 2
+      }
+    },
+    "repair_strategy": {
+      "full": {
+        "correct mapping or representation": 42,
+        "strengthen eligibility check": 38,
+        "preserve or propagate relation": 32,
+        "correct ownership or lifetime": 12,
+        "restore ordering or synchronization": 11,
+        "constrain unsafe transformation": 8,
+        "perform omitted operation": 6
+      },
+      "strongest_supported": {
+        "strengthen eligibility check": 38,
+        "correct mapping or representation": 37,
+        "preserve or propagate relation": 30,
+        "correct ownership or lifetime": 11,
+        "restore ordering or synchronization": 9,
+        "constrain unsafe transformation": 7,
+        "perform omitted operation": 4
+      }
+    }
+  },
+  "rank_preservation": {
+    "relation_family": {
+      "full_top": [
+        "value--storage/layout"
+      ],
+      "strongest_supported_top": [
+        "value--storage/layout"
+      ],
+      "top_preserved": true
+    },
+    "transition_family": {
+      "full_top": [
+        "representation or layout change"
+      ],
+      "strongest_supported_top": [
+        "representation or layout change"
+      ],
+      "top_preserved": true
+    },
+    "obligation_family": {
+      "full_top": [
+        "happens-before ordering"
+      ],
+      "strongest_supported_top": [
+        "happens-before ordering"
+      ],
+      "top_preserved": true
+    },
+    "failure_mode": {
+      "full_top": [
+        "missing eligibility check"
+      ],
+      "strongest_supported_top": [
+        "missing eligibility check"
+      ],
+      "top_preserved": true
+    },
+    "repair_strategy": {
+      "full_top": [
+        "correct mapping or representation"
+      ],
+      "strongest_supported_top": [
+        "strengthen eligibility check"
+      ],
+      "top_preserved": false
+    }
+  }
+}

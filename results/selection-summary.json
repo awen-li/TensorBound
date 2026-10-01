@@ -1,0 +1,22 @@
+{
+  "collected_records": 7509,
+  "final_membership": {
+    "excluded": 7245,
+    "retained": 264
+  },
+  "retained_path_counts": [
+    7509,
+    780,
+    433,
+    395,
+    333,
+    279,
+    269,
+    264
+  ],
+  "screening_decisions": {
+    "exclude": 6729,
+    "include": 537,
+    "uncertain": 243
+  }
+}

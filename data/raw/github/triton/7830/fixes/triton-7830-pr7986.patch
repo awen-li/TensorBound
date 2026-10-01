@@ -1,0 +1,41 @@
+From 9f275e57ea4e9291c6dbbd4644ccc89e8182eb86 Mon Sep 17 00:00:00 2001
+From: Thomas Raoux <thomas.raoux@openai.com>
+Date: Wed, 27 Aug 2025 10:11:32 -0700
+Subject: [PATCH] [BACKEND] Fix incorrect offsets in mmav5 unswizzled smem
+ offset
+
+---
+ python/test/unit/language/test_matmul.py                    | 2 +-
+ .../nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/WGMMA.cpp  | 6 ++++--
+ 2 files changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/python/test/unit/language/test_matmul.py b/python/test/unit/language/test_matmul.py
+index 85acf2608b41..8e4d5bc9bfaf 100644
+--- a/python/test/unit/language/test_matmul.py
++++ b/python/test/unit/language/test_matmul.py
+@@ -91,7 +91,7 @@ def get_src_element_ty_size(dtype_str):
+ @pytest.mark.parametrize("dtype_dst_str", ["float32", "float16", "float64"])
+ @pytest.mark.parametrize("BLOCK_M, BLOCK_N, BLOCK_K, NUM_STAGES", [(128, 128, 16, 4), (64, 128, 32, 4), (32, 32, 32, 4),
+                                                                    (256, 128, 32, 4), (64, 512, 32, 2),
+-                                                                   (512, 64, 32, 2), (64, 16, 32, 4)])
++                                                                   (512, 64, 32, 2), (64, 16, 64, 4)])
+ @pytest.mark.parametrize("NUM_CTAS", [1, 2])
+ @pytest.mark.parametrize("NUM_WARPS", [4, 8])
+ @pytest.mark.parametrize("EPILOGUE_SUBTILE", [True, False])
+diff --git a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/WGMMA.cpp b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/WGMMA.cpp
+index 9a04b299d435..6cc60bfe130f 100644
+--- a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/WGMMA.cpp
++++ b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/WGMMA.cpp
+@@ -159,8 +159,10 @@ Value mlir::triton::NVIDIA::DotOpMmaV3SmemLoader::smemLoad(
+       off1 = tb.mul(tb.i32_val(elemBits / 8), offset);
+     }
+   } else {
+-    off1 = tb.mul(k, tb.i32_val(shape[1 - fastMovingDim]));
+-    off1 = tb.add(off1, tb.mul(m, tb.i32_val(1024)));
++    assert(a == 0 && instrShape[0] * elemBits == 16 * 8 &&
++           "Currently expect that unswizzled case only happens for "
++           "rhs <Kx16> cases and the inner dimension is 16bytes.");
++    off1 = tb.i32_val(512 * b);
+   }
+   Value smemBase = tb.ptrtoint(i32_ty, base);
+   smemBase = tb.add(smemBase, off1);

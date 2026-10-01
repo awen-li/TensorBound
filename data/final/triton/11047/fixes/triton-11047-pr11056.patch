@@ -1,0 +1,463 @@
+From 8949044c7e954243aa9e13edbcab6f63a012ab8c Mon Sep 17 00:00:00 2001
+From: Peter Bell <peterbell10@openai.com>
+Date: Mon, 27 Jul 2026 13:57:10 +0100
+Subject: [PATCH 1/3] Reapplies #9484, Fixes #11047
+
+---
+ .../TritonNvidiaGPU/IR/TritonNvidiaGPUOps.td  |  6 +-
+ lib/Analysis/Membar.cpp                       |  2 +
+ .../Transforms/Pipeliner/WGMMAPipeline.cpp    |  6 +-
+ lib/Dialect/TritonGPU/Transforms/Utility.cpp  |  3 +-
+ python/test/gluon/test_core.py                | 65 +++++++++++++++++++
+ test/Analysis/test-membar.mlir                |  4 +-
+ test/Conversion/tritongpu_to_llvm_hopper.mlir | 29 +++++++++
+ test/TritonGPU/loop-pipeline-hopper.mlir      |  4 +-
+ .../lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM.cpp | 59 ++++++++++++-----
+ 9 files changed, 154 insertions(+), 24 deletions(-)
+
+diff --git a/include/triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOps.td b/include/triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOps.td
+index d41e0e79f368..02e128c144c3 100644
+--- a/include/triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOps.td
++++ b/include/triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOps.td
+@@ -239,7 +239,7 @@ def TTNG_WarpGroupDotOp : TTNG_Op<"warp_group_dot", [
+ def TTNG_WarpGroupDotWaitOp : TTNG_Op<"warp_group_dot_wait", [DeclareOpInterfaceMethods<InferTypeOpInterface>,
+                                                               AllTypesMatch<["inputs", "outputs"]>]> {
+   let summary = "warp group dot wait";
+-  let arguments = (ins Variadic<TTG_TensorOrMemDesc>:$inputs, I32Attr:$pendings);
++  let arguments = (ins Variadic<TTG_TensorOrMemDesc>:$inputs, I32Attr:$pendings, UnitAttr:$warpGroupLocal);
+   let results = (outs Variadic<TTG_TensorOrMemDesc>:$outputs);
+   let description = [{
+     Waits until there are $pendings or fewer outstanding async dot operations.
+@@ -248,6 +248,10 @@ def TTNG_WarpGroupDotWaitOp : TTNG_Op<"warp_group_dot_wait", [DeclareOpInterface
+     waiting on. For example, if there are N pending async dot ops and we wait
+     until one remains pending, then $inputs must include the results of the
+     first N - 1 dot ops.
++
++    The `warpGroupLocal` attribute specifies that we only wait for the local
++    warp group, and if num_warps > 4 then shared memory inputs may still be in
++    use by other warp groups.
+   }];
+ 
+   let assemblyFormat = "$inputs attr-dict `:` type($inputs)";
+diff --git a/lib/Analysis/Membar.cpp b/lib/Analysis/Membar.cpp
+index c2da316f0a50..fad2f5e3d639 100644
+--- a/lib/Analysis/Membar.cpp
++++ b/lib/Analysis/Membar.cpp
+@@ -265,6 +265,8 @@ bool containsLocalBarrier(Operation *op) {
+     return true;
+   if (auto barrier = dyn_cast<triton::gpu::BarrierOp>(op))
+     return barrier.hasLocal();
++  if (auto wgWait = dyn_cast<ttng::WarpGroupDotWaitOp>(op))
++    return !wgWait.getWarpGroupLocal() && triton::gpu::lookupNumWarps(op) > 4;
+   return false;
+ }
+ 
+diff --git a/lib/Dialect/TritonGPU/Transforms/Pipeliner/WGMMAPipeline.cpp b/lib/Dialect/TritonGPU/Transforms/Pipeliner/WGMMAPipeline.cpp
+index 6f4cf8c1a64f..9ce29380b29e 100644
+--- a/lib/Dialect/TritonGPU/Transforms/Pipeliner/WGMMAPipeline.cpp
++++ b/lib/Dialect/TritonGPU/Transforms/Pipeliner/WGMMAPipeline.cpp
+@@ -221,7 +221,8 @@ static void threadValuesThroughWait(ttng::WarpGroupDotWaitOp wait,
+   // We can't use replaceWithNewOp because we're changing the number of return
+   // values in the operation.
+   auto newWait = ttng::WarpGroupDotWaitOp::create(
+-      builder, wait.getLoc(), llvm::to_vector(newOperands), wait.getPendings());
++      builder, wait.getLoc(), llvm::to_vector(newOperands),
++      wait.getPendingsAttr(), wait.getWarpGroupLocalAttr());
+ 
+   auto dominatedByNewWait = [&](OpOperand &operand) {
+     auto opInThisBlock =
+@@ -655,7 +656,8 @@ static void insertAsyncWarpGroupDotWaitInLoop(
+ 
+       OpBuilder builder((*firstUse)->getOwner());
+       auto newWait = ttng::WarpGroupDotWaitOp::create(
+-          builder, asyncDot->getLoc(), ArrayRef<Value>{}, 0);
++          builder, asyncDot->getLoc(), ArrayRef<Value>{}, 0,
++          /*warpGroupLocal=*/true);
+ 
+       SmallVector<Value> users;
+       for (; firstUse != uses.end(); ++firstUse) {
+diff --git a/lib/Dialect/TritonGPU/Transforms/Utility.cpp b/lib/Dialect/TritonGPU/Transforms/Utility.cpp
+index 8f5c95dc28b3..75631c4be4f6 100644
+--- a/lib/Dialect/TritonGPU/Transforms/Utility.cpp
++++ b/lib/Dialect/TritonGPU/Transforms/Utility.cpp
+@@ -1501,7 +1501,8 @@ void replaceUsesAndPropagateType(
+       auto operands = llvm::to_vector(wait.getOperands());
+       operands[operand->getOperandNumber()] = val;
+       auto newWait = ttng::WarpGroupDotWaitOp::create(
+-          builder, wait.getLoc(), operands, wait.getPendings());
++          builder, wait.getLoc(), operands, wait.getPendingsAttr(),
++          wait.getWarpGroupLocalAttr());
+       wait.replaceAllUsesWith(newWait.getResults());
+       wait.erase();
+     } else {
+diff --git a/python/test/gluon/test_core.py b/python/test/gluon/test_core.py
+index 04fa53bf482d..3d5af986cd72 100644
+--- a/python/test/gluon/test_core.py
++++ b/python/test/gluon/test_core.py
+@@ -974,6 +974,71 @@ def test_warpgroup_mma(ASYNC):
+     torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-1)
+ 
+ 
++@gluon.jit
++def warpgroup_mma_wait_multi_warpgroup_kernel(a_ptr, b0_ptr, b1_ptr, out_ptr, D: ttgl.constexpr, NBLK: ttgl.constexpr,
++                                              WG: ttgl.constexpr):
++    M: ttgl.constexpr = 64 * WG
++    c_layout: ttgl.constexpr = ttgl.NVMMADistributedLayout([3, 0], warps_per_cta=[4 * WG, 1], instr_shape=[16, 64, 16])
++    smem_b: ttgl.constexpr = ttgl.NVMMASharedLayout.get_default_for([D, D], ttgl.bfloat16)
++    smem_a: ttgl.constexpr = ttgl.NVMMASharedLayout.get_default_for([M, D], ttgl.bfloat16)
++    layout: ttgl.constexpr = ttgl.BlockedLayout([1, 8], [4, 8], [4 * WG, 1], [1, 0])
++
++    a_smem = ttgl.allocate_shared_memory(ttgl.bfloat16, [M, D], smem_a)
++    b0_smem = ttgl.allocate_shared_memory(ttgl.bfloat16, [D, D], smem_b)
++    b1_smem = ttgl.allocate_shared_memory(ttgl.bfloat16, [D, D], smem_b)
++
++    rows = ttgl.arange(0, D, layout=ttgl.SliceLayout(1, layout))
++    cols = ttgl.arange(0, D, layout=ttgl.SliceLayout(0, layout))
++    offs = rows[:, None] * D + cols[None, :]
++    aoffs = ttgl.arange(0, M, layout=ttgl.SliceLayout(1, layout))[:, None] * D + cols[None, :]
++
++    acc = ttgl.zeros([M, D], ttgl.float32, c_layout)
++    inflight = hopper.warpgroup_mma_init(acc)
++
++    async_copy.async_copy_global_to_shared(a_smem, a_ptr + aoffs)
++    async_copy.commit_group()
++
++    for i in tl.range(0, NBLK):
++        async_copy.async_copy_global_to_shared(b0_smem, b0_ptr + i * D * D + offs)
++        acc = hopper.warpgroup_mma_wait(num_outstanding=0, deps=(inflight, ))
++        async_copy.async_copy_global_to_shared(b1_smem, b1_ptr + i * D * D + offs)
++        async_copy.commit_group()
++        async_copy.wait_group(0)
++        hopper.fence_async_shared()
++        acc = hopper.warpgroup_mma(a_smem, b0_smem, acc, use_acc=True, is_async=True)
++        acc = hopper.warpgroup_mma_wait(num_outstanding=0, deps=(acc, ))
++        inflight = hopper.warpgroup_mma(a_smem, b1_smem, acc, use_acc=True, is_async=True)
++    acc = hopper.warpgroup_mma_wait(num_outstanding=0, deps=(inflight, ))
++
++    out_r = ttgl.arange(0, M, layout=ttgl.SliceLayout(1, c_layout))
++    out_c = ttgl.arange(0, D, layout=ttgl.SliceLayout(0, c_layout))
++    pid = ttgl.program_id(0)
++    ttgl.store(out_ptr + pid.to(ttgl.int64) * (M * D) + out_r[:, None] * D + out_c[None, :], acc)
++
++
++@pytest.mark.skipif(not is_hopper(), reason="Requires Hopper")
++def test_warpgroup_mma_wait_synchronizes_warpgroups():
++    torch.manual_seed(0)
++    d, num_warp_groups = 64, 2
++    m = 64 * num_warp_groups
++    num_blocks, grid = 512, 528
++
++    b0 = torch.randint(-3, 4, (num_blocks, d, d), device="cuda", dtype=torch.float32)
++    b1 = torch.randint(-3, 4, (num_blocks, d, d), device="cuda", dtype=torch.float32)
++    expected = (b0.sum(dim=(0, 1)) + b1.sum(dim=(0, 1)))[None, :].expand(m, d)
++    assert expected.abs().max() < 2**24
++
++    a = torch.ones((m, d), device="cuda", dtype=torch.bfloat16)
++    b0 = b0.to(torch.bfloat16)
++    b1 = b1.to(torch.bfloat16)
++
++    for _ in range(5):
++        out = torch.empty((grid, m, d), dtype=torch.float32, device="cuda")
++        warpgroup_mma_wait_multi_warpgroup_kernel[(grid, )](a, b0, b1, out, D=d, NBLK=num_blocks, WG=num_warp_groups,
++                                                            num_warps=4 * num_warp_groups)
++        torch.testing.assert_close(out, expected[None, :, :].expand_as(out), atol=0, rtol=0)
++
++
+ @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
+ def test_tcgen05_mma_two_ctas_transposed_lhs_shared_layout():
+     torch.manual_seed(0)
+diff --git a/test/Analysis/test-membar.mlir b/test/Analysis/test-membar.mlir
+index feae9091bf40..d9db89a057fc 100644
+--- a/test/Analysis/test-membar.mlir
++++ b/test/Analysis/test-membar.mlir
+@@ -1455,9 +1455,9 @@ tt.func @loop_memindex_subslice(%arg0: tensor<2x128x128xf16>) {
+ #shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+ #shared3 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 8}>
+ #smem = #ttg.shared_memory
+-#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [8, 1], instrShape = [16, 256, 32]}>
++#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 256, 32]}>
+ 
+-module attributes {ttg.target = "cuda:90", "ttg.num-warps" = 8 : i32} {
++module attributes {ttg.target = "cuda:90", "ttg.num-warps" = 4 : i32} {
+   // CHECK-LABEL: warp_dot_multi_read
+   tt.func @warp_dot_multi_read(%arg0: !tt.tensordesc<1x256x128xf8E5M2, #shared1>, %arg1: tensor<128x128x!tt.ptr<f8E5M2>>, %arg2: i32, %arg3: i1, %arg4: tensor<128x256xf32, #mma>, %arg5: tensor<128x128xi1>) {
+ 
+diff --git a/test/Conversion/tritongpu_to_llvm_hopper.mlir b/test/Conversion/tritongpu_to_llvm_hopper.mlir
+index c511f3948d95..e694b8ce9200 100644
+--- a/test/Conversion/tritongpu_to_llvm_hopper.mlir
++++ b/test/Conversion/tritongpu_to_llvm_hopper.mlir
+@@ -674,14 +674,43 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-warps" = 4 : i32} {
+ // CHECK-LABEL: @warpgroup_dot_wait_1_input
+ tt.func @warpgroup_dot_wait_1_input(%arg0: tensor<128xf32, #blocked>) {
+   // CHECK: nvg.wgmma_wait_group
++  // CHECK-NOT: nvvm.barrier
++  // CHECK: llvm.return
+   ttng.warp_group_dot_wait %arg0 {pendings = 0 : i32} : tensor<128xf32, #blocked>
+   tt.return
+ }
+ 
+ tt.func @warpgroup_dot_wait_2_inputs(%arg0: tensor<128xf32, #blocked>, %arg1: tensor<128xf32, #blocked>) {
+   // CHECK: nvg.wgmma_wait_group
++  // CHECK-NOT: nvvm.barrier
++  // CHECK: llvm.return
+   ttng.warp_group_dot_wait %arg0, %arg1 {pendings = 0 : i32} : tensor<128xf32, #blocked>, tensor<128xf32, #blocked>
+   tt.return
+ }
+ 
+ }
++
++// -----
++
++#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [8], order = [0]}>
++
++module attributes {"ttg.target" = "cuda:90", "ttg.num-warps" = 8 : i32} {
++
++// CHECK-LABEL: @warpgroup_dot_wait_synchronizes_warpgroups
++tt.func @warpgroup_dot_wait_synchronizes_warpgroups(%arg0: tensor<256xf32, #blocked>) {
++  // CHECK: nvg.wgmma_wait_group
++  // CHECK-NEXT: nvvm.barrier
++  ttng.warp_group_dot_wait %arg0 {pendings = 0 : i32} : tensor<256xf32, #blocked>
++  tt.return
++}
++
++// CHECK-LABEL: @warpgroup_dot_wait_local_does_not_synchronize_warpgroups
++tt.func @warpgroup_dot_wait_local_does_not_synchronize_warpgroups(%arg0: tensor<256xf32, #blocked>) {
++  // CHECK: nvg.wgmma_wait_group
++  // CHECK-NOT: nvvm.barrier
++  // CHECK: llvm.return
++  ttng.warp_group_dot_wait %arg0 {pendings = 0 : i32, warpGroupLocal} : tensor<256xf32, #blocked>
++  tt.return
++}
++
++}
+diff --git a/test/TritonGPU/loop-pipeline-hopper.mlir b/test/TritonGPU/loop-pipeline-hopper.mlir
+index 2cbc56a180f6..b3822265307c 100644
+--- a/test/TritonGPU/loop-pipeline-hopper.mlir
++++ b/test/TritonGPU/loop-pipeline-hopper.mlir
+@@ -187,7 +187,7 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
+     // CHECK:   ttg.async_copy_global_to_local
+     // CHECK:   ttg.async_commit_group
+     // CHECK:   scf.if
+-    // CHECK:     ttng.warp_group_dot_wait {{.*}} {pendings = 0 : i32}
++    // CHECK:     ttng.warp_group_dot_wait {{.*}} {pendings = 0 : i32, warpGroupLocal}
+     // CHECK:     arith.mulf
+     // CHECK:     scf.yield
+     // CHECK:   scf.yield
+@@ -879,7 +879,7 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
+     // CHECK:   ttg.async_copy_global_to_local
+     // CHECK:   ttg.async_commit_group
+     // CHECK:   scf.if
+-    // CHECK-NEXT: ttng.warp_group_dot_wait {{.*}} {pendings = 0 : i32}
++    // CHECK-NEXT: ttng.warp_group_dot_wait {{.*}} {pendings = 0 : i32, warpGroupLocal}
+     // CHECK:   } else {
+     // CHECK-NOT: ttng.warp_group_dot_wait
+     // CHECK:   scf.yield
+diff --git a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM.cpp b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM.cpp
+index d378c70023b5..1727bad6c770 100644
+--- a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM.cpp
++++ b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM.cpp
+@@ -138,17 +138,11 @@ struct WarpGroupDotWaitOpConversion
+   using ConvertOpToLLVMPattern<
+       triton::nvidia_gpu::WarpGroupDotWaitOp>::ConvertOpToLLVMPattern;
+ 
+-  LogicalResult
+-  matchAndRewrite(triton::nvidia_gpu::WarpGroupDotWaitOp op, OpAdaptor adaptor,
+-                  ConversionPatternRewriter &rewriter) const override {
+-    auto pendings = op.getPendings();
+-    Location loc = op.getLoc();
+-    ValueRange inputs = adaptor.getInputs();
+-    if (inputs.size() == 1) {
+-      rewriter.replaceOpWithNewOp<triton::nvgpu::WGMMAWaitGroupOp>(
+-          op, inputs.front(), pendings);
+-      return success();
+-    }
++  static FailureOr<Value> packInputs(Location loc, RewriterBase &rewriter,
++                                     ValueRange inputs) {
++    if (inputs.size() == 1)
++      return inputs.front();
++
+     SmallVector<Type> types;
+     // Pack the inputs into a single struct.
+     for (Type type : inputs.getTypes()) {
+@@ -169,12 +163,20 @@ struct WarpGroupDotWaitOpConversion
+                                              value, outputStructIndex++);
+       }
+     }
+-    Value packedOutput = triton::nvgpu::WGMMAWaitGroupOp::create(
+-        rewriter, loc, packed, pendings);
+-    // Unpack the output into the original struct types.
++    return packed;
++  }
++
++  static SmallVector<Value> unpackOutput(Location loc, RewriterBase &rewriter,
++                                         Value packedOutput, TypeRange types) {
+     SmallVector<Value> outputs;
+-    outputStructIndex = 0;
+-    for (Type type : inputs.getTypes()) {
++    if (types.size() == 1) {
++      outputs.push_back(packedOutput);
++      return outputs;
++    }
++
++    // Unpack the output into the original struct types.
++    unsigned outputStructIndex = 0;
++    for (Type type : types) {
+       auto structType = cast<LLVM::LLVMStructType>(type);
+       Value unpacked = LLVM::UndefOp::create(rewriter, loc, structType);
+       for (auto [i, type] : llvm::enumerate(structType.getBody())) {
+@@ -185,7 +187,32 @@ struct WarpGroupDotWaitOpConversion
+       }
+       outputs.push_back(unpacked);
+     }
++    return outputs;
++  }
++
++  LogicalResult
++  matchAndRewrite(triton::nvidia_gpu::WarpGroupDotWaitOp op, OpAdaptor adaptor,
++                  ConversionPatternRewriter &rewriter) const override {
++    Location loc = op.getLoc();
++    ValueRange inputs = adaptor.getInputs();
++    auto packed = packInputs(loc, rewriter, inputs);
++    if (failed(packed))
++      return failure();
++
++    auto wait = triton::nvgpu::WGMMAWaitGroupOp::create(rewriter, loc, *packed,
++                                                        op.getPendings());
++    auto outputs =
++        unpackOutput(loc, rewriter, wait.getResult(), inputs.getTypes());
++    bool synchronizeWarpGroups =
++        !op.getWarpGroupLocal() && triton::gpu::lookupNumWarps(op) > 4;
+     rewriter.replaceOp(op, outputs);
++
++    // WGMMA waits only synchronize the issuing warp group. Synchronize all
++    // warp groups before releasing shared-memory dependencies.
++    if (synchronizeWarpGroups) {
++      triton::gpu::BarrierOp::create(rewriter, loc,
++                                     triton::gpu::AddrSpace::Local);
++    }
+     return success();
+   }
+ };
+
+From 6861858555e6cd99d7a4f54bbdb98778e038be8e Mon Sep 17 00:00:00 2001
+From: Peter Bell <peterbell10@openai.com>
+Date: Mon, 27 Jul 2026 19:21:24 +0100
+Subject: [PATCH 2/3] Avoid bar.sync if already synchronized by another
+ operation
+
+---
+ lib/Analysis/Membar.cpp             | 10 ++++++
+ test/Analysis/test-membar-ttng.mlir | 55 +++++++++++++++++++++++++++++
+ 2 files changed, 65 insertions(+)
+
+diff --git a/lib/Analysis/Membar.cpp b/lib/Analysis/Membar.cpp
+index fad2f5e3d639..7dfbc8b122f4 100644
+--- a/lib/Analysis/Membar.cpp
++++ b/lib/Analysis/Membar.cpp
+@@ -364,6 +364,16 @@ static bool hasSyncPointBeforeMemoryEffect(Operation *op,
+ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
+                             FuncBlockInfoMapT *funcBlockInfoMap,
+                             OpBuilder *builder) {
++  // A later CTA-wide synchronization can also synchronize this wait, provided
++  // no memory is accessed before reaching it.
++  if (auto wgWait = dyn_cast<ttng::WarpGroupDotWaitOp>(op)) {
++    if (!wgWait.getWarpGroupLocal() &&
++        triton::gpu::lookupNumWarps(wgWait) > 4 &&
++        hasSyncPointBeforeMemoryEffect(wgWait, allocation)) {
++      wgWait->setAttr("warpGroupLocal", builder->getUnitAttr());
++    }
++  }
++
+   auto barrierStages = getLocalBarrierStages(op, allocation);
+   if (barrierStages.beforeMemoryEffects) {
+     // Model a leading local barrier before handling the operation's effects.
+diff --git a/test/Analysis/test-membar-ttng.mlir b/test/Analysis/test-membar-ttng.mlir
+index e7c0b85c94d8..47c3357508a0 100644
+--- a/test/Analysis/test-membar-ttng.mlir
++++ b/test/Analysis/test-membar-ttng.mlir
+@@ -19,6 +19,61 @@ tt.func @async_store_wait(%arg: tensor<32x16xf16, #AL>) {
+ 
+ // -----
+ 
++#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [8], order = [0]}>
++#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
++#smem = #ttg.shared_memory
++
++module attributes {"ttg.num-warps" = 8 : i32, "ttg.num-ctas" = 1 : i32} {
++// CHECK-LABEL: @warpgroup_wait_followed_by_cta_barrier
++tt.func @warpgroup_wait_followed_by_cta_barrier(%acc: tensor<256xf32, #blocked>, %value: i32) {
++  %c1 = arith.constant 1 : i32
++  // CHECK: ttng.warp_group_dot_wait {{.*}} {pendings = 0 : i32, warpGroupLocal}
++  // CHECK-NEXT: arith.addi
++  // CHECK-NEXT: ttg.barrier local
++  %wait = ttng.warp_group_dot_wait %acc {pendings = 0 : i32} : tensor<256xf32, #blocked>
++  %next = arith.addi %value, %c1 : i32
++  ttg.barrier local
++  tt.return
++}
++
++// CHECK-LABEL: @warpgroup_wait_followed_by_barrier_expect
++tt.func @warpgroup_wait_followed_by_barrier_expect(%acc: tensor<256xf32, #blocked>, %value: i32) {
++  %true = arith.constant true
++  %c1 = arith.constant 1 : i32
++  %barrier = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
++  // CHECK: ttng.warp_group_dot_wait {{.*}} {pendings = 0 : i32, warpGroupLocal}
++  // CHECK-NEXT: arith.addi
++  // CHECK-NEXT: ttng.barrier_expect
++  %wait = ttng.warp_group_dot_wait %acc {pendings = 0 : i32} : tensor<256xf32, #blocked>
++  %next = arith.addi %value, %c1 : i32
++  ttng.barrier_expect %barrier, 8, %true : !ttg.memdesc<1xi64, #shared, #smem, mutable>
++  tt.return
++}
++
++// CHECK-LABEL: @warpgroup_wait_before_memory_effect
++tt.func @warpgroup_wait_before_memory_effect(%acc: tensor<256xf32, #blocked>) {
++  %allocation = ttg.local_alloc : () -> !ttg.memdesc<256xf32, #shared, #smem, mutable>
++  // CHECK: ttng.warp_group_dot_wait {{.*}} {pendings = 0 : i32}
++  // CHECK-NEXT: ttg.local_store
++  %wait = ttng.warp_group_dot_wait %acc {pendings = 0 : i32} : tensor<256xf32, #blocked>
++  ttg.local_store %acc, %allocation : tensor<256xf32, #blocked> -> !ttg.memdesc<256xf32, #shared, #smem, mutable>
++  ttg.barrier local
++  tt.return
++}
++
++// CHECK-LABEL: @warpgroup_wait_before_barrier_invalidation
++tt.func @warpgroup_wait_before_barrier_invalidation(%acc: tensor<256xf32, #blocked>) {
++  %barrier = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
++  // CHECK: ttng.warp_group_dot_wait {{.*}} {pendings = 0 : i32}
++  // CHECK-NEXT: ttng.inval_barrier
++  %wait = ttng.warp_group_dot_wait %acc {pendings = 0 : i32} : tensor<256xf32, #blocked>
++  ttng.inval_barrier %barrier : !ttg.memdesc<1xi64, #shared, #smem, mutable>
++  tt.return
++}
++}
++
++// -----
++
+ #barrier_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+ #smem = #ttg.shared_memory
+ 
+
+From 275211e3ed6fb67e79958b491de8d402d45232d7 Mon Sep 17 00:00:00 2001
+From: Peter Bell <peterbell10@openai.com>
+Date: Mon, 27 Jul 2026 22:16:48 +0100
+Subject: [PATCH 3/3] Explain motivation
+
+---
+ .../triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOps.td    | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/include/triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOps.td b/include/triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOps.td
+index 02e128c144c3..8b0e2b64a22c 100644
+--- a/include/triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOps.td
++++ b/include/triton/Dialect/TritonNvidiaGPU/IR/TritonNvidiaGPUOps.td
+@@ -251,7 +251,8 @@ def TTNG_WarpGroupDotWaitOp : TTNG_Op<"warp_group_dot_wait", [DeclareOpInterface
+ 
+     The `warpGroupLocal` attribute specifies that we only wait for the local
+     warp group, and if num_warps > 4 then shared memory inputs may still be in
+-    use by other warp groups.
++    use by other warp groups. This is useful when only the result register
++    values need to be ready and the shared memory inputs will not be overwritten.
+   }];
+ 
+   let assemblyFormat = "$inputs attr-dict `:` type($inputs)";

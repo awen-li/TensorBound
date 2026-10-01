@@ -1,0 +1,1153 @@
+From 9aa213efbcde1546e03044bd2a94b67fa9611bc9 Mon Sep 17 00:00:00 2001
+From: MaheshRavishankar <ravishankarm@google.com>
+Date: Wed, 6 Apr 2022 16:32:59 -0700
+Subject: [PATCH 1/4] Handle offsets/strides correctly while rewriting
+ destructive updates.
+
+The current rewrite of destructive updates ignores all offsets/strides
+of the source flow.dispatch.tensor.load/store. Fix that to handle these
+offset and strides correctly.
+
+Fixes #8790
+---
+ .../BufferizeCopyOnlyDispatchesPass.cpp       |  21 +--
+ .../Codegen/Common/DestructiveUpdateUtils.cpp | 117 +++++++----------
+ .../test/bufferize_copy_only_dispatches.mlir  |   8 +-
+ .../rewrite_linalg_destructive_updates.mlir   | 124 +++++++++++++++++-
+ iree/compiler/Codegen/Common/test/test.vmfb   |   0
+ .../tile_and_distribute_to_workgroups.mlir    |  17 ++-
+ iree/compiler/Codegen/Utils/Utils.cpp         |  22 ++--
+ iree/compiler/Codegen/Utils/Utils.h           |   8 +-
+ iree/test/e2e/regression/BUILD                |   1 +
+ iree/test/e2e/regression/CMakeLists.txt       |   4 +
+ iree/test/e2e/regression/strided_slice.mlir   |  59 +++++++++
+ 11 files changed, 272 insertions(+), 109 deletions(-)
+ create mode 100644 iree/compiler/Codegen/Common/test/test.vmfb
+ create mode 100644 iree/test/e2e/regression/strided_slice.mlir
+
+diff --git a/iree/compiler/Codegen/Common/BufferizeCopyOnlyDispatchesPass.cpp b/iree/compiler/Codegen/Common/BufferizeCopyOnlyDispatchesPass.cpp
+index 2500fc787c73..ef987f23bfa2 100644
+--- a/iree/compiler/Codegen/Common/BufferizeCopyOnlyDispatchesPass.cpp
++++ b/iree/compiler/Codegen/Common/BufferizeCopyOnlyDispatchesPass.cpp
+@@ -60,18 +60,19 @@ struct FoldTensorLoadWithExtractSlice
+             .getDefiningOp<IREE::Flow::DispatchTensorLoadOp>();
+     if (!dispatchTensorLoadOp) return failure();
+ 
+-    SmallVector<OpFoldResult> offsets, sizes, strides;
++    SmallVector<OpFoldResult> offsets, strides;
+     // `tensor.extract_slice` (i.e. the producer) folds **into**
+     // `flow.dispatch.tensor.load1 (i.e. the consumer).
+-    if (failed(foldOffsetsSizesAndStrides(
+-            rewriter, dispatchTensorLoadOp->getLoc(), extractSliceOp,
+-            dispatchTensorLoadOp, offsets, sizes, strides))) {
++    if (failed(foldOffsetsAndStrides(rewriter, dispatchTensorLoadOp->getLoc(),
++                                     dispatchTensorLoadOp, extractSliceOp,
++                                     offsets, strides))) {
+       return failure();
+     }
+ 
+     rewriter.replaceOpWithNewOp<IREE::Flow::DispatchTensorLoadOp>(
+         extractSliceOp, extractSliceOp.getType(), dispatchTensorLoadOp.source(),
+-        dispatchTensorLoadOp.source_dims(), offsets, sizes, strides);
++        dispatchTensorLoadOp.source_dims(), offsets,
++        extractSliceOp.getMixedSizes(), strides);
+     return success();
+   }
+ };
+@@ -102,19 +103,19 @@ struct FoldInsertSliceWithTensorStoreOp
+       return failure();
+     }
+ 
+-    SmallVector<OpFoldResult> offsets, sizes, strides;
++    SmallVector<OpFoldResult> offsets, strides;
+     // `tensor.insert_slice` (i.e. the producer) folds **into**
+     // `flow.dispatch.tensor.store` (i.e. the consumer).
+-    if (failed(foldOffsetsSizesAndStrides(
+-            rewriter, dispatchTensorStoreOp->getLoc(), insertSliceOp,
+-            dispatchTensorStoreOp, offsets, sizes, strides))) {
++    if (failed(foldOffsetsAndStrides(rewriter, dispatchTensorStoreOp->getLoc(),
++                                     dispatchTensorStoreOp, insertSliceOp,
++                                     offsets, strides))) {
+       return failure();
+     }
+ 
+     rewriter.replaceOpWithNewOp<IREE::Flow::DispatchTensorStoreOp>(
+         dispatchTensorStoreOp, insertSliceOp.source(),
+         dispatchTensorStoreOp.target(), dispatchTensorStoreOp.target_dims(),
+-        offsets, sizes, strides);
++        offsets, insertSliceOp.getMixedSizes(), strides);
+     return success();
+   }
+ };
+diff --git a/iree/compiler/Codegen/Common/DestructiveUpdateUtils.cpp b/iree/compiler/Codegen/Common/DestructiveUpdateUtils.cpp
+index 9db65ebff47a..bb636237915e 100644
+--- a/iree/compiler/Codegen/Common/DestructiveUpdateUtils.cpp
++++ b/iree/compiler/Codegen/Common/DestructiveUpdateUtils.cpp
+@@ -12,6 +12,7 @@
+ //===----------------------------------------------------------------------===//
+ 
+ #include "iree-dialects/Dialect/LinalgExt/IR/LinalgExtInterfaces.h"
++#include "iree/compiler/Codegen/Utils/Utils.h"
+ #include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
+ #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
+ #include "iree/compiler/Dialect/Util/IR/UtilDialect.h"
+@@ -59,23 +60,29 @@ static bool hasDestructiveUpdateUses(BlockArgument arg,
+   SmallVector<Operation *> reads;
+   SmallVector<Operation *> writes;
+   for (OpOperand &u : arg.getUses()) {
+-    TypeSwitch<Operation *, void>(u.getOwner())
+-        .Case<linalg::LinalgOp, IREE::LinalgExt::LinalgExtOp>(
+-            [&](auto linalgLikeOp) {
+-              if (linalgLikeOp.isOutputTensor(&u)) {
+-                writes.push_back(linalgLikeOp);
+-              } else {
+-                reads.push_back(linalgLikeOp);
+-              }
+-            })
+-        .Case<tensor::InsertSliceOp>([&](tensor::InsertSliceOp sliceOp) {
+-          if (sliceOp.dest() == u.get()) {
+-            writes.push_back(sliceOp);
+-          } else {
+-            reads.push_back(sliceOp);
+-          }
+-        })
+-        .Default([&](Operation *op) { reads.push_back(op); });
++    Operation *user = u.getOwner();
++    if (auto linalgOp = dyn_cast<linalg::LinalgOp>(user)) {
++      if (linalgOp.isOutputTensor(&u)) {
++        writes.push_back(linalgOp);
++      } else {
++        reads.push_back(linalgOp);
++      }
++    } else if (auto linalgExtOp =
++                   dyn_cast<IREE::LinalgExt::LinalgExtOp>(user)) {
++      if (linalgExtOp.isOutputTensor(&u)) {
++        writes.push_back(linalgExtOp);
++      } else {
++        reads.push_back(linalgExtOp);
++      }
++    } else if (auto sliceOp = dyn_cast<tensor::InsertSliceOp>(user)) {
++      if (sliceOp.dest() == u.get()) {
++        writes.push_back(sliceOp);
++      } else {
++        reads.push_back(sliceOp);
++      }
++    } else {
++      reads.push_back(user);
++    }
+   }
+   // For now, only allow exactly a single tensor.insert_slice op that must be
+   // dominated by all tensor.extract_slice ops.
+@@ -193,40 +200,6 @@ static Value isADestructiveUpdatePattern(Value tensor,
+   return nullptr;
+ }
+ 
+-/// Compute the offsets, sizes and strides for the Flow op from the Tensor op
+-/// accounting for dropped dims.
+-static void populateOffsetSizeAndStrides(
+-    IREE::Flow::DispatchTensorLoadOp flowOp, tensor::ExtractSliceOp sliceOp,
+-    SmallVector<OpFoldResult> &offsets, SmallVector<OpFoldResult> &sizes,
+-    SmallVector<OpFoldResult> &strides) {
+-  SmallVector<OpFoldResult> flowOffsets = flowOp.getMixedOffsets();
+-  SmallVector<OpFoldResult> flowSizes = flowOp.getMixedSizes();
+-  SmallVector<OpFoldResult> flowStrides = flowOp.getMixedStrides();
+-  SmallVector<OpFoldResult> sliceOffsets = sliceOp.getMixedOffsets();
+-  SmallVector<OpFoldResult> sliceSizes = sliceOp.getMixedSizes();
+-  SmallVector<OpFoldResult> sliceStrides = sliceOp.getMixedStrides();
+-
+-  auto flowDroppedDims = flowOp.getDroppedDims();
+-  if (flowDroppedDims.empty()) {
+-    offsets = std::move(sliceOffsets);
+-    sizes = std::move(sliceSizes);
+-    strides = std::move(sliceStrides);
+-  } else {
+-    offsets = std::move(flowOffsets);
+-    sizes = std::move(flowSizes);
+-    strides = std::move(flowStrides);
+-    unsigned sliceOpDim = 0;
+-    for (auto flowDim : llvm::seq<unsigned>(0, offsets.size())) {
+-      if (!flowDroppedDims.test(flowDim)) {
+-        offsets[flowDim] = sliceOffsets[sliceOpDim];
+-        sizes[flowDim] = sliceSizes[sliceOpDim];
+-        strides[flowDim] = sliceStrides[sliceOpDim];
+-        sliceOpDim++;
+-      }
+-    }
+-  }
+-}
+-
+ /// Folds tensor.extract_slice ops on top of flow.dispatch.tensor.load ops into
+ /// new flow.dispatch.tensor.load ops.
+ static LogicalResult foldExtractSliceOp(OpBuilder &b,
+@@ -249,11 +222,14 @@ static LogicalResult foldExtractSliceOp(OpBuilder &b,
+   if (!loadOp) return failure();
+ 
+   SmallVector<OpFoldResult> offsets, sizes, strides;
+-  populateOffsetSizeAndStrides(loadOp, op, offsets, sizes, strides);
++  Location loc = op.getLoc();
++  if (failed(foldOffsetsAndStrides(b, loc, loadOp, op, offsets, strides))) {
++    return failure();
++  }
+ 
+   Value loaded = b.create<IREE::Flow::DispatchTensorLoadOp>(
+       op.getLoc(), op.getType(), loadOp.source(), loadOp.source_dims(), offsets,
+-      sizes, strides);
++      op.getMixedSizes(), strides);
+ 
+   op.getResult().replaceAllUsesWith(loaded);
+   op.erase();
+@@ -262,8 +238,8 @@ static LogicalResult foldExtractSliceOp(OpBuilder &b,
+ 
+ template <typename OpTy>
+ static LogicalResult rewriteDestructiveUpdateInPlace(
+-    OpBuilder &b, OpTy linalgLikeOp, Value target,
+-    ValueRange targetDynamicDims) {
++    OpBuilder &b, OpTy linalgLikeOp,
++    IREE::Flow::DispatchTensorStoreOp storeOp) {
+   LLVM_DEBUG(llvm::dbgs() << "RewriteDestructiveUpdateInPlace: "
+                           << *linalgLikeOp.getOperation() << "\n");
+   if (!linalgLikeOp->hasOneUse()) {
+@@ -285,7 +261,9 @@ static LogicalResult rewriteDestructiveUpdateInPlace(
+     usedResult.replaceAllUsesWith(dest);
+ 
+     b.create<IREE::Flow::DispatchTensorStoreOp>(
+-        linalgLikeOp.getLoc(), usedResult, target, targetDynamicDims);
++        linalgLikeOp.getLoc(), usedResult, storeOp.target(),
++        storeOp.target_dims(), storeOp.getMixedOffsets(),
++        storeOp.getMixedSizes(), storeOp.getMixedStrides());
+ 
+     return success();
+   }
+@@ -296,8 +274,8 @@ static LogicalResult rewriteDestructiveUpdateInPlace(
+ /// tensor.insert_slice.
+ template <>
+ LogicalResult rewriteDestructiveUpdateInPlace<tensor::InsertSliceOp>(
+-    OpBuilder &b, tensor::InsertSliceOp insertSliceOp, Value target,
+-    ValueRange targetDynamicDims) {
++    OpBuilder &b, tensor::InsertSliceOp insertSliceOp,
++    IREE::Flow::DispatchTensorStoreOp storeOp) {
+   LLVM_DEBUG(llvm::dbgs() << "RewriteDestructiveUpdateInPlace: "
+                           << *insertSliceOp.getOperation() << "\n");
+   if (!insertSliceOp->hasOneUse()) {
+@@ -317,11 +295,16 @@ LogicalResult rewriteDestructiveUpdateInPlace<tensor::InsertSliceOp>(
+     // Kills the SSA use-def chain.
+     usedResult.replaceAllUsesWith(dest);
+ 
++    SmallVector<OpFoldResult> offsets, strides;
++    Location loc = insertSliceOp->getLoc();
++    if (failed(foldOffsetsAndStrides(b, loc, storeOp, insertSliceOp, offsets,
++                                     strides))) {
++      return failure();
++    }
++
+     b.create<IREE::Flow::DispatchTensorStoreOp>(
+-        insertSliceOp->getLoc(), insertSliceOp.source(), target,
+-        targetDynamicDims, insertSliceOp.offsets(), insertSliceOp.sizes(),
+-        insertSliceOp.strides(), insertSliceOp.static_offsets(),
+-        insertSliceOp.static_sizes(), insertSliceOp.static_strides());
++        insertSliceOp->getLoc(), insertSliceOp.source(), storeOp.target(),
++        storeOp.target_dims(), offsets, insertSliceOp.getMixedSizes(), strides);
+ 
+     return success();
+   }
+@@ -344,8 +327,8 @@ static bool hasNonScfForControlFlow(func::FuncOp funcOp) {
+ }
+ 
+ static LogicalResult rewriteDestructiveUpdateInPlace(
+-    OpBuilder &b, SpecialTerminatorOpCapture &capture, Value target,
+-    ValueRange targetDynamicDims) {
++    OpBuilder &b, SpecialTerminatorOpCapture &capture,
++    IREE::Flow::DispatchTensorStoreOp storeOp) {
+   Operation *outermostProducingOp = (capture.loops.empty())
+                                         ? capture.rootDestructiveUpdate
+                                         : capture.loops.front();
+@@ -357,8 +340,7 @@ static LogicalResult rewriteDestructiveUpdateInPlace(
+       TypeSwitch<Operation *, LogicalResult>(capture.rootDestructiveUpdate)
+           .Case<linalg::LinalgOp, IREE::LinalgExt::LinalgExtOp,
+                 tensor::InsertSliceOp>([&](auto op) {
+-            return rewriteDestructiveUpdateInPlace(b, op, target,
+-                                                   targetDynamicDims);
++            return rewriteDestructiveUpdateInPlace(b, op, storeOp);
+           })
+           .Default([&](Operation *) { return failure(); });
+   if (failed(status)) return failure();
+@@ -385,8 +367,7 @@ LogicalResult rewriteLinalgDestructiveUpdates(func::FuncOp funcOp) {
+     capture.initValue = op.value();
+     Value sourceValue = isADestructiveUpdatePattern(capture.initValue, capture);
+     if (!sourceValue) return WalkResult::advance();
+-    if (failed(rewriteDestructiveUpdateInPlace(b, capture, op.target(),
+-                                               op.target_dims()))) {
++    if (failed(rewriteDestructiveUpdateInPlace(b, capture, op))) {
+       return WalkResult::interrupt();
+     }
+     processedStores.push_back(op);
+diff --git a/iree/compiler/Codegen/Common/test/bufferize_copy_only_dispatches.mlir b/iree/compiler/Codegen/Common/test/bufferize_copy_only_dispatches.mlir
+index 97ff069a227d..ec4773e4431a 100644
+--- a/iree/compiler/Codegen/Common/test/bufferize_copy_only_dispatches.mlir
++++ b/iree/compiler/Codegen/Common/test/bufferize_copy_only_dispatches.mlir
+@@ -51,8 +51,8 @@ builtin.module {
+ //  CHECK-DAG:   %[[DEST:.+]] = hal.interface.binding.subspan set(0) binding(1)
+ //  CHECK-DAG:   %[[OFFSET_Y:.+]] = affine.apply #[[MAP0]]()[%[[INSERT_OFFSET_Y]], %[[DEST_STRIDE_Y]], %[[DEST_OFFSET_Y]]]
+ //  CHECK-DAG:   %[[OFFSET_X:.+]] = affine.apply #[[MAP0]]()[%[[INSERT_OFFSET_X]], %[[DEST_STRIDE_X]], %[[DEST_OFFSET_X]]]
+-//  CHECK-DAG:   %[[STRIDE_Y:.+]] = affine.apply #[[MAP1]]()[%[[DEST_STRIDE_Y]], %[[INSERT_STRIDE_Y]]]
+-//  CHECK-DAG:   %[[STRIDE_X:.+]] = affine.apply #[[MAP1]]()[%[[DEST_STRIDE_X]], %[[INSERT_STRIDE_X]]]
++//  CHECK-DAG:   %[[STRIDE_Y:.+]] = affine.apply #[[MAP1]]()[%[[INSERT_STRIDE_Y]], %[[DEST_STRIDE_Y]]]
++//  CHECK-DAG:   %[[STRIDE_X:.+]] = affine.apply #[[MAP1]]()[%[[INSERT_STRIDE_X]], %[[DEST_STRIDE_X]]]
+ //  CHECK-DAG:   %[[SUBVIEW:.+]] = memref.subview %[[DEST]][%[[OFFSET_Y]], %[[OFFSET_X]]] [%[[SOURCE_SIZE_Y]], %[[SOURCE_SIZE_X]]]
+ // CHECK-SAME:       [%[[STRIDE_Y]], %[[STRIDE_X]]]
+ //      CHECK:   linalg.generic
+@@ -105,9 +105,9 @@ builtin.module {
+ //  CHECK-DAG:   %[[SOURCE:.+]] = hal.interface.binding.subspan set(0) binding(0)
+ //  CHECK-DAG:   %[[DEST:.+]] = hal.interface.binding.subspan set(0) binding(1)
+ //  CHECK-DAG:   %[[OFFSET_Y:.+]] = affine.apply #[[MAP0]]()[%[[EXTRACT_OFFSET_Y]], %[[SOURCE_STRIDE_Y]], %[[SOURCE_OFFSET_Y]]]
+-//  CHECK-DAG:   %[[STRIDE_Y:.+]] = affine.apply #[[MAP1]]()[%[[SOURCE_STRIDE_Y]], %[[EXTRACT_STRIDE_Y]]]
++//  CHECK-DAG:   %[[STRIDE_Y:.+]] = affine.apply #[[MAP1]]()[%[[EXTRACT_STRIDE_Y]], %[[SOURCE_STRIDE_Y]]]
+ //  CHECK-DAG:   %[[OFFSET_X:.+]] = affine.apply #[[MAP0]]()[%[[EXTRACT_OFFSET_X]], %[[SOURCE_STRIDE_X]], %[[SOURCE_OFFSET_X]]]
+-//  CHECK-DAG:   %[[STRIDE_X:.+]] = affine.apply #[[MAP1]]()[%[[SOURCE_STRIDE_X]], %[[EXTRACT_STRIDE_X]]]
++//  CHECK-DAG:   %[[STRIDE_X:.+]] = affine.apply #[[MAP1]]()[%[[EXTRACT_STRIDE_X]], %[[SOURCE_STRIDE_X]]]
+ //  CHECK-DAG:   %[[SOURCE_SUBVIEW:.+]] = memref.subview %[[SOURCE]][%[[OFFSET_Y]], %[[OFFSET_X]]] [%[[DEST_SIZE_Y]], %[[DEST_SIZE_X]]]
+ // CHECK-SAME:       [%[[STRIDE_Y]], %[[STRIDE_X]]]
+ //      CHECK:   linalg.generic
+diff --git a/iree/compiler/Codegen/Common/test/rewrite_linalg_destructive_updates.mlir b/iree/compiler/Codegen/Common/test/rewrite_linalg_destructive_updates.mlir
+index 5e6ce5832561..4ffe5aa22c03 100644
+--- a/iree/compiler/Codegen/Common/test/rewrite_linalg_destructive_updates.mlir
++++ b/iree/compiler/Codegen/Common/test/rewrite_linalg_destructive_updates.mlir
+@@ -1,4 +1,4 @@
+-// RUN: iree-opt -iree-codegen-rewrite-linalg-destructive-updates %s | FileCheck %s
++// RUN: iree-opt -iree-codegen-rewrite-linalg-destructive-updates -split-input-file %s | FileCheck %s
+ 
+ func.func @matmul() {
+   %cst = arith.constant 0.000000e+00 : f32
+@@ -40,3 +40,125 @@ func.func @matmul() {
+ // CHECK:           scf.for
+ // CHECK:             %[[MATMUL:.+]] = linalg.matmul
+ // CHECK:             flow.dispatch.tensor.store %[[MATMUL]]
++
++// -----
++
++func.func @check_offset_strides() {
++  %lhs_offset_y = hal.interface.constant.load[0] : index
++  %lhs_offset_x = hal.interface.constant.load[1] : index
++  %lhs_stride_y = hal.interface.constant.load[2] : index
++  %lhs_stride_x = hal.interface.constant.load[3] : index
++  %rhs_offset_y = hal.interface.constant.load[4] : index
++  %rhs_offset_x = hal.interface.constant.load[5] : index
++  %rhs_stride_y = hal.interface.constant.load[6] : index
++  %rhs_stride_x = hal.interface.constant.load[7] : index
++  %lhs_binding_size_y = hal.interface.constant.load[8] : index
++  %lhs_binding_size_x = hal.interface.constant.load[9] : index
++  %rhs_binding_size_y = hal.interface.constant.load[10] : index
++  %rhs_binding_size_x = hal.interface.constant.load[11] : index
++  %lhs_size_y = hal.interface.constant.load[12] : index
++  %lhs_size_x = hal.interface.constant.load[13] : index
++  %rhs_size_y = hal.interface.constant.load[14] : index
++  %rhs_size_x = hal.interface.constant.load[15] : index
++  %output_offset_y = hal.interface.constant.load[16] : index
++  %output_offset_x = hal.interface.constant.load[17] : index
++  %output_stride_y = hal.interface.constant.load[18] : index
++  %output_stride_x = hal.interface.constant.load[19] : index
++  %output_binding_size_y = hal.interface.constant.load[20] : index
++  %output_binding_size_x = hal.interface.constant.load[21] : index
++  %lhs_binding = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer)
++      : !flow.dispatch.tensor<readonly:?x?xf32>{%lhs_binding_size_y, %lhs_binding_size_x}
++  %rhs_binding = hal.interface.binding.subspan set(0) binding(1) type(storage_buffer)
++      : !flow.dispatch.tensor<readonly:?x?xf32>{%rhs_binding_size_y, %rhs_binding_size_x}
++  %output_binding = hal.interface.binding.subspan set(0) binding(2) type(storage_buffer)
++      : !flow.dispatch.tensor<writeonly:?x?xf32>{%output_binding_size_y, %output_binding_size_x}
++  %lhs = flow.dispatch.tensor.load %lhs_binding,
++      offsets = [%lhs_offset_y, %lhs_offset_x],
++      sizes = [%lhs_size_y, %lhs_size_x],
++      strides = [%lhs_stride_y, %lhs_stride_x]
++      : !flow.dispatch.tensor<readonly:?x?xf32>{%lhs_binding_size_y, %lhs_binding_size_x} -> tensor<?x?xf32>
++  %rhs = flow.dispatch.tensor.load %rhs_binding,
++      offsets = [%rhs_offset_y, %rhs_offset_x],
++      sizes = [%rhs_size_y, %rhs_size_x],
++      strides = [%rhs_stride_y, %rhs_stride_x]
++      : !flow.dispatch.tensor<readonly:?x?xf32>{%rhs_binding_size_y, %rhs_binding_size_x} -> tensor<?x?xf32>
++  %cst = arith.constant 0.0 : f32
++  %workgroup_id_y = hal.interface.workgroup.id[1] : index
++  %workgroup_id_x = hal.interface.workgroup.id[0] : index
++  %workgroup_count_y = hal.interface.workgroup.count[1] : index
++  %workgroup_count_x = hal.interface.workgroup.count[0] : index
++  %lb_y = affine.apply affine_map<()[s0] -> (s0*64)>()[%workgroup_id_y]
++  %step_y = affine.apply affine_map<()[s0] -> (s0*64)>()[%workgroup_count_y]
++  %lb_x = affine.apply affine_map<()[s0] -> (s0 * 64)>()[%workgroup_id_x]
++  %step_x = affine.apply affine_map<()[s0] -> (s0 * 64)>()[%workgroup_count_x]
++  %init = linalg.init_tensor [%lhs_size_y, %rhs_size_x] : tensor<?x?xf32>
++  %0 =  scf.for %iv0 = %lb_y to %lhs_size_y step %step_y iter_args(%arg0 = %init) -> tensor<?x?xf32> {
++    %1 = scf.for %iv1 = %lb_x to %rhs_size_x step %step_x iter_args(%arg1 = %arg0) -> tensor<?x?xf32> {
++      %tilesize_y = affine.min affine_map<(d0)[s0] -> (-d0 + s0, 64)>(%iv0)[%lhs_size_y]
++      %tilesize_x = affine.min affine_map<(d0)[s0] -> (-d0 + s0, 64)>(%iv1)[%rhs_size_x]
++      %lhs_tile = tensor.extract_slice %lhs[%iv0, 0] [%tilesize_y, %lhs_size_x] [1, 1]
++          : tensor<?x?xf32> to tensor<?x?xf32>
++      %rhs_tile = tensor.extract_slice %rhs[0, %iv1] [%rhs_size_y, %tilesize_x] [1, 1]
++          : tensor<?x?xf32> to tensor<?x?xf32>
++      %out_tile = tensor.extract_slice %arg1[%iv0, %iv1] [%tilesize_y, %tilesize_x] [1, 1]
++          : tensor<?x?xf32> to tensor<?x?xf32>
++      %fill = linalg.fill ins(%cst : f32) outs(%out_tile : tensor<?x?xf32>) -> tensor<?x?xf32>
++      %gemm = linalg.matmul ins(%lhs_tile, %rhs_tile : tensor<?x?xf32>, tensor<?x?xf32>)
++          outs(%fill : tensor<?x?xf32>) -> tensor<?x?xf32>
++      %yield = tensor.insert_slice %gemm into %arg1[%iv0, %iv1] [%tilesize_y, %tilesize_x] [1, 1]
++          : tensor<?x?xf32> into tensor<?x?xf32>
++      scf.yield %yield : tensor<?x?xf32>
++    }
++    scf.yield %1 : tensor<?x?xf32>
++  }
++  flow.dispatch.tensor.store %0, %output_binding,
++      offsets = [%output_offset_y, %output_offset_x],
++      sizes = [%lhs_size_y, %rhs_size_x],
++      strides = [%output_stride_y, %output_stride_x]
++      : tensor<?x?xf32> -> !flow.dispatch.tensor<writeonly:?x?xf32>{%output_binding_size_y, %output_binding_size_x}
++  return
++}
++//  CHECK-DAG: #[[MAP1:.+]] = affine_map<(d0)[s0] -> (-d0 + s0, 64)>
++//  CHECK-DAG: #[[MAP2:.+]] = affine_map<()[s0, s1, s2] -> (s0 * s1 + s2)>
++//      CHECK: func @check_offset_strides()
++//  CHECK-DAG:   %[[LHS_OFFSET_Y:.+]] = hal.interface.constant.load[0]
++//  CHECK-DAG:   %[[LHS_OFFSET_X:.+]] = hal.interface.constant.load[1]
++//  CHECK-DAG:   %[[LHS_STRIDE_Y:.+]] = hal.interface.constant.load[2]
++//  CHECK-DAG:   %[[LHS_STRIDE_X:.+]] = hal.interface.constant.load[3]
++//  CHECK-DAG:   %[[RHS_OFFSET_Y:.+]] = hal.interface.constant.load[4]
++//  CHECK-DAG:   %[[RHS_OFFSET_X:.+]] = hal.interface.constant.load[5]
++//  CHECK-DAG:   %[[RHS_STRIDE_Y:.+]] = hal.interface.constant.load[6]
++//  CHECK-DAG:   %[[RHS_STRIDE_X:.+]] = hal.interface.constant.load[7]
++//  CHECK-DAG:   %[[LHS_SIZE_Y:.+]] = hal.interface.constant.load[12]
++//  CHECK-DAG:   %[[LHS_SIZE_X:.+]] = hal.interface.constant.load[13]
++//  CHECK-DAG:   %[[RHS_SIZE_Y:.+]] = hal.interface.constant.load[14]
++//  CHECK-DAG:   %[[RHS_SIZE_X:.+]] = hal.interface.constant.load[15]
++//  CHECK-DAG:   %[[OUTPUT_OFFSET_Y:.+]] = hal.interface.constant.load[16]
++//  CHECK-DAG:   %[[OUTPUT_OFFSET_X:.+]] = hal.interface.constant.load[17]
++//  CHECK-DAG:   %[[OUTPUT_STRIDE_Y:.+]] = hal.interface.constant.load[18]
++//  CHECK-DAG:   %[[OUTPUT_STRIDE_X:.+]] = hal.interface.constant.load[19]
++//  CHECK-DAG:   %[[LHS_BINDING:.+]] = hal.interface.binding.subspan set(0) binding(0)
++//  CHECK-DAG:   %[[RHS_BINDING:.+]] = hal.interface.binding.subspan set(0) binding(1)
++//  CHECK-DAG:   %[[RESULT_BINDING:.+]] = hal.interface.binding.subspan set(0) binding(2)
++//      CHECK:   scf.for %[[IV0:.+]] =
++//      CHECK:     scf.for %[[IV1:.+]] =
++//  CHECK-DAG:       %[[TILESIZE_Y:.+]] = affine.min #[[MAP1]](%[[IV0]])[%[[LHS_SIZE_Y]]]
++//  CHECK-DAG:       %[[TILESIZE_X:.+]] = affine.min #[[MAP1]](%[[IV1]])[%[[RHS_SIZE_X]]]
++//  CHECK-DAG:       %[[OFFSET_Y:.+]] = affine.apply #[[MAP2]]()[%[[IV0]], %[[LHS_STRIDE_Y]], %[[LHS_OFFSET_Y]]]
++//      CHECK:       %[[LHS_TILE:.+]] = flow.dispatch.tensor.load %[[LHS_BINDING]]
++// CHECK-SAME:           offsets = [%[[OFFSET_Y]], %[[LHS_OFFSET_X]]]
++// CHECK-SAME:           sizes = [%[[TILESIZE_Y]], %[[LHS_SIZE_X]]]
++// CHECK-SAME:           strides = [%[[LHS_STRIDE_Y]], %[[LHS_STRIDE_X]]]
++//      CHECK:       %[[OFFSET_X:.+]] = affine.apply #[[MAP2]]()[%[[IV1]], %[[RHS_STRIDE_X]], %[[RHS_OFFSET_X]]]
++//      CHECK:       %[[RHS_TILE:.+]] = flow.dispatch.tensor.load %[[RHS_BINDING]]
++// CHECK-SAME:           offsets = [%[[RHS_OFFSET_Y]], %[[OFFSET_X]]]
++// CHECK-SAME:           sizes = [%[[RHS_SIZE_Y]], %[[TILESIZE_X]]]
++// CHECK-SAME:           strides = [%[[RHS_STRIDE_Y]], %[[RHS_STRIDE_X]]]
++//      CHECK:       linalg.fill
++//      CHECK:       %[[GEMM:.+]] = linalg.matmul
++//  CHECK-DAG:       %[[OUT_OFFSET_Y:.+]] = affine.apply #[[MAP2]]()[%[[IV0]], %[[OUTPUT_STRIDE_Y]], %[[OUTPUT_OFFSET_Y]]]
++//  CHECK-DAG:       %[[OUT_OFFSET_X:.+]] = affine.apply #[[MAP2]]()[%[[IV1]], %[[OUTPUT_STRIDE_X]], %[[OUTPUT_OFFSET_X]]]
++//      CHECK:       flow.dispatch.tensor.store %[[GEMM]], %[[RESULT_BINDING]]
++// CHECK-SAME:           offsets = [%[[OUT_OFFSET_Y]], %[[OUT_OFFSET_X]]]
++// CHECK-SAME:           sizes = [%[[TILESIZE_Y]], %[[TILESIZE_X]]]
++// CHECK-SAME:           strides = [%[[OUTPUT_STRIDE_Y]], %[[OUTPUT_STRIDE_X]]]
+diff --git a/iree/compiler/Codegen/Common/test/test.vmfb b/iree/compiler/Codegen/Common/test/test.vmfb
+new file mode 100644
+index 000000000000..e69de29bb2d1
+diff --git a/iree/compiler/Codegen/Common/test/tile_and_distribute_to_workgroups.mlir b/iree/compiler/Codegen/Common/test/tile_and_distribute_to_workgroups.mlir
+index cc0527c9403e..fbf45c7b6f4a 100644
+--- a/iree/compiler/Codegen/Common/test/tile_and_distribute_to_workgroups.mlir
++++ b/iree/compiler/Codegen/Common/test/tile_and_distribute_to_workgroups.mlir
+@@ -199,12 +199,13 @@ hal.executable private @add4D {
+ //      CHECK: hal.executable.entry_point public @add4D
+ // CHECK-SAME:   translation_info = #[[TRANSLATION]]
+ //      CHECK: func @add4D()
++//      CHECK:   %[[C0:.+]] = arith.constant 0 : index
+ //      CHECK:   scf.for %[[IV0:.+]] =
+ //      CHECK:     scf.for %[[IV1:.+]] =
+ //      CHECK:       scf.for %[[IV2:.+]] =
+ //  CHECK-NOT:         scf.for
+ //      CHECK:         %[[GENERIC:.+]] = linalg.generic
+-//      CHECK:         flow.dispatch.tensor.store %[[GENERIC]], %{{.+}}, offsets = [0, %[[IV0]], %[[IV1]], %[[IV2]]]
++//      CHECK:         flow.dispatch.tensor.store %[[GENERIC]], %{{.+}}, offsets = [%[[C0]], %[[IV0]], %[[IV1]], %[[IV2]]]
+ 
+ // -----
+ 
+@@ -607,6 +608,7 @@ hal.executable private @conv {
+ //      CHECK: hal.executable.entry_point public @conv
+ // CHECK-SAME:  translation_info = #[[TRANSLATION]]
+ //      CHECK: func @conv()
++//      CHECK:   %[[C0:.+]] = arith.constant 0
+ //      CHECK:   scf.for %[[IV0:.+]] =
+ //      CHECK:     scf.for %[[IV1:.+]] =
+ //      CHECK:       scf.for %[[IV2:.+]] =
+@@ -614,7 +616,7 @@ hal.executable private @conv {
+ //  CHECK-DAG:         %[[FILTER:.+]] = flow.dispatch.tensor.load %{{.+}}, offsets = [0, 0, 0, %[[IV2]]]
+ //  CHECK-DAG:         %[[INIT:.+]] = flow.dispatch.tensor.load %{{.+}}, offsets = [0, %[[IV0]], %[[IV1]], %[[IV2]]]
+ //      CHECK:         %[[RESULT:.+]] = linalg.conv_2d_nhwc_hwcf
+-//      CHECK:         flow.dispatch.tensor.store %[[RESULT]], %{{.+}}, offsets = [0, %[[IV0]], %[[IV1]], %[[IV2]]]
++//      CHECK:         flow.dispatch.tensor.store %[[RESULT]], %{{.+}}, offsets = [%[[C0]], %[[IV0]], %[[IV1]], %[[IV2]]]
+ 
+ // -----
+ 
+@@ -663,6 +665,7 @@ hal.executable private @conv_static {
+ //      CHECK: hal.executable.entry_point public @conv_static
+ // CHECK-SAME:  translation_info = #[[TRANSLATION]]
+ //      CHECK: func @conv_static()
++//      CHECK:   %[[C0:.+]] = arith.constant 0 : index
+ //      CHECK:   scf.for %[[IV0:.+]] =
+ //      CHECK:     scf.for %[[IV1:.+]] =
+ //      CHECK:       scf.for %[[IV2:.+]] =
+@@ -671,7 +674,7 @@ hal.executable private @conv_static {
+ // CHECK-SAME:             outs(%[[INIT]] :
+ //      CHECK:         %[[RESULT:.+]] = linalg.depthwise_conv_2d_nhwc_hwc
+ // CHECK-SAME:             outs(%[[FILL]] :
+-//      CHECK:         flow.dispatch.tensor.store %[[RESULT]], %{{.+}}, offsets = [0, %[[IV0]], %[[IV1]], %[[IV2]]], sizes = [1, 20, 40, 48]
++//      CHECK:         flow.dispatch.tensor.store %[[RESULT]], %{{.+}}, offsets = [%[[C0]], %[[IV0]], %[[IV1]], %[[IV2]]], sizes = [1, 20, 40, 48]
+ 
+ // -----
+ 
+@@ -932,6 +935,7 @@ hal.executable private @gemm_unit_N {
+ //      CHECK: hal.executable.entry_point public @gemm_unit_N
+ // CHECK-SAME:  translation_info = #[[TRANSLATION]]
+ //      CHECK: func @gemm_unit_N()
++//  CHECK-DAG:   %[[C0:.+]] = arith.constant 0 : index
+ //  CHECK-DAG:   %[[M:.+]] = hal.interface.constant.load[0]
+ //  CHECK-DAG:   %[[WG_ID_X:.+]] = hal.interface.workgroup.id[0]
+ //  CHECK-DAG:   %[[WG_COUNT_X:.+]] = hal.interface.workgroup.count[0]
+@@ -941,7 +945,7 @@ hal.executable private @gemm_unit_N {
+ //  CHECK-NOT:     scf.for
+ //      CHECK:     %[[GEMM:.+]] = linalg.matmul
+ //      CHECK:     flow.dispatch.tensor.store %[[GEMM]],
+-// CHECK-SAME:         offsets = [%[[IV0]], 0]
++// CHECK-SAME:         offsets = [%[[IV0]], %[[C0]]]
+ 
+ // -----
+ #config = #iree_codegen.lowering_config<tile_sizes = [[0, 0, 0], [0, 0, 0], [0, 0, 16]]>
+@@ -1045,12 +1049,13 @@ hal.executable private @generic_unit_dims {
+ //      CHECK: hal.executable.entry_point public @generic_unit_dims
+ // CHECK-SAME:  translation_info = #[[TRANSLATION]]
+ //      CHECK: func @generic_unit_dims()
++//      CHECK:   %[[C0:.+]] = arith.constant 0 : index
+ //      CHECK:   scf.for %[[IV0:.+]] =
+ //      CHECK:     scf.for %[[IV1:.+]] =
+ //      CHECK:       scf.for %[[IV2:.+]] =
+ //      CHECK:         %[[GENERIC:.+]] = linalg.generic
+ //      CHECK:         flow.dispatch.tensor.store %[[GENERIC]],
+-// CHECK-SAME:             offsets = [0, 0, 0, 0, %[[IV0]], %[[IV1]], 0, %[[IV2]]]
++// CHECK-SAME:             offsets = [%[[C0]], %[[C0]], %[[C0]], %[[C0]], %[[IV0]], %[[IV1]], %[[C0]], %[[IV2]]]
+ 
+ // -----
+ #config = #iree_codegen.lowering_config<tile_sizes = [[0], [0], [4]]>
+@@ -1201,7 +1206,7 @@ hal.executable private @rank_reduced_slice {
+ // CHECK-SAME:       : !flow.dispatch.tensor<writeonly:10xf32>
+ //      CHECK:   scf.for %[[IV0:.+]] =
+ //      CHECK:     %[[SRC_TILE:.+]] = flow.dispatch.tensor.load %[[SRC_BINDING]]
+-// CHECK-SAME:         offsets = [0, %[[IV0]]], sizes = [1, 2], strides = [1, 1]
++// CHECK-SAME:         offsets = [%[[C0]], %[[IV0]]], sizes = [1, 2], strides = [1, 1]
+ //      CHECK:     linalg.generic
+ // CHECK-SAME:         ins(%[[SRC_TILE]] :
+ 
+diff --git a/iree/compiler/Codegen/Utils/Utils.cpp b/iree/compiler/Codegen/Utils/Utils.cpp
+index 1ec4e776709f..21cc338b8a0a 100644
+--- a/iree/compiler/Codegen/Utils/Utils.cpp
++++ b/iree/compiler/Codegen/Utils/Utils.cpp
+@@ -632,43 +632,37 @@ static AffineExpr mul(OpFoldResult lhs, OpFoldResult rhs,
+ 
+ /// Returns the offsets, sizes and strides to use when combining two operations
+ /// that implement the `OffsetSizeAndStrideOpInterface`.
+-LogicalResult foldOffsetsSizesAndStrides(
+-    PatternRewriter &rewriter, Location loc,
+-    OffsetSizeAndStrideOpInterface producer,
++LogicalResult foldOffsetsAndStrides(
++    OpBuilder &builder, Location loc, OffsetSizeAndStrideOpInterface producer,
+     OffsetSizeAndStrideOpInterface consumer,
+     SmallVector<OpFoldResult> &combinedOffsets,
+-    SmallVector<OpFoldResult> &combinedSizes,
+     SmallVector<OpFoldResult> &combinedStrides) {
+   SmallVector<OpFoldResult> consumerOffsets = consumer.getMixedOffsets();
+   SmallVector<OpFoldResult> consumerStrides = consumer.getMixedStrides();
+   SmallVector<OpFoldResult> producerOffsets = producer.getMixedOffsets();
+   SmallVector<OpFoldResult> producerStrides = producer.getMixedStrides();
+   if (consumerOffsets.size() != producerOffsets.size()) {
+-    return rewriter.notifyMatchFailure(
+-        producer,
+-        "expected op and consumer to have same number of offset values");
++    return failure();
+   }
+ 
+   combinedOffsets.resize(consumerOffsets.size());
+-  combinedSizes.resize(consumerOffsets.size());
+   combinedStrides.resize(consumerOffsets.size());
+   for (auto i : llvm::seq<unsigned>(0, consumerOffsets.size())) {
+     SmallVector<Value> offsetSymbols, strideSymbols;
+     // The combined offset is computed as
+-    //    consumer_offset + producer_offset * consumer_strides.
++    //    producer_offset + consumer_offset * producer_strides.
+     combinedOffsets[i] = getOpFoldResult(
+-        rewriter, loc,
+-        add(mul(producerOffsets[i], consumerStrides[i], offsetSymbols),
+-            consumerOffsets[i], offsetSymbols),
++        builder, loc,
++        add(mul(consumerOffsets[i], producerStrides[i], offsetSymbols),
++            producerOffsets[i], offsetSymbols),
+         offsetSymbols);
+     // The combined stride is computed as
+     //    consumer_stride * producer_stride.
+     combinedStrides[i] = getOpFoldResult(
+-        rewriter, loc,
++        builder, loc,
+         mul(consumerStrides[i], producerStrides[i], strideSymbols),
+         strideSymbols);
+   }
+-  combinedSizes = producer.getMixedSizes();
+   return success();
+ }
+ 
+diff --git a/iree/compiler/Codegen/Utils/Utils.h b/iree/compiler/Codegen/Utils/Utils.h
+index 4e4d06dda959..34b9dd9f2854 100644
+--- a/iree/compiler/Codegen/Utils/Utils.h
++++ b/iree/compiler/Codegen/Utils/Utils.h
+@@ -164,16 +164,12 @@ linalg::LinalgLoopDistributionOptions getIREELinalgLoopDistributionOptions();
+ /// `OffsetSizeAndStrideOpInterface`.
+ /// The following computations are performed:
+ ///   - offsets = producer_offsets * consumer_strides + consumer_offsets,
+-///   - sizes = producer_sizes
+ ///   - strides = producer_strides * consumer_strides.
+-// TODO: Sizes should technically be combined with `min` but one often has
+-// enough static knowledge to avoid this extra complexity.
+-LogicalResult foldOffsetsSizesAndStrides(
+-    PatternRewriter &rewriter, Location loc,
++LogicalResult foldOffsetsAndStrides(
++    OpBuilder &builder, Location loc,
+     OffsetSizeAndStrideOpInterface producer,
+     OffsetSizeAndStrideOpInterface consumer,
+     SmallVector<OpFoldResult> &combinedOffsets,
+-    SmallVector<OpFoldResult> &combinedSizes,
+     SmallVector<OpFoldResult> &combinedStrides);
+ }  // namespace iree_compiler
+ }  // namespace mlir
+diff --git a/iree/test/e2e/regression/BUILD b/iree/test/e2e/regression/BUILD
+index 2e7dbc2ae05a..86289ffafd86 100644
+--- a/iree/test/e2e/regression/BUILD
++++ b/iree/test/e2e/regression/BUILD
+@@ -29,6 +29,7 @@ BACKEND_TESTS = [
+     "dynamic_torch_index_select_vector.mlir",
+     "linalg_ops.mlir",
+     "linalg_ext_ops.mlir",
++    "strided_slice.mlir",
+ ]
+ 
+ iree_lit_test_suite(
+diff --git a/iree/test/e2e/regression/CMakeLists.txt b/iree/test/e2e/regression/CMakeLists.txt
+index c1bf2f93d39f..05cebfad6ada 100644
+--- a/iree/test/e2e/regression/CMakeLists.txt
++++ b/iree/test/e2e/regression/CMakeLists.txt
+@@ -44,6 +44,7 @@ iree_check_single_backend_test_suite(
+     "linalg_ext_ops.mlir"
+     "linalg_ops.mlir"
+     "lowering_config.mlir"
++    "strided_slice.mlir"
+   TARGET_BACKEND
+     "dylib-llvm-aot"
+   DRIVER
+@@ -79,6 +80,7 @@ iree_check_single_backend_test_suite(
+     "dynamic_torch_index_select_vector.mlir"
+     "linalg_ext_ops.mlir"
+     "linalg_ops.mlir"
++    "strided_slice.mlir"
+   TARGET_BACKEND
+     "vmvx"
+   DRIVER
+@@ -101,6 +103,7 @@ iree_check_single_backend_test_suite(
+     "dynamic_torch_index_select_vector.mlir"
+     "linalg_ext_ops.mlir"
+     "linalg_ops.mlir"
++    "strided_slice.mlir"
+   TARGET_BACKEND
+     "vulkan-spirv"
+   DRIVER
+@@ -123,6 +126,7 @@ iree_check_single_backend_test_suite(
+     "dynamic_torch_index_select_vector.mlir"
+     "linalg_ext_ops.mlir"
+     "linalg_ops.mlir"
++    "strided_slice.mlir"
+   TARGET_BACKEND
+     "cuda"
+   DRIVER
+diff --git a/iree/test/e2e/regression/strided_slice.mlir b/iree/test/e2e/regression/strided_slice.mlir
+new file mode 100644
+index 000000000000..f805267417ba
+--- /dev/null
++++ b/iree/test/e2e/regression/strided_slice.mlir
+@@ -0,0 +1,59 @@
++func @stride_slice() {
++  %c15 = arith.constant 15 : i32
++  %c16 = arith.constant 16 : i32
++  %0 = linalg.init_tensor [12, 15] : tensor<12x15xi32>
++  %1 = linalg.generic {
++      indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>],
++      iterator_types = ["parallel", "parallel"]}
++      outs(%0 : tensor<12x15xi32>) {
++    ^bb0(%b0 : i32):
++      %2 = linalg.index 0 : index
++      %3 = linalg.index 1 : index
++      %4 = arith.index_cast %2 : index to i32
++      %5 = arith.index_cast %3 : index to i32
++      %6 = arith.muli %c15, %4 : i32
++      %7 = arith.addi %6, %5 : i32
++      linalg.yield %7 : i32
++    } -> tensor<12x15xi32>
++  %2 = linalg.init_tensor [14, 16] : tensor<14x16xi32>
++  %3 = linalg.generic {
++      indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>],
++      iterator_types = ["parallel", "parallel"]}
++      outs(%2 : tensor<14x16xi32>) {
++    ^bb0(%b0 : i32):
++      %4 = linalg.index 0 : index
++      %5 = linalg.index 1 : index
++      %6 = arith.index_cast %4 : index to i32
++      %7 = arith.index_cast %5 : index to i32
++      %8 = arith.muli %c16, %6 : i32
++      %9 = arith.addi %8, %7 : i32
++      linalg.yield %9 : i32
++    } -> tensor<14x16xi32>
++  %4 = tensor.extract_slice %1[2, 3] [3, 3] [2, 3] : tensor<12x15xi32> to tensor<3x3xi32>
++  %5 = tensor.extract_slice %3[3, 2] [3, 3] [3, 2] : tensor<14x16xi32> to tensor<3x3xi32>
++  %6 = linalg.init_tensor [3, 3] : tensor<3x3xi32>
++  %7 = linalg.generic {
++      indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>,
++                       affine_map<(d0, d1) -> (d0, d1)>],
++      iterator_types = ["parallel", "parallel"]}
++      ins(%4, %5 : tensor<3x3xi32>, tensor<3x3xi32>)
++      outs(%6 : tensor<3x3xi32>) {
++    ^bb0(%b0 : i32, %b1 : i32, %b2: i32):
++      %8 = arith.addi %b0, %b1 : i32
++      linalg.yield %8 : i32
++    } -> tensor<3x3xi32>
++  %8 = arith.constant dense<42> : tensor<10x12xi32>
++  %9 = tensor.insert_slice %7 into %8[1, 2] [3, 3] [2, 3] : tensor<3x3xi32> into tensor<10x12xi32>
++  check.expect_eq_const(%9, dense<[
++    [42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42],
++    [42, 42, 83, 42, 42, 88, 42, 42, 93, 42, 42, 42],
++    [42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42],
++    [42, 42, 161, 42, 42, 166, 42, 42, 171, 42, 42, 42],
++    [42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42],
++    [42, 42, 239, 42, 42, 244, 42, 42, 249, 42, 42, 42],
++    [42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42],
++    [42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42],
++    [42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42],
++    [42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42]]> : tensor<10x12xi32>) : tensor<10x12xi32>
++  return
++}
+
+From 93b78bf97c35d55c37a5fc1563ba70ca7866461f Mon Sep 17 00:00:00 2001
+From: MaheshRavishankar <ravishankarm@google.com>
+Date: Thu, 7 Apr 2022 16:59:57 -0700
+Subject: [PATCH 2/4] Fix clang format.
+
+---
+ iree/compiler/Codegen/Utils/Utils.h | 11 +++++------
+ 1 file changed, 5 insertions(+), 6 deletions(-)
+
+diff --git a/iree/compiler/Codegen/Utils/Utils.h b/iree/compiler/Codegen/Utils/Utils.h
+index 34b9dd9f2854..68e40055b0b0 100644
+--- a/iree/compiler/Codegen/Utils/Utils.h
++++ b/iree/compiler/Codegen/Utils/Utils.h
+@@ -165,12 +165,11 @@ linalg::LinalgLoopDistributionOptions getIREELinalgLoopDistributionOptions();
+ /// The following computations are performed:
+ ///   - offsets = producer_offsets * consumer_strides + consumer_offsets,
+ ///   - strides = producer_strides * consumer_strides.
+-LogicalResult foldOffsetsAndStrides(
+-    OpBuilder &builder, Location loc,
+-    OffsetSizeAndStrideOpInterface producer,
+-    OffsetSizeAndStrideOpInterface consumer,
+-    SmallVector<OpFoldResult> &combinedOffsets,
+-    SmallVector<OpFoldResult> &combinedStrides);
++LogicalResult foldOffsetsAndStrides(OpBuilder &builder, Location loc,
++                                    OffsetSizeAndStrideOpInterface producer,
++                                    OffsetSizeAndStrideOpInterface consumer,
++                                    SmallVector<OpFoldResult> &combinedOffsets,
++                                    SmallVector<OpFoldResult> &combinedStrides);
+ }  // namespace iree_compiler
+ }  // namespace mlir
+ 
+
+From 6bf7ce64f63ff99f0c935a22459354e54f0c352e Mon Sep 17 00:00:00 2001
+From: MaheshRavishankar <ravishankarm@google.com>
+Date: Fri, 8 Apr 2022 12:41:08 -0700
+Subject: [PATCH 3/4] Remove stray local file.
+
+---
+ iree/compiler/Codegen/Common/test/test.vmfb | 0
+ 1 file changed, 0 insertions(+), 0 deletions(-)
+ delete mode 100644 iree/compiler/Codegen/Common/test/test.vmfb
+
+diff --git a/iree/compiler/Codegen/Common/test/test.vmfb b/iree/compiler/Codegen/Common/test/test.vmfb
+deleted file mode 100644
+index e69de29bb2d1..000000000000
+
+From e32f92771b16d04848e40f5905279faa1bfd8963 Mon Sep 17 00:00:00 2001
+From: MaheshRavishankar <ravishankarm@google.com>
+Date: Mon, 11 Apr 2022 10:57:09 -0700
+Subject: [PATCH 4/4] Handle rank reduced cases.
+
+---
+ .../BufferizeCopyOnlyDispatchesPass.cpp       | 23 +++++-----
+ .../Codegen/Common/DestructiveUpdateUtils.cpp | 15 ++++---
+ .../tile_and_distribute_to_workgroups.mlir    | 12 ++---
+ iree/compiler/Codegen/Utils/Utils.cpp         | 39 ++++++++++------
+ iree/compiler/Codegen/Utils/Utils.h           | 12 ++---
+ iree/compiler/Dialect/Flow/IR/FlowOps.cpp     | 44 ++++++++++++-------
+ iree/compiler/Dialect/Flow/IR/FlowOps.td      |  5 +++
+ iree/test/e2e/regression/strided_slice.mlir   | 33 ++++++++++++++
+ 8 files changed, 126 insertions(+), 57 deletions(-)
+
+diff --git a/iree/compiler/Codegen/Common/BufferizeCopyOnlyDispatchesPass.cpp b/iree/compiler/Codegen/Common/BufferizeCopyOnlyDispatchesPass.cpp
+index ef987f23bfa2..fabb2cb64002 100644
+--- a/iree/compiler/Codegen/Common/BufferizeCopyOnlyDispatchesPass.cpp
++++ b/iree/compiler/Codegen/Common/BufferizeCopyOnlyDispatchesPass.cpp
+@@ -60,19 +60,19 @@ struct FoldTensorLoadWithExtractSlice
+             .getDefiningOp<IREE::Flow::DispatchTensorLoadOp>();
+     if (!dispatchTensorLoadOp) return failure();
+ 
+-    SmallVector<OpFoldResult> offsets, strides;
++    SmallVector<OpFoldResult> offsets, sizes, strides;
+     // `tensor.extract_slice` (i.e. the producer) folds **into**
+     // `flow.dispatch.tensor.load1 (i.e. the consumer).
+-    if (failed(foldOffsetsAndStrides(rewriter, dispatchTensorLoadOp->getLoc(),
+-                                     dispatchTensorLoadOp, extractSliceOp,
+-                                     offsets, strides))) {
++    if (failed(foldOffsetsSizesAndStrides(
++            rewriter, dispatchTensorLoadOp->getLoc(), dispatchTensorLoadOp,
++            extractSliceOp, dispatchTensorLoadOp.getDroppedDims(), offsets,
++            sizes, strides))) {
+       return failure();
+     }
+ 
+     rewriter.replaceOpWithNewOp<IREE::Flow::DispatchTensorLoadOp>(
+         extractSliceOp, extractSliceOp.getType(), dispatchTensorLoadOp.source(),
+-        dispatchTensorLoadOp.source_dims(), offsets,
+-        extractSliceOp.getMixedSizes(), strides);
++        dispatchTensorLoadOp.source_dims(), offsets, sizes, strides);
+     return success();
+   }
+ };
+@@ -103,19 +103,20 @@ struct FoldInsertSliceWithTensorStoreOp
+       return failure();
+     }
+ 
+-    SmallVector<OpFoldResult> offsets, strides;
++    SmallVector<OpFoldResult> offsets, sizes, strides;
+     // `tensor.insert_slice` (i.e. the producer) folds **into**
+     // `flow.dispatch.tensor.store` (i.e. the consumer).
+-    if (failed(foldOffsetsAndStrides(rewriter, dispatchTensorStoreOp->getLoc(),
+-                                     dispatchTensorStoreOp, insertSliceOp,
+-                                     offsets, strides))) {
++    if (failed(foldOffsetsSizesAndStrides(
++            rewriter, dispatchTensorStoreOp->getLoc(), dispatchTensorStoreOp,
++            insertSliceOp, dispatchTensorStoreOp.getDroppedDims(), offsets,
++            sizes, strides))) {
+       return failure();
+     }
+ 
+     rewriter.replaceOpWithNewOp<IREE::Flow::DispatchTensorStoreOp>(
+         dispatchTensorStoreOp, insertSliceOp.source(),
+         dispatchTensorStoreOp.target(), dispatchTensorStoreOp.target_dims(),
+-        offsets, insertSliceOp.getMixedSizes(), strides);
++        offsets, sizes, strides);
+     return success();
+   }
+ };
+diff --git a/iree/compiler/Codegen/Common/DestructiveUpdateUtils.cpp b/iree/compiler/Codegen/Common/DestructiveUpdateUtils.cpp
+index bb636237915e..a6b0ec59ce20 100644
+--- a/iree/compiler/Codegen/Common/DestructiveUpdateUtils.cpp
++++ b/iree/compiler/Codegen/Common/DestructiveUpdateUtils.cpp
+@@ -223,13 +223,15 @@ static LogicalResult foldExtractSliceOp(OpBuilder &b,
+ 
+   SmallVector<OpFoldResult> offsets, sizes, strides;
+   Location loc = op.getLoc();
+-  if (failed(foldOffsetsAndStrides(b, loc, loadOp, op, offsets, strides))) {
++  if (failed(foldOffsetsSizesAndStrides(b, loc, loadOp, op,
++                                        loadOp.getDroppedDims(), offsets, sizes,
++                                        strides))) {
+     return failure();
+   }
+ 
+   Value loaded = b.create<IREE::Flow::DispatchTensorLoadOp>(
+       op.getLoc(), op.getType(), loadOp.source(), loadOp.source_dims(), offsets,
+-      op.getMixedSizes(), strides);
++      sizes, strides);
+ 
+   op.getResult().replaceAllUsesWith(loaded);
+   op.erase();
+@@ -295,16 +297,17 @@ LogicalResult rewriteDestructiveUpdateInPlace<tensor::InsertSliceOp>(
+     // Kills the SSA use-def chain.
+     usedResult.replaceAllUsesWith(dest);
+ 
+-    SmallVector<OpFoldResult> offsets, strides;
++    SmallVector<OpFoldResult> offsets, sizes, strides;
+     Location loc = insertSliceOp->getLoc();
+-    if (failed(foldOffsetsAndStrides(b, loc, storeOp, insertSliceOp, offsets,
+-                                     strides))) {
++    if (failed(foldOffsetsSizesAndStrides(b, loc, storeOp, insertSliceOp,
++                                          storeOp.getDroppedDims(), offsets,
++                                          sizes, strides))) {
+       return failure();
+     }
+ 
+     b.create<IREE::Flow::DispatchTensorStoreOp>(
+         insertSliceOp->getLoc(), insertSliceOp.source(), storeOp.target(),
+-        storeOp.target_dims(), offsets, insertSliceOp.getMixedSizes(), strides);
++        storeOp.target_dims(), offsets, sizes, strides);
+ 
+     return success();
+   }
+diff --git a/iree/compiler/Codegen/Common/test/tile_and_distribute_to_workgroups.mlir b/iree/compiler/Codegen/Common/test/tile_and_distribute_to_workgroups.mlir
+index fbf45c7b6f4a..9dcca269959a 100644
+--- a/iree/compiler/Codegen/Common/test/tile_and_distribute_to_workgroups.mlir
++++ b/iree/compiler/Codegen/Common/test/tile_and_distribute_to_workgroups.mlir
+@@ -1178,11 +1178,11 @@ hal.executable private @rank_reduced_slice {
+     builtin.module {
+       func.func @rank_reduced_slice() {
+         %in_binding = hal.interface.binding.subspan set(0) binding(0) type(storage_buffer)
+-            : !flow.dispatch.tensor<readonly:1x40xf32>
++            : !flow.dispatch.tensor<readonly:5x40xf32>
+         %out_binding = hal.interface.binding.subspan set(0) binding(1) type(storage_buffer)
+             : !flow.dispatch.tensor<writeonly:10xf32>
+-        %in = flow.dispatch.tensor.load %in_binding, offsets = [0, 10], sizes = [1, 10], strides = [1, 1]
+-            : !flow.dispatch.tensor<readonly:1x40xf32> -> tensor<10xf32>
++        %in = flow.dispatch.tensor.load %in_binding, offsets = [3, 10], sizes = [1, 10], strides = [2, 1]
++            : !flow.dispatch.tensor<readonly:5x40xf32> -> tensor<10xf32>
+         %out = linalg.init_tensor [10] : tensor<10xf32>
+         %val = linalg.generic {
+             indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>],
+@@ -1199,14 +1199,16 @@ hal.executable private @rank_reduced_slice {
+     }
+   }
+ }
++//      CHECK: #[[MAP:.+]] = affine_map<()[s0] -> (s0 + 10)>
+ //      CHECK: func @rank_reduced_slice()
+ //  CHECK-DAG:   %[[SRC_BINDING:.+]] = hal.interface.binding.subspan set(0) binding(0)
+-// CHECK-SAME:       : !flow.dispatch.tensor<readonly:1x40xf32>
++// CHECK-SAME:       : !flow.dispatch.tensor<readonly:5x40xf32>
+ //  CHECK-DAG:   %[[DST_BINDING:.+]] = hal.interface.binding.subspan set(0) binding(1)
+ // CHECK-SAME:       : !flow.dispatch.tensor<writeonly:10xf32>
+ //      CHECK:   scf.for %[[IV0:.+]] =
++//      CHECK:     %[[OFFSET:.+]] = affine.apply #[[MAP]]()[%[[IV0]]]
+ //      CHECK:     %[[SRC_TILE:.+]] = flow.dispatch.tensor.load %[[SRC_BINDING]]
+-// CHECK-SAME:         offsets = [%[[C0]], %[[IV0]]], sizes = [1, 2], strides = [1, 1]
++// CHECK-SAME:         offsets = [3, %[[OFFSET]]], sizes = [1, 2], strides = [2, 1]
+ //      CHECK:     linalg.generic
+ // CHECK-SAME:         ins(%[[SRC_TILE]] :
+ 
+diff --git a/iree/compiler/Codegen/Utils/Utils.cpp b/iree/compiler/Codegen/Utils/Utils.cpp
+index 21cc338b8a0a..d94b3d3e9806 100644
+--- a/iree/compiler/Codegen/Utils/Utils.cpp
++++ b/iree/compiler/Codegen/Utils/Utils.cpp
+@@ -632,36 +632,49 @@ static AffineExpr mul(OpFoldResult lhs, OpFoldResult rhs,
+ 
+ /// Returns the offsets, sizes and strides to use when combining two operations
+ /// that implement the `OffsetSizeAndStrideOpInterface`.
+-LogicalResult foldOffsetsAndStrides(
++LogicalResult foldOffsetsSizesAndStrides(
+     OpBuilder &builder, Location loc, OffsetSizeAndStrideOpInterface producer,
+     OffsetSizeAndStrideOpInterface consumer,
++    const llvm::SmallBitVector &droppedProducerDims,
+     SmallVector<OpFoldResult> &combinedOffsets,
++    SmallVector<OpFoldResult> &combinedSizes,
+     SmallVector<OpFoldResult> &combinedStrides) {
+   SmallVector<OpFoldResult> consumerOffsets = consumer.getMixedOffsets();
++  SmallVector<OpFoldResult> consumerSizes = consumer.getMixedSizes();
+   SmallVector<OpFoldResult> consumerStrides = consumer.getMixedStrides();
+   SmallVector<OpFoldResult> producerOffsets = producer.getMixedOffsets();
++  SmallVector<OpFoldResult> producerSizes = producer.getMixedSizes();
+   SmallVector<OpFoldResult> producerStrides = producer.getMixedStrides();
+-  if (consumerOffsets.size() != producerOffsets.size()) {
+-    return failure();
+-  }
+ 
+-  combinedOffsets.resize(consumerOffsets.size());
+-  combinedStrides.resize(consumerOffsets.size());
+-  for (auto i : llvm::seq<unsigned>(0, consumerOffsets.size())) {
++  combinedOffsets.resize(producerOffsets.size());
++  combinedSizes.resize(producerOffsets.size());
++  combinedStrides.resize(producerOffsets.size());
++  unsigned consumerPos = 0;
++  for (auto i : llvm::seq<unsigned>(0, producerOffsets.size())) {
++    if (droppedProducerDims.test(i)) {
++      // For dropped dims, get the values from the producer.
++      combinedOffsets[i] = producerOffsets[i];
++      combinedSizes[i] = producerSizes[i];
++      combinedStrides[i] = producerStrides[i];
++      continue;
++    }
+     SmallVector<Value> offsetSymbols, strideSymbols;
+     // The combined offset is computed as
+     //    producer_offset + consumer_offset * producer_strides.
+-    combinedOffsets[i] = getOpFoldResult(
+-        builder, loc,
+-        add(mul(consumerOffsets[i], producerStrides[i], offsetSymbols),
+-            producerOffsets[i], offsetSymbols),
+-        offsetSymbols);
++    combinedOffsets[i] =
++        getOpFoldResult(builder, loc,
++                        add(mul(consumerOffsets[consumerPos],
++                                producerStrides[i], offsetSymbols),
++                            producerOffsets[i], offsetSymbols),
++                        offsetSymbols);
++    combinedSizes[i] = consumerSizes[consumerPos];
+     // The combined stride is computed as
+     //    consumer_stride * producer_stride.
+     combinedStrides[i] = getOpFoldResult(
+         builder, loc,
+-        mul(consumerStrides[i], producerStrides[i], strideSymbols),
++        mul(consumerStrides[consumerPos], producerStrides[i], strideSymbols),
+         strideSymbols);
++    consumerPos++;
+   }
+   return success();
+ }
+diff --git a/iree/compiler/Codegen/Utils/Utils.h b/iree/compiler/Codegen/Utils/Utils.h
+index 68e40055b0b0..739c02b342b3 100644
+--- a/iree/compiler/Codegen/Utils/Utils.h
++++ b/iree/compiler/Codegen/Utils/Utils.h
+@@ -165,11 +165,13 @@ linalg::LinalgLoopDistributionOptions getIREELinalgLoopDistributionOptions();
+ /// The following computations are performed:
+ ///   - offsets = producer_offsets * consumer_strides + consumer_offsets,
+ ///   - strides = producer_strides * consumer_strides.
+-LogicalResult foldOffsetsAndStrides(OpBuilder &builder, Location loc,
+-                                    OffsetSizeAndStrideOpInterface producer,
+-                                    OffsetSizeAndStrideOpInterface consumer,
+-                                    SmallVector<OpFoldResult> &combinedOffsets,
+-                                    SmallVector<OpFoldResult> &combinedStrides);
++LogicalResult foldOffsetsSizesAndStrides(
++    OpBuilder &builder, Location loc, OffsetSizeAndStrideOpInterface producer,
++    OffsetSizeAndStrideOpInterface consumer,
++    const llvm::SmallBitVector &droppedProducerDims,
++    SmallVector<OpFoldResult> &combinedOffsets,
++    SmallVector<OpFoldResult> &combinedSizes,
++    SmallVector<OpFoldResult> &combinedStrides);
+ }  // namespace iree_compiler
+ }  // namespace mlir
+ 
+diff --git a/iree/compiler/Dialect/Flow/IR/FlowOps.cpp b/iree/compiler/Dialect/Flow/IR/FlowOps.cpp
+index acaf7eba2087..c134b96eb998 100644
+--- a/iree/compiler/Dialect/Flow/IR/FlowOps.cpp
++++ b/iree/compiler/Dialect/Flow/IR/FlowOps.cpp
+@@ -60,6 +60,27 @@ static LogicalResult verifyOpDynamicDims(Operation *op, ValueRange values,
+   return success();
+ }
+ 
++// Gets the dropped dimensions for `flow.dispatch.tensor.load/store`.
++static llvm::SmallBitVector getDroppedDimsImpl(
++    RankedTensorType slicedObjectType, ArrayRef<OpFoldResult> mixedSizes) {
++  ArrayRef<int64_t> resultShape = slicedObjectType.getShape();
++  llvm::SmallBitVector droppedDims(mixedSizes.size());
++  unsigned shapePos = 0;
++  for (const auto &size : enumerate(mixedSizes)) {
++    Optional<int64_t> sizeVal = getConstantIntValue(size.value());
++    // If the size is not 1, or if the current matched dimension of the result
++    // is the same static shape as the size value (which is 1), then the
++    // dimension is preserved.
++    if (!sizeVal || sizeVal.getValue() != 1 ||
++        (shapePos < resultShape.size() && resultShape[shapePos] == 1)) {
++      shapePos++;
++      continue;
++    }
++    droppedDims.set(size.index());
++  }
++  return droppedDims;
++}
++
+ //===----------------------------------------------------------------------===//
+ // flow.dispatch.tie_shape
+ //===----------------------------------------------------------------------===//
+@@ -187,23 +208,7 @@ RankedTensorType DispatchTensorLoadOp::inferResultType(
+ }
+ 
+ llvm::SmallBitVector DispatchTensorLoadOp::getDroppedDims() {
+-  ArrayRef<int64_t> resultShape = getType().getShape();
+-  SmallVector<OpFoldResult> mixedSizes = getMixedSizes();
+-  llvm::SmallBitVector droppedDims(mixedSizes.size());
+-  unsigned shapePos = 0;
+-  for (const auto &size : enumerate(mixedSizes)) {
+-    Optional<int64_t> sizeVal = getConstantIntValue(size.value());
+-    // If the size is not 1, or if the current matched dimension of the result
+-    // is the same static shape as the size value (which is 1), then the
+-    // dimension is preserved.
+-    if (!sizeVal || sizeVal.getValue() != 1 ||
+-        (shapePos < resultShape.size() && resultShape[shapePos] == 1)) {
+-      shapePos++;
+-      continue;
+-    }
+-    droppedDims.set(size.index());
+-  }
+-  return droppedDims;
++  return getDroppedDimsImpl(getType(), getMixedSizes());
+ }
+ 
+ void DispatchTensorLoadOp::build(OpBuilder &builder, OperationState &state,
+@@ -334,6 +339,11 @@ void DispatchTensorStoreOp::build(OpBuilder &builder, OperationState &state,
+   state.addAttributes(attributes);
+ }
+ 
++llvm::SmallBitVector DispatchTensorStoreOp::getDroppedDims() {
++  return getDroppedDimsImpl(value().getType().cast<RankedTensorType>(),
++                            getMixedSizes());
++}
++
+ //===----------------------------------------------------------------------===//
+ // flow.dispatch.workgroups
+ //===----------------------------------------------------------------------===//
+diff --git a/iree/compiler/Dialect/Flow/IR/FlowOps.td b/iree/compiler/Dialect/Flow/IR/FlowOps.td
+index aa203a2a9541..1817dc1f298c 100644
+--- a/iree/compiler/Dialect/Flow/IR/FlowOps.td
++++ b/iree/compiler/Dialect/Flow/IR/FlowOps.td
+@@ -478,6 +478,11 @@ def FLOW_DispatchTensorStoreOp : FLOW_Op<"dispatch.tensor.store", [
+       return idx == 0 ? sizes() : target_dims();
+     }
+     ValueRange getResultDynamicDims(unsigned idx) { return {}; }
++
++    /// Returns the list of dimensions that are dropped if the
++    /// !flow.dispatch.tensor.load is rank-reducing.
++    llvm::SmallBitVector getDroppedDims();
++
+   }];
+ 
+   let hasVerifier = 1;
+diff --git a/iree/test/e2e/regression/strided_slice.mlir b/iree/test/e2e/regression/strided_slice.mlir
+index f805267417ba..106d0e08f0f8 100644
+--- a/iree/test/e2e/regression/strided_slice.mlir
++++ b/iree/test/e2e/regression/strided_slice.mlir
+@@ -57,3 +57,36 @@ func @stride_slice() {
+     [42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42]]> : tensor<10x12xi32>) : tensor<10x12xi32>
+   return
+ }
++
++#map = affine_map<(d0) -> (d0)>
++func @issue_8825() {
++  %c0 = arith.constant 0 : index
++  %c0_i64 = arith.constant 0 : i64
++  %c3_i64 = arith.constant 3 : i64
++  %c2_i64 = arith.constant 2 : i64
++  %arg0 = arith.constant dense<[0.0, 1.0, 2.0, 3.0]> : tensor<4xf32>
++  %0 = tensor.dim %arg0, %c0 : tensor<4xf32>
++  %1 = arith.index_cast %0 : index to i64
++  %2 = arith.addi %c2_i64, %1 : i64
++  %3 = arith.cmpi sge, %c2_i64, %c0_i64 : i64
++  %4 = arith.select %3, %c2_i64, %2 : i64
++  %5 = arith.cmpi slt, %4, %c0_i64 : i64
++  %6 = arith.select %5, %c0_i64, %4 : i64
++  %7 = arith.cmpi sgt, %6, %1 : i64
++  %8 = arith.select %7, %1, %6 : i64
++  %9 = arith.index_cast %8 : i64 to index
++  %10 = arith.cmpi sge, %0, %9 : index
++  %11 = arith.select %10, %0, %9 : index
++  %12 = arith.subi %11, %9 : index
++  %13 = tensor.extract_slice %arg0[%9] [%12] [1] : tensor<4xf32> to tensor<?xf32>
++  %14 = linalg.init_tensor [%12] : tensor<?xf32>
++  %16 = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel"]} ins(%13 : tensor<?xf32>) outs(%14 : tensor<?xf32>) {
++    ^bb0(%arg1: f32, %arg2: f32):
++      %16 = arith.sitofp %c3_i64 : i64 to f32
++      %17 = arith.mulf %arg1, %16 : f32
++      linalg.yield %17 : f32
++    } -> tensor<?xf32>
++  %17 = tensor.cast %16 : tensor<?xf32> to tensor<2xf32>
++  check.expect_almost_eq_const(%17, dense<[6.0, 9.0]> : tensor<2xf32>) : tensor<2xf32>
++  return
++}
+\ No newline at end of file

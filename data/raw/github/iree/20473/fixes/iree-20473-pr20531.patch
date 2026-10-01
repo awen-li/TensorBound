@@ -1,0 +1,1824 @@
+From c1ce92fd2f2801a9f732a7fac5f5ed24cf606f3e Mon Sep 17 00:00:00 2001
+From: yzhang93 <zhyuhang88@gmail.com>
+Date: Wed, 9 Apr 2025 16:58:29 +0000
+Subject: [PATCH 1/5] [Im2col] Add input-filter permutation info to im2col
+ metadata
+
+Signed-off-by: yzhang93 <zhyuhang88@gmail.com>
+---
+ .../IR/AggregatedOpInterfaceImpl.cpp          | 27 +++++-
+ .../Dialect/LinalgExt/IR/LinalgExtOps.cpp     | 23 ++++-
+ .../Dialect/LinalgExt/IR/LinalgExtOps.td      | 15 +++-
+ .../Transforms/ConvertConvToIm2ColOp.cpp      | 69 ++++++++++++--
+ .../Transforms/test/conv_to_im2col.mlir       | 90 +++++++++++++++++++
+ .../Transforms/test/decompose_im2col.mlir     | 80 +++++++++++++++++
+ 6 files changed, 291 insertions(+), 13 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/Dialect/LinalgExt/IR/AggregatedOpInterfaceImpl.cpp b/compiler/src/iree/compiler/Dialect/LinalgExt/IR/AggregatedOpInterfaceImpl.cpp
+index 6c5fdbd3452d..96e4fbfd815d 100644
+--- a/compiler/src/iree/compiler/Dialect/LinalgExt/IR/AggregatedOpInterfaceImpl.cpp
++++ b/compiler/src/iree/compiler/Dialect/LinalgExt/IR/AggregatedOpInterfaceImpl.cpp
+@@ -777,6 +777,22 @@ FailureOr<SmallVector<Value>> Im2colOp::decomposeOperation(OpBuilder &b) {
+     }
+     kBasis.push_back(size);
+   }
++
++  // Check if the reduction dimension has different layouts between input and
++  // filter, if so, transpose the order of (P, Q, C) according to
++  // `inputFilterPerm` encoded in im2col metadata.
++  auto isIdentityPermutation = [](ArrayRef<int64_t> perm) -> bool {
++    return llvm::equal(llvm::seq<int64_t>(0, perm.size()), perm);
++  };
++
++  ArrayRef<int64_t> inputFilterPerm = getInputFilterPerm();
++  if (!isIdentityPermutation(inputFilterPerm)) {
++    SmallVector<OpFoldResult> origKBasis = kBasis;
++    for (auto [newIdx, transIdx] : llvm::enumerate(inputFilterPerm)) {
++      kBasis[newIdx] = origKBasis[transIdx];
++    }
++  }
++
+   OpFoldResult kIndex = kOffset;
+   for (auto [i, ivIdx, stride] :
+        llvm::enumerate(getKOutputDims(), getMixedKStrides())) {
+@@ -792,17 +808,22 @@ FailureOr<SmallVector<Value>> Im2colOp::decomposeOperation(OpBuilder &b) {
+            /*hasOuterBound=*/true)
+           .getResults();
+   // Split the delinearized offsets into the window offsets (for M offsets)
+-  // and the K offsets for the input tensor.
++  // and the K offsets for the input tensor based on the layout.
++  auto getIndex = [&inputFilterPerm](int64_t value) -> int64_t {
++    auto it = std::find(inputFilterPerm.begin(), inputFilterPerm.end(), value);
++    return static_cast<int64_t>(std::distance(inputFilterPerm.begin(), it));
++  };
++
+   SmallVector<Value> windowOffset, inputKOffset;
+   int delinKIdx = 0;
+   for (int i = 0; i < getInputRank(); ++i) {
+     if (batchPosSet.contains(i))
+       continue;
+     if (mPosSet.contains(i)) {
+-      windowOffset.push_back(delinKOffset[delinKIdx++]);
++      windowOffset.push_back(delinKOffset[getIndex(delinKIdx++)]);
+       continue;
+     }
+-    inputKOffset.push_back(delinKOffset[delinKIdx++]);
++    inputKOffset.push_back(delinKOffset[getIndex(delinKIdx++)]);
+   }
+ 
+   // Compute offsets for extract. The linearized im2col result M offset is
+diff --git a/compiler/src/iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.cpp b/compiler/src/iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.cpp
+index 7b4997134205..0458f51f92b3 100644
+--- a/compiler/src/iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.cpp
++++ b/compiler/src/iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.cpp
+@@ -1620,7 +1620,8 @@ void Im2colOp::build(
+     ArrayRef<OpFoldResult> kernelSize, ArrayRef<OpFoldResult> mOffset,
+     ArrayRef<OpFoldResult> mStrides, ArrayRef<OpFoldResult> kOffset,
+     ArrayRef<OpFoldResult> kStrides, ArrayRef<int64_t> batchPos,
+-    ArrayRef<int64_t> mPos, ArrayRef<int64_t> kPos) {
++    ArrayRef<int64_t> mPos, ArrayRef<int64_t> kPos,
++    ArrayRef<int64_t> inputFilterPerm) {
+   assert(strides.size() == kernelSize.size() &&
+          dilations.size() == kernelSize.size() &&
+          mPos.size() == kernelSize.size() &&
+@@ -1648,7 +1649,8 @@ void Im2colOp::build(
+         builder.getDenseI64ArrayAttr(staticKOffset), dynamicKStrides,
+         builder.getDenseI64ArrayAttr(staticKStrides),
+         builder.getDenseI64ArrayAttr(batchPos),
+-        builder.getDenseI64ArrayAttr(mPos), builder.getDenseI64ArrayAttr(kPos));
++        builder.getDenseI64ArrayAttr(mPos), builder.getDenseI64ArrayAttr(kPos),
++        builder.getDenseI64ArrayAttr(inputFilterPerm));
+ }
+ 
+ LogicalResult Im2colOp::verify() {
+@@ -1711,6 +1713,7 @@ LogicalResult Im2colOp::verify() {
+   ArrayRef<int64_t> strides = getStrides();
+   ArrayRef<int64_t> dilations = getDilations();
+   SmallVector<OpFoldResult> kernelSize = getMixedKernelSize();
++  ArrayRef<int64_t> inputFilterPerm = getInputFilterPerm();
+   if (kernelSize.size() != mPos.size()) {
+     return op->emitOpError(
+         "expected kernel rank to be equal to the m_pos rank");
+@@ -1724,6 +1727,22 @@ LogicalResult Im2colOp::verify() {
+         "expected dilations rank to be equal to the kernel rank");
+   }
+ 
++  size_t sharedRank = mPos.size() + kPos.size();
++  if (inputFilterPerm.size() != sharedRank) {
++    return op->emitOpError("expected input_filter_perm size (")
++           << inputFilterPerm.size()
++           << ") to match the number of shared dimensions (m_Pos + k_pos = "
++           << sharedRank << ")";
++  }
++  SmallVector<int64_t> permVec(inputFilterPerm.begin(), inputFilterPerm.end());
++  llvm::sort(permVec);
++  for (int64_t i = 0; i < static_cast<int64_t>(sharedRank); ++i) {
++    if (permVec[i] != i) {
++      return op->emitOpError("input_filter_perm must be a permutation of [0, ")
++             << sharedRank << "), but got an invalid entry: " << permVec[i];
++    }
++  }
++
+   // Verify input and output shapes.
+   ArrayRef<int64_t> inputShape = inputType.getShape();
+   ArrayRef<int64_t> outputShape = outputType.getShape();
+diff --git a/compiler/src/iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.td b/compiler/src/iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.td
+index e57f26356509..8ce39b79e8cc 100644
+--- a/compiler/src/iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.td
++++ b/compiler/src/iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.td
+@@ -794,6 +794,14 @@ def IREELinalgExt_Im2colOp : IREELinalgExt_Op<"im2col",
+     would be 4 for `K0`, and 1 for `K1`, meaning as `K0` increases by 1, the
+     index into the flat `K` increases by 4. The strides in M from `m_strides`
+     are orthogonal to the strides in `K` from `k_strides`.
++
++    The `input_filter_perm` attribute specifies the permutation required to align
++    the reduction dimensions of the input layout with the filter layout,
++    particularly for computing the K dimension of the im2col output. This is useful
++    when the logical layout of the filter (e.g., `CHW`) differs from that of the
++    input (e.g., `HWC`). For instance, an `input_filter_perm = [2, 0, 1]` indicates
++    the input needs to be transposed from `HWC` to `CHW` layout before extracting
++    patches into K.
+   }];
+ 
+   let arguments = (ins AnyShaped:$input, AnyShaped:$output,
+@@ -811,7 +819,8 @@ def IREELinalgExt_Im2colOp : IREELinalgExt_Op<"im2col",
+                        DenseI64ArrayAttr:$static_k_strides,
+                        DenseI64ArrayAttr:$batch_pos,
+                        DenseI64ArrayAttr:$m_pos,
+-                       DenseI64ArrayAttr:$k_pos);
++                       DenseI64ArrayAttr:$k_pos,
++                       DenseI64ArrayAttr:$input_filter_perm);
+ 
+   let results = (outs Variadic<AnyShaped>:$results);
+   let hasFolder = 1;
+@@ -830,6 +839,7 @@ def IREELinalgExt_Im2colOp : IREELinalgExt_Op<"im2col",
+     `batch_pos` `=` $batch_pos
+     `m_pos` `=` $m_pos
+     `k_pos` `=` $k_pos
++    `input_filter_perm` `=` $input_filter_perm
+     `ins` `(` $input `:` type($input) `)`
+     `outs` `(` $output `:` type($output) `)`
+     (`->` type($results)^)?
+@@ -846,7 +856,8 @@ def IREELinalgExt_Im2colOp : IREELinalgExt_Op<"im2col",
+       "ArrayRef<OpFoldResult>":$k_strides,
+       "ArrayRef<int64_t>":$batch_dimensions,
+       "ArrayRef<int64_t>":$m_dimensions,
+-      "ArrayRef<int64_t>":$k_dimensions)>
++      "ArrayRef<int64_t>":$k_dimensions,
++      "ArrayRef<int64_t>":$input_filter_perm)>
+   ];
+ 
+   let extraClassDeclaration = extraLinalgExtOpClassDeclaration # [{
+diff --git a/compiler/src/iree/compiler/Dialect/LinalgExt/Transforms/ConvertConvToIm2ColOp.cpp b/compiler/src/iree/compiler/Dialect/LinalgExt/Transforms/ConvertConvToIm2ColOp.cpp
+index fe7aacf41cc6..a5265be0bbb1 100644
+--- a/compiler/src/iree/compiler/Dialect/LinalgExt/Transforms/ConvertConvToIm2ColOp.cpp
++++ b/compiler/src/iree/compiler/Dialect/LinalgExt/Transforms/ConvertConvToIm2ColOp.cpp
+@@ -60,6 +60,59 @@ static SmallVector<int64_t> getBasisFromShape(ArrayRef<int64_t> shape) {
+   return basis;
+ }
+ 
++// Collect all AffineDimExprs from an AffineExpr.
++static void collectDimExprs(ArrayRef<AffineExpr> exprs,
++                            DenseSet<AffineExpr> &out) {
++  for (auto &expr : exprs) {
++    if (auto dimExpr = dyn_cast<AffineDimExpr>(expr)) {
++      out.insert(dimExpr);
++    } else if (auto binOpExpr = dyn_cast<AffineBinaryOpExpr>(expr)) {
++      collectDimExprs({binOpExpr.getLHS(), binOpExpr.getRHS()}, out);
++    } else {
++      llvm::errs() << "Non-dimension expression found: " << expr << "\n";
++    }
++  }
++}
++
++// Computes `inputFilterPerm` that maps the input spatial and channel order to
++// filter's.
++static SmallVector<int64_t> computeInputFilterPerm(AffineMap inputMap,
++                                                   AffineMap filterMap) {
++  DenseSet<AffineExpr> inputDimsSet;
++  DenseSet<AffineExpr> filterDimsSet;
++  collectDimExprs(inputMap.getResults(), inputDimsSet);
++  collectDimExprs(filterMap.getResults(), filterDimsSet);
++
++  // Get shared dims from input and filter in order of appearance.
++  SmallVector<AffineExpr> inputSharedDims;
++  SmallVector<AffineExpr> filterSharedDims;
++  for (AffineExpr expr : inputMap.getResults()) {
++    expr.walk([&](AffineExpr dimExpr) {
++      if (filterDimsSet.contains(dimExpr)) {
++        inputSharedDims.push_back(dimExpr);
++      }
++    });
++  }
++  for (AffineExpr expr : filterMap.getResults()) {
++    expr.walk([&](AffineExpr dimExpr) {
++      if (inputDimsSet.contains(dimExpr)) {
++        filterSharedDims.push_back(dimExpr);
++      }
++    });
++  }
++  // Compute the permutation that maps inputSharedDims to filterSharedDims.
++  SmallVector<int64_t> inputFilterPerm;
++  for (AffineExpr filterExpr : filterSharedDims) {
++    auto it = llvm::find(inputSharedDims, filterExpr);
++    if (it == inputSharedDims.end()) {
++      llvm_unreachable(
++          "Filter dimension not found in input shared dimensions.");
++    }
++    inputFilterPerm.push_back(std::distance(inputSharedDims.begin(), it));
++  }
++  return inputFilterPerm;
++}
++
+ namespace {
+ 
+ using ControlFnTy = std::function<bool(Operation *)>;
+@@ -67,7 +120,7 @@ using ControlFnTy = std::function<bool(Operation *)>;
+ // and linalg.matmul.
+ // The following explains this for a linalg.conv_2d_nhwc_hwcf op.
+ //
+-// A convolution operaton can be written as a matrix-matrix multiplication by
++// A convolution operation can be written as a matrix-matrix multiplication by
+ // unfolding the cross correlation between input and filter and explicitly copy
+ // overlapped sliding window inputs.
+ //
+@@ -83,7 +136,7 @@ using ControlFnTy = std::function<bool(Operation *)>;
+ // size, |columns| = filter spatial size. To compute the output Y(i, j) we need
+ // to calculate the dot product between filter window at input X(x, y)) and the
+ // filter which will look like the following where r.h.s is the img2col matrix
+-// and l.h.s is the flattned filter:
++// and l.h.s is the flattened filter:
+ //
+ // clang-format off
+ // [x(0, 0), x(0, 1), x(1, 0), x(1, 1)]
+@@ -93,10 +146,10 @@ using ControlFnTy = std::function<bool(Operation *)>;
+ // clang-format on
+ //
+ // In general for 2D case with (N, H, W, C) input and (Kh, Kw, C, D) filter
+-// and output (N, Ho, Wo, D) the convolutin is the following matrix-matrix
++// and output (N, Ho, Wo, D) the convolution is the following matrix-matrix
+ // multiplication (Ho x Wo, Kh x Kw x C) * (Kh x Kw x C, D) for each input in
+-// the N input. For the case where N > 1 its a batched matrxi-matrix
+-// multplication.
++// the N batches. For the case where N > 1 its a batched matrxi-matrix
++// multiplication.
+ 
+ class ConvertConvGeneric final
+     : public OpInterfaceRewritePattern<linalg::LinalgOp> {
+@@ -211,6 +264,10 @@ class ConvertConvGeneric final
+ 
+     SmallVector<OpFoldResult> kOffset(kBasis.size(), rewriter.getIndexAttr(0));
+     SmallVector<OpFoldResult> mOffset(mBasis.size(), rewriter.getIndexAttr(0));
++
++    SmallVector<int64_t> inputFilterPerm =
++        computeInputFilterPerm(inputMap, filterMap);
++
+     auto loc = linalgOp.getLoc();
+     Value colTensor = rewriter.create<tensor::EmptyOp>(
+         loc, colTensorShape, inputType.getElementType());
+@@ -219,7 +276,7 @@ class ConvertConvGeneric final
+             .create<IREE::LinalgExt::Im2colOp>(
+                 loc, input, /*output=*/colTensor, convDims.strides,
+                 convDims.dilations, kernelSizes, mOffset, mBasis, kOffset,
+-                kBasis, batchPos, mPos, kPos)
++                kBasis, batchPos, mPos, kPos, inputFilterPerm)
+             .getResult(0);
+ 
+     Value reshapedFilter = rewriter.create<tensor::CollapseShapeOp>(
+diff --git a/compiler/src/iree/compiler/Dialect/LinalgExt/Transforms/test/conv_to_im2col.mlir b/compiler/src/iree/compiler/Dialect/LinalgExt/Transforms/test/conv_to_im2col.mlir
+index a682835ade26..33a1500e3b1b 100644
+--- a/compiler/src/iree/compiler/Dialect/LinalgExt/Transforms/test/conv_to_im2col.mlir
++++ b/compiler/src/iree/compiler/Dialect/LinalgExt/Transforms/test/conv_to_im2col.mlir
+@@ -19,6 +19,7 @@ util.func public @conv_2d_nhwc_hwcf(%arg0: tensor<1x16x16x4xf32>, %arg1: tensor<
+ // CHECK-SAME:   strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+ // CHECK-SAME:   m_offset = [0, 0] * [14, 1] k_offset = [0] * [1]
+ // CHECK-SAME:   batch_pos = [0] m_pos = [1, 2] k_pos = [3]
++// CHECK-SAME:   input_filter_perm = [0, 1, 2]
+ // CHECK-SAME:   ins(%[[ARG0]] : tensor<1x16x16x4xf32>)
+ // CHECK-SAME:   outs(%[[EMPTY]] : tensor<1x14x14x36xf32>) -> tensor<1x14x14x36xf32>
+ // CHECK-DAG:  %[[COLLAPSED:.+]] = tensor.collapse_shape %[[ARG1]] {{\[}}[0, 1, 2], [3]] : tensor<3x3x4x16xf32> into tensor<36x16xf32>
+@@ -53,6 +54,7 @@ util.func public @conv_2d_nchw_fchw(%arg0: tensor<1x4x16x16xf32>, %arg1: tensor<
+ // CHECK-SAME:   strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+ // CHECK-SAME:   m_offset = [0, 0] * [14, 1] k_offset = [0] * [1]
+ // CHECK-SAME:   batch_pos = [0] m_pos = [2, 3] k_pos = [1]
++// CHECK-SAME:   input_filter_perm = [0, 1, 2]
+ // CHECK-SAME:   ins(%[[ARG0]] : tensor<1x4x16x16xf32>)
+ // CHECK-SAME:   outs(%[[EMPTY]] : tensor<1x14x14x36xf32>) -> tensor<1x14x14x36xf32>
+ // CHECK-DAG:  %[[COLLAPSED:.+]] = tensor.collapse_shape %[[ARG1]] {{\[}}[0], [1, 2, 3]] : tensor<16x4x3x3xf32> into tensor<16x36xf32>
+@@ -87,6 +89,7 @@ util.func public @conv_mixed_types(%arg0: tensor<1x16x16x4xf16>, %arg1: tensor<3
+ // CHECK-SAME:   strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+ // CHECK-SAME:   m_offset = [0, 0] * [14, 1] k_offset = [0] * [1]
+ // CHECK-SAME:   batch_pos = [0] m_pos = [1, 2] k_pos = [3]
++// CHECK-SAME:   input_filter_perm = [0, 1, 2]
+ // CHECK-SAME:   ins(%[[ARG0]] : tensor<1x16x16x4xf16>)
+ // CHECK-SAME:   outs(%[[EMPTY]] : tensor<1x14x14x36xf16>) -> tensor<1x14x14x36xf16>
+ // CHECK-DAG:  %[[COLLAPSED:.+]] = tensor.collapse_shape %[[ARG1]] {{\[}}[0, 1, 2], [3]] : tensor<3x3x4x16xf16> into tensor<36x16xf16>
+@@ -123,6 +126,7 @@ util.func public @conv_strided(%arg0: tensor<1x16x16x4xf16>, %arg1: tensor<3x3x4
+ // CHECK-SAME:   strides = [2, 2] dilations = [1, 1] kernel_size = [3, 3]
+ // CHECK-SAME:   m_offset = [0, 0] * [7, 1] k_offset = [0] * [1]
+ // CHECK-SAME:   batch_pos = [0] m_pos = [1, 2] k_pos = [3]
++// CHECK-SAME:   input_filter_perm = [0, 1, 2]
+ // CHECK-SAME:   ins(%[[ARG0]] : tensor<1x16x16x4xf16>)
+ // CHECK-SAME:   outs(%[[EMPTY]] : tensor<1x7x7x36xf16>) -> tensor<1x7x7x36xf16>
+ // CHECK-DAG:  %[[COLLAPSED:.+]] = tensor.collapse_shape %[[ARG1]] {{\[}}[0, 1, 2], [3]] : tensor<3x3x4x16xf16> into tensor<36x16xf16>
+@@ -233,6 +237,7 @@ util.func public @conv_1d_ncw_fcw_transpose_maps(%arg0: tensor<1x8x130xf32>, %ar
+ // CHECK-SAME:   strides = [1] dilations = [1] kernel_size = [3]
+ // CHECK-SAME:   m_offset = [0] * [1] k_offset = [0] * [1]
+ // CHECK-SAME:   batch_pos = [0] m_pos = [2] k_pos = [1]
++// CHECK-SAME:   input_filter_perm = [0, 1]
+ // CHECK-SAME:   ins(%[[ARG0]] : tensor<1x8x130xf32>)
+ // CHECK-SAME:   outs(%[[EMPTY2]] : tensor<1x128x24xf32>) -> tensor<1x128x24xf32>
+ // CHECK-DAG:  %[[COLLAPSED:.+]] = tensor.collapse_shape %[[ARG1]] {{\[}}[0], [1, 2]] : tensor<16x8x3xf32> into tensor<16x24xf32>
+@@ -273,6 +278,7 @@ util.func public @conv_2d_chwn_chwf(%arg0: tensor<16x26x18x288xf32>, %arg1: tens
+ // CHECK-SAME:   strides = [1, 1] dilations = [1, 1] kernel_size = [24, 16]
+ // CHECK-SAME:   m_offset = [0, 0] * [3, 1] k_offset = [0] * [1]
+ // CHECK-SAME:   batch_pos = [3] m_pos = [1, 2] k_pos = [0]
++// CHECK-SAME:   input_filter_perm = [0, 1, 2]
+ // CHECK-SAME:   ins(%[[ARG0]] : tensor<16x26x18x288xf32>)
+ // CHECK-SAME:   outs(%[[EMPTY]] : tensor<288x3x3x6144xf32>) -> tensor<288x3x3x6144xf32>
+ // CHECK-DAG:  %[[COLLAPSED:.+]] = tensor.collapse_shape %[[ARG1]] {{\[}}[0, 1, 2], [3]] : tensor<16x24x16x288xf32> into tensor<6144x288xf32>
+@@ -313,6 +319,7 @@ util.func public @conv_2d_hwcn_hwcf(%arg0: tensor<26x18x16x288xf32>, %arg1: tens
+ // CHECK-SAME:   strides = [1, 1] dilations = [1, 1] kernel_size = [24, 16]
+ // CHECK-SAME:   m_offset = [0, 0] * [3, 1] k_offset = [0] * [1]
+ // CHECK-SAME:   batch_pos = [3] m_pos = [0, 1] k_pos = [2]
++// CHECK-SAME:   input_filter_perm = [0, 1, 2]
+ // CHECK-SAME:   ins(%[[ARG0]] : tensor<26x18x16x288xf32>)
+ // CHECK-SAME:   outs(%[[EMPTY]] : tensor<288x3x3x6144xf32>) -> tensor<288x3x3x6144xf32>
+ // CHECK-DAG:  %[[COLLAPSED:.+]] = tensor.collapse_shape %[[ARG1]] {{\[}}[0, 1, 2], [3]] : tensor<24x16x16x288xf32> into tensor<6144x288xf32>
+@@ -351,6 +358,7 @@ util.func public @conv_nhwc_hwfc_nobatch(%arg0: tensor<16x16x4xf32>, %arg1: tens
+ // CHECK:      %[[EMPTY:.+]] = tensor.empty() : tensor<14x14x9x4xf32>
+ // CHECK:      %[[IM2COL:.+]] = iree_linalg_ext.im2col
+ // CHECK-SAME:   m_offset = [0, 0] * [14, 1] k_offset = [0, 0] * [4, 1] batch_pos = []
++// CHECK-SAME:   input_filter_perm = [0, 1, 2]
+ // CHECK-SAME:   ins(%[[ARG0]] : tensor<16x16x4xf32>)
+ // CHECK-SAME:   outs(%[[EMPTY]] : tensor<14x14x9x4xf32>) -> tensor<14x14x9x4xf32>
+ // CHECK-DAG:  %[[COLLAPSED:.+]] = tensor.collapse_shape %[[ARG1]] {{\[}}[0, 1], [2], [3]] : tensor<3x3x16x4xf32> into tensor<9x16x4xf32>
+@@ -359,3 +367,85 @@ util.func public @conv_nhwc_hwfc_nobatch(%arg0: tensor<16x16x4xf32>, %arg1: tens
+ // CHECK-SAME:   iterator_types = ["parallel", "parallel", "parallel", "reduction", "reduction"]
+ // CHECK-SAME:   ins(%[[IM2COL]], %[[COLLAPSED]] : tensor<14x14x9x4xf32>, tensor<9x16x4xf32>)
+ // CHECK:      util.return %[[MATMUL]] : tensor<14x14x16xf32>
++
++// -----
++
++#map = affine_map<(d0, d1, d2, d3, d4, d5, d6) -> (d0, d1 + d5, d2 + d6, d4)>
++#map1 = affine_map<(d0, d1, d2, d3, d4, d5, d6) -> (d4, d5, d6, d3)>
++#map2 = affine_map<(d0, d1, d2, d3, d4, d5, d6) -> (d0, d1, d2, d3)>
++util.func public @conv_2d_nhwc_chwf(%arg0: tensor<1x16x16x4xf32>, %arg1: tensor<4x3x3x16xf32>, %arg2: tensor<1x14x14x16xf32>) -> tensor<1x14x14x16xf32> {
++  %0 = linalg.generic {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "parallel", "parallel", "reduction", "reduction", "reduction"]} ins(%arg0, %arg1 : tensor<1x16x16x4xf32>, tensor<4x3x3x16xf32>) outs(%arg2 : tensor<1x14x14x16xf32>) {
++  ^bb0(%in: f32, %in_0: f32, %out: f32):
++    %3 = arith.mulf %in, %in_0 : f32
++    %4 = arith.addf %out, %3 : f32
++    linalg.yield %4 : f32
++  } -> tensor<1x14x14x16xf32>
++  util.return %0 : tensor<1x14x14x16xf32>
++}
++
++// CHECK-DAG:  #[[MAP:.+]] = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d4)>
++// CHECK-DAG:  #[[MAP1:.+]] = affine_map<(d0, d1, d2, d3, d4) -> (d4, d3)>
++// CHECK-DAG:  #[[MAP2:.+]] = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3)>
++// CHECK:      util.func public @conv_2d_nhwc_chwf(
++// CHECK-SAME:   %[[ARG0:[a-zA-Z0-9_]+]]: tensor<1x16x16x4xf32>
++// CHECK-SAME:   %[[ARG1:[a-zA-Z0-9_]+]]: tensor<4x3x3x16xf32>
++// CHECK-SAME:   %[[ARG2:[a-zA-Z0-9_]+]]: tensor<1x14x14x16xf32>
++// CHECK:      %[[EMPTY:.+]] = tensor.empty() : tensor<1x14x14x36xf32>
++// CHECK:      %[[IM2COL:.+]] = iree_linalg_ext.im2col
++// CHECK-SAME:   strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
++// CHECK-SAME:   m_offset = [0, 0] * [14, 1] k_offset = [0] * [1]
++// CHECK-SAME:   batch_pos = [0] m_pos = [1, 2] k_pos = [3]
++// CHECK-SAME:   input_filter_perm = [2, 0, 1]
++// CHECK-SAME:   ins(%[[ARG0]] : tensor<1x16x16x4xf32>)
++// CHECK-SAME:   outs(%[[EMPTY]] : tensor<1x14x14x36xf32>) -> tensor<1x14x14x36xf32>
++// CHECK-DAG:  %[[COLLAPSED:.+]] = tensor.collapse_shape %[[ARG1]] {{\[}}[0, 1, 2], [3]] : tensor<4x3x3x16xf32> into tensor<36x16xf32>
++// CHECK:      %[[MATMUL:.+]] = linalg.generic
++// CHECK-SAME:   indexing_maps = [#[[MAP]], #[[MAP1]], #[[MAP2]]]
++// CHECK-SAME:   iterator_types = ["parallel", "parallel", "parallel", "parallel", "reduction"]
++// CHECK-SAME:   ins(%[[IM2COL]], %[[COLLAPSED]] : tensor<1x14x14x36xf32>, tensor<36x16xf32>)
++// CHECK-SAME:   outs(%[[ARG2]] : tensor<1x14x14x16xf32>) {
++// CHECK:          arith.mulf
++// CHECK:          arith.addf
++// CHECK:      } -> tensor<1x14x14x16xf32>
++// CHECK:      util.return %[[MATMUL]] : tensor<1x14x14x16xf32>
++
++// -----
++
++#map = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1 + d4, d3)>
++#map1 = affine_map<(d0, d1, d2, d3, d4) -> (d3, d4, d2)>
++#map2 = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2)>
++util.func public @conv_1d_nhc_chf(%arg0: tensor<1x3x2xf32>, %arg1: tensor<2x2x2xf32>, %arg2: tensor<1x2x2xf32>) -> tensor<1x2x2xf32> {
++  %0 = linalg.generic {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "parallel", "reduction", "reduction"]} ins(%arg0, %arg1 : tensor<1x3x2xf32>, tensor<2x2x2xf32>) outs(%arg2 : tensor<1x2x2xf32>) {
++  ^bb0(%in: f32, %in_0: f32, %out: f32):
++    %1 = arith.mulf %in, %in_0 : f32
++    %2 = arith.addf %out, %1 : f32
++    linalg.yield %2 : f32
++  } -> tensor<1x2x2xf32>
++  util.return %0 : tensor<1x2x2xf32>
++}
++
++// CHECK-DAG:  #[[MAP:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d1, d3)>
++// CHECK-DAG:  #[[MAP1:.+]] = affine_map<(d0, d1, d2, d3) -> (d3, d2)>
++// CHECK-DAG:  #[[MAP2:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2)>
++// CHECK:      util.func public @conv_1d_nhc_chf(
++// CHECK-SAME:   %[[ARG0:[a-zA-Z0-9_]+]]: tensor<1x3x2xf32>
++// CHECK-SAME:   %[[ARG1:[a-zA-Z0-9_]+]]: tensor<2x2x2xf32>
++// CHECK-SAME:   %[[ARG2:[a-zA-Z0-9_]+]]: tensor<1x2x2xf32>
++// CHECK:      %[[EMPTY:.+]] = tensor.empty() : tensor<1x2x4xf32>
++// CHECK:      %[[IM2COL:.+]] = iree_linalg_ext.im2col
++// CHECK-SAME:   strides = [1] dilations = [1] kernel_size = [2]
++// CHECK-SAME:   m_offset = [0] * [1] k_offset = [0] * [1]
++// CHECK-SAME:   batch_pos = [0] m_pos = [1] k_pos = [2]
++// CHECK-SAME:   input_filter_perm = [1, 0]
++// CHECK-SAME:   ins(%[[ARG0]] : tensor<1x3x2xf32>)
++// CHECK-SAME:   outs(%[[EMPTY]] : tensor<1x2x4xf32>) -> tensor<1x2x4xf32>
++// CHECK-DAG:  %[[COLLAPSED:.+]] = tensor.collapse_shape %[[ARG1]] {{\[}}[0, 1], [2]] : tensor<2x2x2xf32> into tensor<4x2xf32>
++// CHECK:      %[[MATMUL:.+]] = linalg.generic
++// CHECK-SAME:   indexing_maps = [#[[MAP]], #[[MAP1]], #[[MAP2]]]
++// CHECK-SAME:   iterator_types = ["parallel", "parallel", "parallel", "reduction"]
++// CHECK-SAME:   ins(%[[IM2COL]], %[[COLLAPSED]] : tensor<1x2x4xf32>, tensor<4x2xf32>)
++// CHECK-SAME:   outs(%[[ARG2]] : tensor<1x2x2xf32>) {
++// CHECK:          arith.mulf
++// CHECK:          arith.addf
++// CHECK:      } -> tensor<1x2x2xf32>
++// CHECK:      util.return %[[MATMUL]] : tensor<1x2x2xf32>
+diff --git a/compiler/src/iree/compiler/Dialect/LinalgExt/Transforms/test/decompose_im2col.mlir b/compiler/src/iree/compiler/Dialect/LinalgExt/Transforms/test/decompose_im2col.mlir
+index be1e67ab4403..45ff7e3129f7 100644
+--- a/compiler/src/iree/compiler/Dialect/LinalgExt/Transforms/test/decompose_im2col.mlir
++++ b/compiler/src/iree/compiler/Dialect/LinalgExt/Transforms/test/decompose_im2col.mlir
+@@ -10,6 +10,7 @@ module {
+             strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+             m_offset = [%m_off] * [1] k_offset = [%k_off] * [1]
+             batch_pos = [0] m_pos = [1, 2] k_pos = [3]
++            input_filter_perm = [0, 1, 2]
+             ins(%arg0 : tensor<2x34x34x640xf32>)
+             outs(%0 : tensor<2x?x4xf32>) -> tensor<2x?x4xf32>
+     return %7 : tensor<2x?x4xf32>
+@@ -54,6 +55,7 @@ module {
+             strides = [5, 3] dilations = [4, 7] kernel_size = [5, 2]
+             m_offset = [%m_off] * [1] k_offset = [%k_off] * [1]
+             batch_pos = [1] m_pos = [3, 2] k_pos = [0]
++            input_filter_perm = [0, 1, 2]
+             ins(%arg0 : tensor<640x2x101x172xf32>)
+             outs(%0 : tensor<2x?x?xf32>) -> tensor<2x?x?xf32>
+     return %8 : tensor<2x?x?xf32>
+@@ -99,6 +101,7 @@ module {
+             strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+             m_offset = [%m0, %m1] * [%m_stride, 1] k_offset = [%k, 0] * [4, 1]
+             batch_pos = [0] m_pos = [1, 2] k_pos = [3]
++            input_filter_perm = [0, 1, 2]
+             ins(%arg0 : tensor<2x34x34x640xf32>)
+             outs(%0 : tensor<2x?x?x2x4xf32>) -> tensor<2x?x?x2x4xf32>
+     return %7 : tensor<2x?x?x2x4xf32>
+@@ -148,6 +151,7 @@ module {
+             strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+             m_offset = [%m0, %m1] * [32, 1] k_offset = [%k, 0] * [4, 1]
+             batch_pos = [0] m_pos = [1, 2] k_pos = [3]
++            input_filter_perm = [0, 1, 2]
+             ins(%arg0 : tensor<2x640x34x34xf32>)
+             outs(%0 : tensor<2x1x1x2x4xf32>) -> tensor<2x1x1x2x4xf32>
+     return %7 : tensor<2x1x1x2x4xf32>
+@@ -168,6 +172,7 @@ module {
+             strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+             m_offset = [%m_off] * [1] k_offset = [%k_off] * [1]
+             batch_pos = [0] m_pos = [1, 2] k_pos = [3]
++            input_filter_perm = [0, 1, 2]
+             ins(%arg0 : tensor<2x34x34x640xf32>)
+             outs(%0 : tensor<2x2x4xf32>) -> tensor<2x2x4xf32>
+     return %7 : tensor<2x2x4xf32>
+@@ -247,6 +252,7 @@ module {
+   %im2col = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+                               m_offset = [0, 0] * [2, 1] k_offset = [0] * [1]
+                               batch_pos = [0] m_pos = [2, 3] k_pos = [1]
++                              input_filter_perm = [0, 1, 2]
+                               ins(%padded : tensor<1x8x9x9xf32>)
+                               outs(%empty : tensor<1x2x2x12xf32>) -> tensor<1x2x2x12xf32>
+   return %im2col : tensor<1x2x2x12xf32>
+@@ -260,3 +266,77 @@ module {
+ //  CHECK-NEXT: ^bb0
+ //  CHECK-NEXT:   tensor.yield
+ //  CHECK-NEXT: } : tensor<1x?x?x?xf32> to tensor<1x1x1x1xf32>
++
++// -----
++
++module {
++  func.func @im2col_nhc_with_perm(%arg0: tensor<1x3x2xf32>) -> tensor<1x2x4xf32> {
++    %0 = tensor.empty() : tensor<1x2x4xf32>
++    %1 = iree_linalg_ext.im2col strides = [1] dilations = [1] kernel_size = [2]
++                            m_offset = [0] * [1] k_offset = [0] * [1]
++                            batch_pos = [0] m_pos = [1] k_pos = [2]
++                            input_filter_perm = [1, 0]
++                            ins(%arg0 : tensor<1x3x2xf32>)
++                            outs(%0 : tensor<1x2x4xf32>) -> tensor<1x2x4xf32>
++    return %1 : tensor<1x2x4xf32>
++  }
++}
++//   CHECK-DAG: #[[$MAP:.+]] = affine_map<(d0, d1) -> (d0 + d1)>
++// CHECK-LABEL: func.func @im2col_nhc_with_perm
++//  CHECK-SAME:     %[[ARG0:[a-zA-Z0-9_]+]]: tensor<1x3x2xf32>
++//   CHECK-DAG:   %[[C0:.+]] = arith.constant 0 : index
++//   CHECK-DAG:   %[[C1:.+]] = arith.constant 1 : index
++//   CHECK-DAG:   %[[C2:.+]] = arith.constant 2 : index
++//   CHECK-DAG:   %[[C4:.+]] = arith.constant 4 : index
++//       CHECK:   %[[OUT_TILE:.+]] = tensor.empty() : tensor<1x2x4xf32>
++//       CHECK:   %[[MLOOP:.+]] = scf.for %[[M:.+]] = %[[C0]] to %[[C2]] step %[[C1]] iter_args(%[[OUT1:.+]] = %[[OUT_TILE]]) -> (tensor<1x2x4xf32>)
++//       CHECK:     %[[KLOOP:.+]] = scf.for %[[K:.+]] = %[[C0]] to %[[C4]] step %[[C1]] iter_args(%[[OUT2:.+]] = %[[OUT1]]) -> (tensor<1x2x4xf32>)
++//   CHECK-DAG:       %[[kParts:.+]]:2 = affine.delinearize_index %[[K]] into (2, 2) : index, index
++//   CHECK-DAG:       %[[hIdx:.+]] = affine.apply #[[$MAP]](%[[M]], %[[kParts]]#1)
++//       CHECK:       %[[IN_SLICE:.+]] = tensor.extract_slice %[[ARG0]][0, %[[hIdx]], %[[kParts]]#0] [1, 1, 1] [1, 1, 1] : tensor<1x3x2xf32> to tensor<1x1x1xf32>
++//       CHECK:       %[[OUT_SLICE:.+]] = tensor.extract_slice %[[OUT2]][0, %[[M]], %[[K]]] [1, 1, 1] [1, 1, 1] : tensor<1x2x4xf32> to tensor<1x1x1xf32>
++//       CHECK:       %[[COPY:.+]] = linalg.copy ins(%[[IN_SLICE]] : tensor<1x1x1xf32>) outs(%[[OUT_SLICE]] : tensor<1x1x1xf32>) -> tensor<1x1x1xf32>
++//       CHECK:       %[[INSERT:.+]] = tensor.insert_slice %[[COPY]] into %[[OUT2]][0, %[[M]], %[[K]]] [1, 1, 1] [1, 1, 1] : tensor<1x1x1xf32> into tensor<1x2x4xf32>
++//       CHECK:       scf.yield %[[INSERT]] : tensor<1x2x4xf32>
++//       CHECK:     scf.yield %[[KLOOP]] : tensor<1x2x4xf32>
++//       CHECK:   return %[[MLOOP]] : tensor<1x2x4xf32>
++
++// -----
++
++module {
++  func.func @im2col_nhwc_with_perm(%arg0: tensor<1x16x16x4xf32>) -> tensor<1x14x14x36xf32> {
++    %0 = tensor.empty() : tensor<1x14x14x36xf32>
++    %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
++                            m_offset = [0, 0] * [14, 1] k_offset = [0] * [1]
++                            batch_pos = [0] m_pos = [1, 2] k_pos = [3]
++                            input_filter_perm = [2, 0, 1]
++                            ins(%arg0 : tensor<1x16x16x4xf32>)
++                            outs(%0 : tensor<1x14x14x36xf32>) -> tensor<1x14x14x36xf32>
++    return %1 : tensor<1x14x14x36xf32>
++  }
++}
++//   CHECK-DAG: #[[$MAP:.+]] = affine_map<(d0, d1) -> (d0 * 14 + d1)>
++//   CHECK-DAG: #[[$MAP1:.+]] = affine_map<(d0, d1) -> (d0 + d1)>
++// CHECK-LABEL: func.func @im2col_nhwc_with_perm
++//  CHECK-SAME: %[[ARG0:[a-zA-Z0-9_]+]]: tensor<1x16x16x4xf32>
++//   CHECK-DAG: %[[C36:.+]] = arith.constant 36 : index
++//   CHECK-DAG: %[[C14:.+]] = arith.constant 14 : index
++//   CHECK-DAG: %[[C1:.+]] = arith.constant 1 : index
++//   CHECK-DAG: %[[C0:.+]] = arith.constant 0 : index
++//   CHECK: %[[OUT_TILE:.+]] = tensor.empty() : tensor<1x14x14x36xf32>
++//   CHECK: %[[MLOOP0:.+]] = scf.for %[[M1:.+]] = %[[C0]] to %[[C14]] step %[[C1]] iter_args(%[[OUT1:.+]] = %[[OUT_TILE]]) -> (tensor<1x14x14x36xf32>)
++//   CHECK:   %[[MLOOP1:.+]] = scf.for %[[M2:.+]] = %[[C0]] to %[[C14]] step %[[C1]] iter_args(%[[OUT2:.+]] = %[[OUT1]]) -> (tensor<1x14x14x36xf32>)
++//   CHECK:     %[[KLOOP:.+]] = scf.for %[[K:.+]] = %[[C0]] to %[[C36]] step %[[C1]] iter_args(%[[OUT3:.+]] = %[[OUT2]]) -> (tensor<1x14x14x36xf32>)
++//   CHECK-DAG:   %[[kParts:.+]]:3 = affine.delinearize_index %[[K]] into (4, 3, 3) : index, index, index
++//   CHECK-DAG:   %[[FLAT_M:.+]] = affine.apply #[[$MAP]](%[[M1]], %[[M2]])
++//   CHECK-DAG:   %[[mParts:.+]]:2 = affine.delinearize_index %[[FLAT_M]] into (14, 14) : index, index
++//   CHECK-DAG:   %[[hIDX:.+]] = affine.apply #[[$MAP1]](%[[mParts]]#0, %[[kParts]]#1)
++//   CHECK-DAG:   %[[wIDX:.+]] = affine.apply #[[$MAP1]](%[[mParts]]#1, %[[kParts]]#2)
++//   CHECK:       %[[IN_SLICE:.+]] = tensor.extract_slice %[[ARG0]][0, %[[hIDX]], %[[wIDX]], %[[kParts]]#0] [1, 1, 1, 1] [1, 1, 1, 1] : tensor<1x16x16x4xf32> to tensor<1x1x1x1xf32>
++//   CHECK:       %[[OUT_SLICE:.+]] = tensor.extract_slice %[[OUT3]][0, %[[M1]], %[[M2]], %[[K]]]
++//   CHECK:       %[[COPY:.+]] = linalg.copy ins(%[[IN_SLICE]] : tensor<1x1x1x1xf32>) outs(%[[OUT_SLICE]] : tensor<1x1x1x1xf32>)
++//   CHECK:       %[[INSERT:.+]] = tensor.insert_slice %[[COPY]] into %[[OUT3]][0, %[[M1]], %[[M2]], %[[K]]]
++//   CHECK:     scf.yield %[[INSERT]] : tensor<1x14x14x36xf32>
++//   CHECK:   scf.yield %[[KLOOP]] : tensor<1x14x14x36xf32>
++//   CHECK: scf.yield %[[MLOOP1]] : tensor<1x14x14x36xf32>
++//   CHECK: return %[[MLOOP0]] : tensor<1x14x14x36xf32>
+
+From e020f73d75195b18175dd35883742d8c399643aa Mon Sep 17 00:00:00 2001
+From: yzhang93 <zhyuhang88@gmail.com>
+Date: Fri, 11 Apr 2025 19:00:56 +0000
+Subject: [PATCH 2/5] Fix and add tests
+
+Signed-off-by: yzhang93 <zhyuhang88@gmail.com>
+---
+ .../test/gpu_apply_derived_thread_config.mlir |  1 +
+ .../Dialect/LinalgExt/IR/LinalgExtOps.cpp     |  5 ++-
+ .../Dialect/LinalgExt/IR/test/invalid.mlir    | 37 +++++++++++++++++++
+ .../Dialect/LinalgExt/IR/test/roundtrip.mlir  | 14 +++++++
+ .../LinalgExt/Transforms/test/tiling.mlir     |  8 ++++
+ 5 files changed, 63 insertions(+), 2 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/Codegen/Common/GPU/test/gpu_apply_derived_thread_config.mlir b/compiler/src/iree/compiler/Codegen/Common/GPU/test/gpu_apply_derived_thread_config.mlir
+index dbaa3c23589a..dba8f4868be8 100644
+--- a/compiler/src/iree/compiler/Codegen/Common/GPU/test/gpu_apply_derived_thread_config.mlir
++++ b/compiler/src/iree/compiler/Codegen/Common/GPU/test/gpu_apply_derived_thread_config.mlir
+@@ -179,6 +179,7 @@ module {
+       strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+       m_offset = [0] * [1] k_offset = [0] * [1]
+       batch_pos = [0] m_pos = [2, 3] k_pos = [1]
++      input_filter_perm = [0, 1, 2]
+       ins(%2 : tensor<2x34x34x128xf16>)
+       outs(%3 : tensor<2x128x8xf16>) -> tensor<2x128x8xf16>
+     return %4 : tensor<2x128x8xf16>
+diff --git a/compiler/src/iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.cpp b/compiler/src/iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.cpp
+index 0458f51f92b3..1dbcc22f3a28 100644
+--- a/compiler/src/iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.cpp
++++ b/compiler/src/iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.cpp
+@@ -1738,8 +1738,9 @@ LogicalResult Im2colOp::verify() {
+   llvm::sort(permVec);
+   for (int64_t i = 0; i < static_cast<int64_t>(sharedRank); ++i) {
+     if (permVec[i] != i) {
+-      return op->emitOpError("input_filter_perm must be a permutation of [0, ")
+-             << sharedRank << "), but got an invalid entry: " << permVec[i];
++      return op->emitOpError(
++                 "expected input_filter_perm to be a permutation of [0, ")
++             << sharedRank << ")";
+     }
+   }
+ 
+diff --git a/compiler/src/iree/compiler/Dialect/LinalgExt/IR/test/invalid.mlir b/compiler/src/iree/compiler/Dialect/LinalgExt/IR/test/invalid.mlir
+index 3ac037f40dcb..09216db6460a 100644
+--- a/compiler/src/iree/compiler/Dialect/LinalgExt/IR/test/invalid.mlir
++++ b/compiler/src/iree/compiler/Dialect/LinalgExt/IR/test/invalid.mlir
+@@ -635,6 +635,7 @@ func.func @illegal_im2col_strides(%arg0: tensor<2x34x34x640xf32>) -> tensor<2x10
+   %1 = iree_linalg_ext.im2col strides = [1] dilations = [1, 1] kernel_size = [3, 3]
+            m_offset = [0] * [1] k_offset = [0] * [1]
+            batch_pos = [0] m_pos = [1, 2] k_pos = [3]
++           input_filter_perm = [0, 1, 2]
+            ins(%arg0 : tensor<2x34x34x640xf32>)
+            outs(%0 : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+   return %1 : tensor<2x1024x5760xf32>
+@@ -648,6 +649,7 @@ func.func @illegal_im2col_dilations(%arg0: tensor<2x34x34x640xf32>) -> tensor<2x
+   %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1, 1] kernel_size = [3, 3]
+            m_offset = [0] * [1] k_offset = [0] * [1]
+            batch_pos = [0] m_pos = [1, 2] k_pos = [3]
++           input_filter_perm = [0, 1, 2]
+            ins(%arg0 : tensor<2x34x34x640xf32>)
+            outs(%0 : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+   return %1 : tensor<2x1024x5760xf32>
+@@ -661,6 +663,7 @@ func.func @illegal_im2col_kernel_size(%arg0: tensor<2x34x34x640xf32>) -> tensor<
+   %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3]
+            m_offset = [0] * [1] k_offset = [0] * [1]
+            batch_pos = [0] m_pos = [1, 2] k_pos = [3]
++           input_filter_perm = [0, 1, 2]
+            ins(%arg0 : tensor<2x34x34x640xf32>)
+            outs(%0 : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+   return %1 : tensor<2x1024x5760xf32>
+@@ -674,6 +677,7 @@ func.func @illegal_im2col_m_offset(%arg0: tensor<2x34x34x640xf32>) -> tensor<2x1
+   %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+            m_offset = [0, 0] * [1] k_offset = [0] * [1]
+            batch_pos = [0] m_pos = [1, 2] k_pos = [3]
++           input_filter_perm = [0, 1, 2]
+            ins(%arg0 : tensor<2x34x34x640xf32>)
+            outs(%0 : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+   return %1 : tensor<2x1024x5760xf32>
+@@ -687,6 +691,7 @@ func.func @illegal_im2col_k_offset(%arg0: tensor<2x34x34x640xf32>) -> tensor<2x1
+   %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+            m_offset = [0] * [1] k_offset = [0, 0] * [1]
+            batch_pos = [0] m_pos = [1, 2] k_pos = [3]
++           input_filter_perm = [0, 1, 2]
+            ins(%arg0 : tensor<2x34x34x640xf32>)
+            outs(%0 : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+   return %1 : tensor<2x1024x5760xf32>
+@@ -700,6 +705,7 @@ func.func @illegal_im2col_m_strides(%arg0: tensor<2x34x34x640xf32>) -> tensor<2x
+   %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+            m_offset = [0] * [0] k_offset = [0] * [1]
+            batch_pos = [0] m_pos = [1, 2] k_pos = [3]
++           input_filter_perm = [0, 1, 2]
+            ins(%arg0 : tensor<2x34x34x640xf32>)
+            outs(%0 : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+   return %1 : tensor<2x1024x5760xf32>
+@@ -713,6 +719,7 @@ func.func @illegal_im2col_k_strides(%arg0: tensor<2x34x34x640xf32>) -> tensor<2x
+   %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+            m_offset = [0] * [1] k_offset = [0] * [2]
+            batch_pos = [0] m_pos = [1, 2] k_pos = [3]
++           input_filter_perm = [0, 1, 2]
+            ins(%arg0 : tensor<2x34x34x640xf32>)
+            outs(%0 : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+   return %1 : tensor<2x1024x5760xf32>
+@@ -726,6 +733,7 @@ func.func @illegal_im2col_input_rank(%arg0: tensor<1x2x34x34x640xf32>) -> tensor
+   %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+            m_offset = [0] * [1] k_offset = [0] * [1]
+            batch_pos = [0] m_pos = [1, 2] k_pos = [3]
++           input_filter_perm = [0, 1, 2]
+            ins(%arg0 : tensor<1x2x34x34x640xf32>)
+            outs(%0 : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+   return %1 : tensor<2x1024x5760xf32>
+@@ -739,6 +747,7 @@ func.func @illegal_im2col_output_rank(%arg0: tensor<2x34x34x640xf32>) -> tensor<
+   %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+            m_offset = [0] * [1] k_offset = [0] * [1]
+            batch_pos = [0] m_pos = [1, 2] k_pos = [3]
++           input_filter_perm = [0, 1, 2]
+            ins(%arg0 : tensor<2x34x34x640xf32>)
+            outs(%0 : tensor<2x1024x9x640xf32>) -> tensor<2x1024x9x640xf32>
+   return %1 : tensor<2x1024x9x640xf32>
+@@ -746,6 +755,34 @@ func.func @illegal_im2col_output_rank(%arg0: tensor<2x34x34x640xf32>) -> tensor<
+ 
+ // -----
+ 
++func.func @illegal_im2col_perm_num(%arg0: tensor<2x34x34x640xf32>) -> tensor<2x1024x5760xf32> {
++  %0 = tensor.empty() : tensor<2x1024x5760xf32>
++  // expected-error @+1 {{expected input_filter_perm size (2) to match the number of shared dimensions (m_Pos + k_pos = 3)}}
++  %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
++           m_offset = [0] * [1] k_offset = [0] * [1]
++           batch_pos = [0] m_pos = [1, 2] k_pos = [3]
++           input_filter_perm = [0, 1]
++           ins(%arg0 : tensor<2x34x34x640xf32>)
++           outs(%0 : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
++  return %1 : tensor<2x1024x5760xf32>
++}
++
++// -----
++
++func.func @illegal_im2col_perm_value(%arg0: tensor<2x34x34x640xf32>) -> tensor<2x1024x5760xf32> {
++  %0 = tensor.empty() : tensor<2x1024x5760xf32>
++  // expected-error @+1 {{expected input_filter_perm to be a permutation of [0, 3)}}
++  %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
++           m_offset = [0] * [1] k_offset = [0] * [1]
++           batch_pos = [0] m_pos = [1, 2] k_pos = [3]
++           input_filter_perm = [1, 2, 3]
++           ins(%arg0 : tensor<2x34x34x640xf32>)
++           outs(%0 : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
++  return %1 : tensor<2x1024x5760xf32>
++}
++
++// -----
++
+ func.func @illegal_winograd_input_shape(%arg0: tensor<1x10x10x32xf32>) -> tensor<8x8x1x6x6x32xf32> {
+   %0 = tensor.empty() : tensor<8x8x1x6x6x32xf32>
+   // expected-error @+1 {{incompatible output shape}}
+diff --git a/compiler/src/iree/compiler/Dialect/LinalgExt/IR/test/roundtrip.mlir b/compiler/src/iree/compiler/Dialect/LinalgExt/IR/test/roundtrip.mlir
+index a2b4f986c67a..3effe580e1d0 100644
+--- a/compiler/src/iree/compiler/Dialect/LinalgExt/IR/test/roundtrip.mlir
++++ b/compiler/src/iree/compiler/Dialect/LinalgExt/IR/test/roundtrip.mlir
+@@ -1009,6 +1009,7 @@ func.func @im2col(%arg0: tensor<2x34x34x640xf32>) -> tensor<2x1024x5760xf32> {
+   %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+            m_offset = [0] * [1] k_offset = [0] * [1]
+            batch_pos = [0] m_pos = [1, 2] k_pos = [3]
++           input_filter_perm = [0, 1, 2]
+            ins(%arg0 : tensor<2x34x34x640xf32>)
+            outs(%0 : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+   return %1 : tensor<2x1024x5760xf32>
+@@ -1019,6 +1020,7 @@ func.func @im2col(%arg0: tensor<2x34x34x640xf32>) -> tensor<2x1024x5760xf32> {
+ // CHECK:         %[[D1:.+]] = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+ // CHECK-SAME:      m_offset = [0] * [1] k_offset = [0] * [1]
+ // CHECK-SAME:      batch_pos = [0] m_pos = [1, 2] k_pos = [3]
++// CHECK-SAME:      input_filter_perm = [0, 1, 2]
+ // CHECK-SAME:      ins(%[[ARG0]] : tensor<2x34x34x640xf32>)
+ // CHECK-SAME:      outs(%[[D0]] : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+ // CHECK:         return %[[D1]] : tensor<2x1024x5760xf32>
+@@ -1031,6 +1033,7 @@ func.func @im2col_dynamic(%arg0: tensor<?x?x?x?xf32>, %s0: index, %s1: index, %s
+   %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+            m_offset = [%mOffset] * [1] k_offset = [%kOffset] * [1]
+            batch_pos = [0] m_pos = [1, 2] k_pos = [3]
++           input_filter_perm = [0, 1, 2]
+            ins(%arg0 : tensor<?x?x?x?xf32>)
+            outs(%0 : tensor<?x?x?xf32>) -> tensor<?x?x?xf32>
+   return %1 : tensor<?x?x?xf32>
+@@ -1042,6 +1045,7 @@ func.func @im2col_dynamic(%arg0: tensor<?x?x?x?xf32>, %s0: index, %s1: index, %s
+ // CHECK:         %[[D1:.+]] = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+ // CHECK-SAME:      m_offset = [%[[MOFFSET]]] * [1] k_offset = [%[[KOFFSET]]] * [1]
+ // CHECK-SAME:      batch_pos = [0] m_pos = [1, 2] k_pos = [3]
++// CHECK-SAME:      input_filter_perm = [0, 1, 2]
+ // CHECK-SAME:      ins(%[[ARG0]] : tensor<?x?x?x?xf32>)
+ // CHECK-SAME:      outs(%[[D0]] : tensor<?x?x?xf32>) -> tensor<?x?x?xf32>
+ // CHECK:         return %[[D1]] : tensor<?x?x?xf32>
+@@ -1053,6 +1057,7 @@ func.func @im2col_strided(%arg0: tensor<2x65x96x640xf32>) -> tensor<2x1024x5760x
+   %1 = iree_linalg_ext.im2col strides = [2, 3] dilations = [1, 1] kernel_size = [3, 3]
+            m_offset = [0] * [1] k_offset = [0] * [1]
+            batch_pos = [0] m_pos = [1, 2] k_pos = [3]
++           input_filter_perm = [0, 1, 2]
+            ins(%arg0 : tensor<2x65x96x640xf32>)
+            outs(%0 : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+   return %1 : tensor<2x1024x5760xf32>
+@@ -1063,6 +1068,7 @@ func.func @im2col_strided(%arg0: tensor<2x65x96x640xf32>) -> tensor<2x1024x5760x
+ // CHECK:         %[[D1:.+]] = iree_linalg_ext.im2col strides = [2, 3] dilations = [1, 1] kernel_size = [3, 3]
+ // CHECK-SAME:      m_offset = [0] * [1] k_offset = [0] * [1]
+ // CHECK-SAME:      batch_pos = [0] m_pos = [1, 2] k_pos = [3]
++// CHECK-SAME:      input_filter_perm = [0, 1, 2]
+ // CHECK-SAME:      ins(%[[ARG0]] : tensor<2x65x96x640xf32>)
+ // CHECK-SAME:      outs(%[[D0]] : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+ // CHECK:         return %[[D1]] : tensor<2x1024x5760xf32>
+@@ -1074,6 +1080,7 @@ func.func @im2col_dilated(%arg0: tensor<2x44x46x640xf32>) -> tensor<2x1024x5760x
+   %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [6, 7] kernel_size = [3, 3]
+            m_offset = [0] * [1] k_offset = [0] * [1]
+            batch_pos = [0] m_pos = [1, 2] k_pos = [3]
++           input_filter_perm = [0, 1, 2]
+            ins(%arg0 : tensor<2x44x46x640xf32>)
+            outs(%0 : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+   return %1 : tensor<2x1024x5760xf32>
+@@ -1084,6 +1091,7 @@ func.func @im2col_dilated(%arg0: tensor<2x44x46x640xf32>) -> tensor<2x1024x5760x
+ // CHECK:         %[[D1:.+]] = iree_linalg_ext.im2col strides = [1, 1] dilations = [6, 7] kernel_size = [3, 3]
+ // CHECK-SAME:      m_offset = [0] * [1] k_offset = [0] * [1]
+ // CHECK-SAME:      batch_pos = [0] m_pos = [1, 2] k_pos = [3]
++// CHECK-SAME:      input_filter_perm = [0, 1, 2]
+ // CHECK-SAME:      ins(%[[ARG0]] : tensor<2x44x46x640xf32>)
+ // CHECK-SAME:      outs(%[[D0]] : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+ // CHECK:         return %[[D1]] : tensor<2x1024x5760xf32>
+@@ -1095,6 +1103,7 @@ func.func @im2col_strided_dilated_mixed_kernel(%arg0: tensor<2x172x101x640xf32>)
+   %1 = iree_linalg_ext.im2col strides = [5, 3] dilations = [4, 7] kernel_size = [5, 2]
+            m_offset = [0] * [1] k_offset = [0] * [1]
+            batch_pos = [0] m_pos = [1, 2] k_pos = [3]
++           input_filter_perm = [0, 1, 2]
+            ins(%arg0 : tensor<2x172x101x640xf32>)
+            outs(%0 : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+   return %1 : tensor<2x1024x5760xf32>
+@@ -1105,6 +1114,7 @@ func.func @im2col_strided_dilated_mixed_kernel(%arg0: tensor<2x172x101x640xf32>)
+ // CHECK:         %[[D1:.+]] = iree_linalg_ext.im2col strides = [5, 3] dilations = [4, 7] kernel_size = [5, 2]
+ // CHECK-SAME:      m_offset = [0] * [1] k_offset = [0] * [1]
+ // CHECK-SAME:      batch_pos = [0] m_pos = [1, 2] k_pos = [3]
++// CHECK-SAME:      input_filter_perm = [0, 1, 2]
+ // CHECK-SAME:      ins(%[[ARG0]] : tensor<2x172x101x640xf32>)
+ // CHECK-SAME:      outs(%[[D0]] : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+ // CHECK:         return %[[D1]] : tensor<2x1024x5760xf32>
+@@ -1116,6 +1126,7 @@ func.func @im2col_transposed_m_pos(%arg0: tensor<640x2x101x172xf32>) -> tensor<2
+   %1 = iree_linalg_ext.im2col strides = [5, 3] dilations = [4, 7] kernel_size = [5, 2]
+            m_offset = [0] * [1] k_offset = [0] * [1]
+            batch_pos = [1] m_pos = [3, 2] k_pos = [0]
++           input_filter_perm = [0, 1, 2]
+            ins(%arg0 : tensor<640x2x101x172xf32>)
+            outs(%0 : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+   return %1 : tensor<2x1024x5760xf32>
+@@ -1126,6 +1137,7 @@ func.func @im2col_transposed_m_pos(%arg0: tensor<640x2x101x172xf32>) -> tensor<2
+ // CHECK:         %[[D1:.+]] = iree_linalg_ext.im2col strides = [5, 3] dilations = [4, 7] kernel_size = [5, 2]
+ // CHECK-SAME:      m_offset = [0] * [1] k_offset = [0] * [1]
+ // CHECK-SAME:      batch_pos = [1] m_pos = [3, 2] k_pos = [0]
++// CHECK-SAME:      input_filter_perm = [0, 1, 2]
+ // CHECK-SAME:      ins(%[[ARG0]] : tensor<640x2x101x172xf32>)
+ // CHECK-SAME:      outs(%[[D0]] : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+ // CHECK:         return %[[D1]] : tensor<2x1024x5760xf32>
+@@ -1137,6 +1149,7 @@ func.func @im2col_expanded(%arg0: tensor<2x3x34x34x640xf32>) -> tensor<2x3x128x8
+   %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+            m_offset = [0, 0] * [8, 1] k_offset = [0, 0] * [64, 1]
+            batch_pos = [0, 1] m_pos = [2, 3] k_pos = [4]
++           input_filter_perm = [0, 1, 2]
+            ins(%arg0 : tensor<2x3x34x34x640xf32>)
+            outs(%0 : tensor<2x3x128x8x90x64xf32>) -> tensor<2x3x128x8x90x64xf32>
+   return %1 : tensor<2x3x128x8x90x64xf32>
+@@ -1147,6 +1160,7 @@ func.func @im2col_expanded(%arg0: tensor<2x3x34x34x640xf32>) -> tensor<2x3x128x8
+ // CHECK:         %[[D1:.+]] = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+ // CHECK-SAME:      m_offset = [0, 0] * [8, 1] k_offset = [0, 0] * [64, 1]
+ // CHECK-SAME:      batch_pos = [0, 1] m_pos = [2, 3] k_pos = [4]
++// CHECK-SAME:      input_filter_perm = [0, 1, 2]
+ // CHECK-SAME:      ins(%[[ARG0]] : tensor<2x3x34x34x640xf32>)
+ // CHECK-SAME:      outs(%[[D0]] : tensor<2x3x128x8x90x64xf32>) -> tensor<2x3x128x8x90x64xf32>
+ // CHECK:         return %[[D1]] : tensor<2x3x128x8x90x64xf32>
+diff --git a/compiler/src/iree/compiler/Dialect/LinalgExt/Transforms/test/tiling.mlir b/compiler/src/iree/compiler/Dialect/LinalgExt/Transforms/test/tiling.mlir
+index 53cb5e444504..659553a9b1d0 100644
+--- a/compiler/src/iree/compiler/Dialect/LinalgExt/Transforms/test/tiling.mlir
++++ b/compiler/src/iree/compiler/Dialect/LinalgExt/Transforms/test/tiling.mlir
+@@ -793,6 +793,7 @@ func.func @im2col(%arg0: tensor<2x34x34x640xf32>) -> tensor<2x1024x5760xf32> {
+   %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+            m_offset = [34] * [1] k_offset = [1000] * [1]
+            batch_pos = [0] m_pos = [1, 2] k_pos = [3]
++           input_filter_perm = [0, 1, 2]
+            ins(%arg0 : tensor<2x34x34x640xf32>)
+            outs(%0 : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+   return %1 : tensor<2x1024x5760xf32>
+@@ -832,6 +833,7 @@ module attributes { transform.with_named_sequence } {
+ // CHECK:              %[[IM2COL:.+]] = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+ // CHECK-SAME:           m_offset = [%[[MOFFSET]]] * [1] k_offset = [%[[KOFFSET]]] * [1]
+ // CHECK-SAME:           batch_pos = [0] m_pos = [1, 2] k_pos = [3]
++// CHECK-SAME:           input_filter_perm = [0, 1, 2]
+ // CHECK-SAME:           ins(%[[EXTRACTED_SLICE]] : tensor<1x34x34x640xf32>)
+ // CHECK-SAME:           outs(%[[EXTRACTED_SLICE_0]] : tensor<1x?x4xf32>) -> tensor<1x?x4xf32>
+ // CHECK:              %[[INSERTED_SLICE:.+]] = tensor.insert_slice %[[IM2COL]] into %[[ARG6]]
+@@ -849,6 +851,7 @@ func.func @im2col_transposed_m_pos(%arg0: tensor<640x2x101x172xf32>) -> tensor<2
+   %1 = iree_linalg_ext.im2col strides = [5, 3] dilations = [4, 7] kernel_size = [5, 2]
+            m_offset = [42] * [1] k_offset = [7] * [1]
+            batch_pos = [1] m_pos = [3, 2] k_pos = [0]
++           input_filter_perm = [0, 1, 2]
+            ins(%arg0 : tensor<640x2x101x172xf32>)
+            outs(%0 : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+   return %1 : tensor<2x1024x5760xf32>
+@@ -890,6 +893,7 @@ module attributes { transform.with_named_sequence } {
+ // CHECK:              %[[IM2COL:.+]] = iree_linalg_ext.im2col strides = [5, 3] dilations = [4, 7] kernel_size = [5, 2]
+ // CHECK-SAME:           m_offset = [%[[MOFFSET]]] * [1] k_offset = [%[[KOFFSET]]] * [1]
+ // CHECK-SAME:           batch_pos = [1] m_pos = [3, 2] k_pos = [0]
++// CHECK-SAME:           input_filter_perm = [0, 1, 2]
+ // CHECK-SAME:           ins(%[[EXTRACTED_SLICE]] : tensor<640x1x101x172xf32>)
+ // CHECK-SAME:           outs(%[[EXTRACTED_SLICE_0]] : tensor<1x?x?xf32>) -> tensor<1x?x?xf32>
+ // CHECK:              %[[INSERTED_SLICE:.+]] = tensor.insert_slice %[[IM2COL]] into %[[ARG6]]
+@@ -908,6 +912,7 @@ func.func @im2col_dynamic(%arg0: tensor<?x?x?x?xf32>, %s0: index, %s1: index, %s
+   %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+            m_offset = [%mOffset] * [1] k_offset = [%kOffset] * [1]
+            batch_pos = [0] m_pos = [1, 2] k_pos = [3]
++           input_filter_perm = [0, 1, 2]
+            ins(%arg0 : tensor<?x?x?x?xf32>)
+            outs(%0 : tensor<?x?x?xf32>) -> tensor<?x?x?xf32>
+   return %1 : tensor<?x?x?xf32>
+@@ -953,6 +958,7 @@ module attributes { transform.with_named_sequence } {
+ // CHECK:              %[[IM2COL:.+]] = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+ // CHECK-SAME:           m_offset = [%[[MOFFSET]]] * [1] k_offset = [%[[KOFFSET]]] * [1]
+ // CHECK-SAME:           batch_pos = [0] m_pos = [1, 2] k_pos = [3]
++// CHECK-SAME:           input_filter_perm = [0, 1, 2]
+ // CHECK-SAME:           ins(%[[EXTRACTED_SLICE]] : tensor<?x?x?x?xf32>)
+ // CHECK-SAME:           outs(%[[EXTRACTED_SLICE_0]] : tensor<?x?x?xf32>) -> tensor<?x?x?xf32>
+ // CHECK:              %[[INSERTED_SLICE:.+]] = tensor.insert_slice %[[IM2COL]] into %[[ARG6]]
+@@ -972,6 +978,7 @@ module {
+             strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+             m_offset = [0, 0] * [%m_stride, 1] k_offset = [0, 0] * [4, 1]
+             batch_pos = [0] m_pos = [1, 2] k_pos = [3]
++            input_filter_perm = [0, 1, 2]
+             ins(%arg0 : tensor<2x34x34x640xf32>)
+             outs(%0 : tensor<2x32x32x1440x4xf32>) -> tensor<2x32x32x1440x4xf32>
+     return %7 : tensor<2x32x32x1440x4xf32>
+@@ -1020,6 +1027,7 @@ module attributes { transform.with_named_sequence } {
+ // CHECK:                  %[[IM2COL:.+]] = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+ // CHECK-SAME:               m_offset = [%[[ARG3]], %[[ARG5]]] * [%[[M_STRIDE]], 1] k_offset = [%[[ARG7]], %[[ARG9]]] * [4, 1]
+ // CHECK-SAME:               batch_pos = [0] m_pos = [1, 2] k_pos = [3]
++// CHECK-SAME:               input_filter_perm = [0, 1, 2]
+ // CHECK-SAME:               ins(%[[EXTRACTED_SLICE]] : tensor<1x34x34x640xf32>)
+ // CHECK-SAME:               outs(%[[EXTRACTED_SLICE_0]] : tensor<1x?x?x?x2xf32>) -> tensor<1x?x?x?x2xf32>
+ // CHECK:                  %[[INSERTED_SLICE:.+]] = tensor.insert_slice %[[IM2COL]] into %[[ARG10]]
+
+From a46c6b7427888325a3b36d2b0c098545ac0627bc Mon Sep 17 00:00:00 2001
+From: yzhang93 <zhyuhang88@gmail.com>
+Date: Mon, 14 Apr 2025 18:57:42 +0000
+Subject: [PATCH 3/5] Address comments
+
+Signed-off-by: yzhang93 <zhyuhang88@gmail.com>
+---
+ .../test/gpu_apply_derived_thread_config.mlir |  2 +-
+ .../IR/AggregatedOpInterfaceImpl.cpp          | 28 ++------
+ .../Dialect/LinalgExt/IR/LinalgExtOps.cpp     | 32 ++++-----
+ .../Dialect/LinalgExt/IR/LinalgExtOps.td      | 23 ++++---
+ .../Dialect/LinalgExt/IR/test/invalid.mlir    | 26 ++++----
+ .../Dialect/LinalgExt/IR/test/roundtrip.mlir  | 28 ++++----
+ .../Transforms/ConvertConvToIm2ColOp.cpp      | 28 ++++----
+ .../Transforms/test/conv_to_im2col.mlir       | 66 +++++--------------
+ .../Transforms/test/decompose_im2col.mlir     | 16 ++---
+ .../LinalgExt/Transforms/test/tiling.mlir     | 16 ++---
+ 10 files changed, 111 insertions(+), 154 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/Codegen/Common/GPU/test/gpu_apply_derived_thread_config.mlir b/compiler/src/iree/compiler/Codegen/Common/GPU/test/gpu_apply_derived_thread_config.mlir
+index dba8f4868be8..4ae233a6e1fb 100644
+--- a/compiler/src/iree/compiler/Codegen/Common/GPU/test/gpu_apply_derived_thread_config.mlir
++++ b/compiler/src/iree/compiler/Codegen/Common/GPU/test/gpu_apply_derived_thread_config.mlir
+@@ -179,7 +179,7 @@ module {
+       strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+       m_offset = [0] * [1] k_offset = [0] * [1]
+       batch_pos = [0] m_pos = [2, 3] k_pos = [1]
+-      input_filter_perm = [0, 1, 2]
++      input_k_perm = [0, 1, 2]
+       ins(%2 : tensor<2x34x34x128xf16>)
+       outs(%3 : tensor<2x128x8xf16>) -> tensor<2x128x8xf16>
+     return %4 : tensor<2x128x8xf16>
+diff --git a/compiler/src/iree/compiler/Dialect/LinalgExt/IR/AggregatedOpInterfaceImpl.cpp b/compiler/src/iree/compiler/Dialect/LinalgExt/IR/AggregatedOpInterfaceImpl.cpp
+index 96e4fbfd815d..412ba1aba100 100644
+--- a/compiler/src/iree/compiler/Dialect/LinalgExt/IR/AggregatedOpInterfaceImpl.cpp
++++ b/compiler/src/iree/compiler/Dialect/LinalgExt/IR/AggregatedOpInterfaceImpl.cpp
+@@ -778,20 +778,10 @@ FailureOr<SmallVector<Value>> Im2colOp::decomposeOperation(OpBuilder &b) {
+     kBasis.push_back(size);
+   }
+ 
+-  // Check if the reduction dimension has different layouts between input and
+-  // filter, if so, transpose the order of (P, Q, C) according to
+-  // `inputFilterPerm` encoded in im2col metadata.
+-  auto isIdentityPermutation = [](ArrayRef<int64_t> perm) -> bool {
+-    return llvm::equal(llvm::seq<int64_t>(0, perm.size()), perm);
+-  };
+-
+-  ArrayRef<int64_t> inputFilterPerm = getInputFilterPerm();
+-  if (!isIdentityPermutation(inputFilterPerm)) {
+-    SmallVector<OpFoldResult> origKBasis = kBasis;
+-    for (auto [newIdx, transIdx] : llvm::enumerate(inputFilterPerm)) {
+-      kBasis[newIdx] = origKBasis[transIdx];
+-    }
+-  }
++  // Transpose the order of (P, Q, C) according to `inputKPerm` encoded in
++  // im2col metadata.
++  ArrayRef<int64_t> inputKPerm = getInputKPerm();
++  applyPermutationToVector(kBasis, getInputKPerm());
+ 
+   OpFoldResult kIndex = kOffset;
+   for (auto [i, ivIdx, stride] :
+@@ -809,21 +799,17 @@ FailureOr<SmallVector<Value>> Im2colOp::decomposeOperation(OpBuilder &b) {
+           .getResults();
+   // Split the delinearized offsets into the window offsets (for M offsets)
+   // and the K offsets for the input tensor based on the layout.
+-  auto getIndex = [&inputFilterPerm](int64_t value) -> int64_t {
+-    auto it = std::find(inputFilterPerm.begin(), inputFilterPerm.end(), value);
+-    return static_cast<int64_t>(std::distance(inputFilterPerm.begin(), it));
+-  };
+-
+   SmallVector<Value> windowOffset, inputKOffset;
+   int delinKIdx = 0;
++  SmallVector<int64_t> invInputKPerm = invertPermutationVector(inputKPerm);
+   for (int i = 0; i < getInputRank(); ++i) {
+     if (batchPosSet.contains(i))
+       continue;
+     if (mPosSet.contains(i)) {
+-      windowOffset.push_back(delinKOffset[getIndex(delinKIdx++)]);
++      windowOffset.push_back(delinKOffset[invInputKPerm[delinKIdx++]]);
+       continue;
+     }
+-    inputKOffset.push_back(delinKOffset[getIndex(delinKIdx++)]);
++    inputKOffset.push_back(delinKOffset[invInputKPerm[delinKIdx++]]);
+   }
+ 
+   // Compute offsets for extract. The linearized im2col result M offset is
+diff --git a/compiler/src/iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.cpp b/compiler/src/iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.cpp
+index 1dbcc22f3a28..613d235076cc 100644
+--- a/compiler/src/iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.cpp
++++ b/compiler/src/iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.cpp
+@@ -1614,14 +1614,16 @@ SmallVector<int64_t> Im2colOp::getKOutputDims() {
+ }
+ 
+ /// Custom builder methods for im2col op.
+-void Im2colOp::build(
+-    OpBuilder &builder, OperationState &state, Value input, Value output,
+-    ArrayRef<int64_t> strides, ArrayRef<int64_t> dilations,
+-    ArrayRef<OpFoldResult> kernelSize, ArrayRef<OpFoldResult> mOffset,
+-    ArrayRef<OpFoldResult> mStrides, ArrayRef<OpFoldResult> kOffset,
+-    ArrayRef<OpFoldResult> kStrides, ArrayRef<int64_t> batchPos,
+-    ArrayRef<int64_t> mPos, ArrayRef<int64_t> kPos,
+-    ArrayRef<int64_t> inputFilterPerm) {
++void Im2colOp::build(OpBuilder &builder, OperationState &state, Value input,
++                     Value output, ArrayRef<int64_t> strides,
++                     ArrayRef<int64_t> dilations,
++                     ArrayRef<OpFoldResult> kernelSize,
++                     ArrayRef<OpFoldResult> mOffset,
++                     ArrayRef<OpFoldResult> mStrides,
++                     ArrayRef<OpFoldResult> kOffset,
++                     ArrayRef<OpFoldResult> kStrides,
++                     ArrayRef<int64_t> batchPos, ArrayRef<int64_t> mPos,
++                     ArrayRef<int64_t> kPos, ArrayRef<int64_t> inputKPerm) {
+   assert(strides.size() == kernelSize.size() &&
+          dilations.size() == kernelSize.size() &&
+          mPos.size() == kernelSize.size() &&
+@@ -1650,7 +1652,7 @@ void Im2colOp::build(
+         builder.getDenseI64ArrayAttr(staticKStrides),
+         builder.getDenseI64ArrayAttr(batchPos),
+         builder.getDenseI64ArrayAttr(mPos), builder.getDenseI64ArrayAttr(kPos),
+-        builder.getDenseI64ArrayAttr(inputFilterPerm));
++        builder.getDenseI64ArrayAttr(inputKPerm));
+ }
+ 
+ LogicalResult Im2colOp::verify() {
+@@ -1713,7 +1715,7 @@ LogicalResult Im2colOp::verify() {
+   ArrayRef<int64_t> strides = getStrides();
+   ArrayRef<int64_t> dilations = getDilations();
+   SmallVector<OpFoldResult> kernelSize = getMixedKernelSize();
+-  ArrayRef<int64_t> inputFilterPerm = getInputFilterPerm();
++  ArrayRef<int64_t> inputKPerm = getInputKPerm();
+   if (kernelSize.size() != mPos.size()) {
+     return op->emitOpError(
+         "expected kernel rank to be equal to the m_pos rank");
+@@ -1728,18 +1730,18 @@ LogicalResult Im2colOp::verify() {
+   }
+ 
+   size_t sharedRank = mPos.size() + kPos.size();
+-  if (inputFilterPerm.size() != sharedRank) {
+-    return op->emitOpError("expected input_filter_perm size (")
+-           << inputFilterPerm.size()
++  if (inputKPerm.size() != sharedRank) {
++    return op->emitOpError("expected input_k_perm size (")
++           << inputKPerm.size()
+            << ") to match the number of shared dimensions (m_Pos + k_pos = "
+            << sharedRank << ")";
+   }
+-  SmallVector<int64_t> permVec(inputFilterPerm.begin(), inputFilterPerm.end());
++  SmallVector<int64_t> permVec(inputKPerm.begin(), inputKPerm.end());
+   llvm::sort(permVec);
+   for (int64_t i = 0; i < static_cast<int64_t>(sharedRank); ++i) {
+     if (permVec[i] != i) {
+       return op->emitOpError(
+-                 "expected input_filter_perm to be a permutation of [0, ")
++                 "expected input_k_perm to be a permutation of [0, ")
+              << sharedRank << ")";
+     }
+   }
+diff --git a/compiler/src/iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.td b/compiler/src/iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.td
+index 8ce39b79e8cc..839304b3aa74 100644
+--- a/compiler/src/iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.td
++++ b/compiler/src/iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.td
+@@ -795,13 +795,16 @@ def IREELinalgExt_Im2colOp : IREELinalgExt_Op<"im2col",
+     index into the flat `K` increases by 4. The strides in M from `m_strides`
+     are orthogonal to the strides in `K` from `k_strides`.
+ 
+-    The `input_filter_perm` attribute specifies the permutation required to align
+-    the reduction dimensions of the input layout with the filter layout,
+-    particularly for computing the K dimension of the im2col output. This is useful
+-    when the logical layout of the filter (e.g., `CHW`) differs from that of the
+-    input (e.g., `HWC`). For instance, an `input_filter_perm = [2, 0, 1]` indicates
+-    the input needs to be transposed from `HWC` to `CHW` layout before extracting
+-    patches into K.
++    The `input_k_perm` attribute defines the permutation needed to align the 
++    reduction dimensions of the input layout with those of the filter layout 
++    when computing the K dimension of the im2col output. This is useful when the
++    layout of the filter (e.g., `CHW`) differs from that of the input (e.g., `HWC`). 
++    For instance, an `input_k_perm = [2, 0, 1]` indicates the input indices needs 
++    to be transposed from `HWC` to `CHW` layout before extracting slices during
++    decomposition. The identity permutation (e.g., input_k_perm = [0, 1, 2]) 
++    indicates that the input layout is already aligned with the filter layout 
++    in terms of reduction dimensions, so no transposition of indices is necessary
++    before slice extraction.
+   }];
+ 
+   let arguments = (ins AnyShaped:$input, AnyShaped:$output,
+@@ -820,7 +823,7 @@ def IREELinalgExt_Im2colOp : IREELinalgExt_Op<"im2col",
+                        DenseI64ArrayAttr:$batch_pos,
+                        DenseI64ArrayAttr:$m_pos,
+                        DenseI64ArrayAttr:$k_pos,
+-                       DenseI64ArrayAttr:$input_filter_perm);
++                       DenseI64ArrayAttr:$input_k_perm);
+ 
+   let results = (outs Variadic<AnyShaped>:$results);
+   let hasFolder = 1;
+@@ -839,7 +842,7 @@ def IREELinalgExt_Im2colOp : IREELinalgExt_Op<"im2col",
+     `batch_pos` `=` $batch_pos
+     `m_pos` `=` $m_pos
+     `k_pos` `=` $k_pos
+-    `input_filter_perm` `=` $input_filter_perm
++    `input_k_perm` `=` $input_k_perm
+     `ins` `(` $input `:` type($input) `)`
+     `outs` `(` $output `:` type($output) `)`
+     (`->` type($results)^)?
+@@ -857,7 +860,7 @@ def IREELinalgExt_Im2colOp : IREELinalgExt_Op<"im2col",
+       "ArrayRef<int64_t>":$batch_dimensions,
+       "ArrayRef<int64_t>":$m_dimensions,
+       "ArrayRef<int64_t>":$k_dimensions,
+-      "ArrayRef<int64_t>":$input_filter_perm)>
++      "ArrayRef<int64_t>":$input_k_perm)>
+   ];
+ 
+   let extraClassDeclaration = extraLinalgExtOpClassDeclaration # [{
+diff --git a/compiler/src/iree/compiler/Dialect/LinalgExt/IR/test/invalid.mlir b/compiler/src/iree/compiler/Dialect/LinalgExt/IR/test/invalid.mlir
+index 09216db6460a..e68abb64a2dd 100644
+--- a/compiler/src/iree/compiler/Dialect/LinalgExt/IR/test/invalid.mlir
++++ b/compiler/src/iree/compiler/Dialect/LinalgExt/IR/test/invalid.mlir
+@@ -635,7 +635,7 @@ func.func @illegal_im2col_strides(%arg0: tensor<2x34x34x640xf32>) -> tensor<2x10
+   %1 = iree_linalg_ext.im2col strides = [1] dilations = [1, 1] kernel_size = [3, 3]
+            m_offset = [0] * [1] k_offset = [0] * [1]
+            batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+-           input_filter_perm = [0, 1, 2]
++           input_k_perm = [0, 1, 2]
+            ins(%arg0 : tensor<2x34x34x640xf32>)
+            outs(%0 : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+   return %1 : tensor<2x1024x5760xf32>
+@@ -649,7 +649,7 @@ func.func @illegal_im2col_dilations(%arg0: tensor<2x34x34x640xf32>) -> tensor<2x
+   %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1, 1] kernel_size = [3, 3]
+            m_offset = [0] * [1] k_offset = [0] * [1]
+            batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+-           input_filter_perm = [0, 1, 2]
++           input_k_perm = [0, 1, 2]
+            ins(%arg0 : tensor<2x34x34x640xf32>)
+            outs(%0 : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+   return %1 : tensor<2x1024x5760xf32>
+@@ -663,7 +663,7 @@ func.func @illegal_im2col_kernel_size(%arg0: tensor<2x34x34x640xf32>) -> tensor<
+   %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3]
+            m_offset = [0] * [1] k_offset = [0] * [1]
+            batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+-           input_filter_perm = [0, 1, 2]
++           input_k_perm = [0, 1, 2]
+            ins(%arg0 : tensor<2x34x34x640xf32>)
+            outs(%0 : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+   return %1 : tensor<2x1024x5760xf32>
+@@ -677,7 +677,7 @@ func.func @illegal_im2col_m_offset(%arg0: tensor<2x34x34x640xf32>) -> tensor<2x1
+   %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+            m_offset = [0, 0] * [1] k_offset = [0] * [1]
+            batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+-           input_filter_perm = [0, 1, 2]
++           input_k_perm = [0, 1, 2]
+            ins(%arg0 : tensor<2x34x34x640xf32>)
+            outs(%0 : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+   return %1 : tensor<2x1024x5760xf32>
+@@ -691,7 +691,7 @@ func.func @illegal_im2col_k_offset(%arg0: tensor<2x34x34x640xf32>) -> tensor<2x1
+   %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+            m_offset = [0] * [1] k_offset = [0, 0] * [1]
+            batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+-           input_filter_perm = [0, 1, 2]
++           input_k_perm = [0, 1, 2]
+            ins(%arg0 : tensor<2x34x34x640xf32>)
+            outs(%0 : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+   return %1 : tensor<2x1024x5760xf32>
+@@ -705,7 +705,7 @@ func.func @illegal_im2col_m_strides(%arg0: tensor<2x34x34x640xf32>) -> tensor<2x
+   %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+            m_offset = [0] * [0] k_offset = [0] * [1]
+            batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+-           input_filter_perm = [0, 1, 2]
++           input_k_perm = [0, 1, 2]
+            ins(%arg0 : tensor<2x34x34x640xf32>)
+            outs(%0 : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+   return %1 : tensor<2x1024x5760xf32>
+@@ -719,7 +719,7 @@ func.func @illegal_im2col_k_strides(%arg0: tensor<2x34x34x640xf32>) -> tensor<2x
+   %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+            m_offset = [0] * [1] k_offset = [0] * [2]
+            batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+-           input_filter_perm = [0, 1, 2]
++           input_k_perm = [0, 1, 2]
+            ins(%arg0 : tensor<2x34x34x640xf32>)
+            outs(%0 : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+   return %1 : tensor<2x1024x5760xf32>
+@@ -733,7 +733,7 @@ func.func @illegal_im2col_input_rank(%arg0: tensor<1x2x34x34x640xf32>) -> tensor
+   %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+            m_offset = [0] * [1] k_offset = [0] * [1]
+            batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+-           input_filter_perm = [0, 1, 2]
++           input_k_perm = [0, 1, 2]
+            ins(%arg0 : tensor<1x2x34x34x640xf32>)
+            outs(%0 : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+   return %1 : tensor<2x1024x5760xf32>
+@@ -747,7 +747,7 @@ func.func @illegal_im2col_output_rank(%arg0: tensor<2x34x34x640xf32>) -> tensor<
+   %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+            m_offset = [0] * [1] k_offset = [0] * [1]
+            batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+-           input_filter_perm = [0, 1, 2]
++           input_k_perm = [0, 1, 2]
+            ins(%arg0 : tensor<2x34x34x640xf32>)
+            outs(%0 : tensor<2x1024x9x640xf32>) -> tensor<2x1024x9x640xf32>
+   return %1 : tensor<2x1024x9x640xf32>
+@@ -757,11 +757,11 @@ func.func @illegal_im2col_output_rank(%arg0: tensor<2x34x34x640xf32>) -> tensor<
+ 
+ func.func @illegal_im2col_perm_num(%arg0: tensor<2x34x34x640xf32>) -> tensor<2x1024x5760xf32> {
+   %0 = tensor.empty() : tensor<2x1024x5760xf32>
+-  // expected-error @+1 {{expected input_filter_perm size (2) to match the number of shared dimensions (m_Pos + k_pos = 3)}}
++  // expected-error @+1 {{expected input_k_perm size (2) to match the number of shared dimensions (m_Pos + k_pos = 3)}}
+   %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+            m_offset = [0] * [1] k_offset = [0] * [1]
+            batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+-           input_filter_perm = [0, 1]
++           input_k_perm = [0, 1]
+            ins(%arg0 : tensor<2x34x34x640xf32>)
+            outs(%0 : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+   return %1 : tensor<2x1024x5760xf32>
+@@ -771,11 +771,11 @@ func.func @illegal_im2col_perm_num(%arg0: tensor<2x34x34x640xf32>) -> tensor<2x1
+ 
+ func.func @illegal_im2col_perm_value(%arg0: tensor<2x34x34x640xf32>) -> tensor<2x1024x5760xf32> {
+   %0 = tensor.empty() : tensor<2x1024x5760xf32>
+-  // expected-error @+1 {{expected input_filter_perm to be a permutation of [0, 3)}}
++  // expected-error @+1 {{expected input_k_perm to be a permutation of [0, 3)}}
+   %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+            m_offset = [0] * [1] k_offset = [0] * [1]
+            batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+-           input_filter_perm = [1, 2, 3]
++           input_k_perm = [1, 2, 3]
+            ins(%arg0 : tensor<2x34x34x640xf32>)
+            outs(%0 : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+   return %1 : tensor<2x1024x5760xf32>
+diff --git a/compiler/src/iree/compiler/Dialect/LinalgExt/IR/test/roundtrip.mlir b/compiler/src/iree/compiler/Dialect/LinalgExt/IR/test/roundtrip.mlir
+index 3effe580e1d0..bda7e2752473 100644
+--- a/compiler/src/iree/compiler/Dialect/LinalgExt/IR/test/roundtrip.mlir
++++ b/compiler/src/iree/compiler/Dialect/LinalgExt/IR/test/roundtrip.mlir
+@@ -1009,7 +1009,7 @@ func.func @im2col(%arg0: tensor<2x34x34x640xf32>) -> tensor<2x1024x5760xf32> {
+   %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+            m_offset = [0] * [1] k_offset = [0] * [1]
+            batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+-           input_filter_perm = [0, 1, 2]
++           input_k_perm = [0, 1, 2]
+            ins(%arg0 : tensor<2x34x34x640xf32>)
+            outs(%0 : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+   return %1 : tensor<2x1024x5760xf32>
+@@ -1020,7 +1020,7 @@ func.func @im2col(%arg0: tensor<2x34x34x640xf32>) -> tensor<2x1024x5760xf32> {
+ // CHECK:         %[[D1:.+]] = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+ // CHECK-SAME:      m_offset = [0] * [1] k_offset = [0] * [1]
+ // CHECK-SAME:      batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+-// CHECK-SAME:      input_filter_perm = [0, 1, 2]
++// CHECK-SAME:      input_k_perm = [0, 1, 2]
+ // CHECK-SAME:      ins(%[[ARG0]] : tensor<2x34x34x640xf32>)
+ // CHECK-SAME:      outs(%[[D0]] : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+ // CHECK:         return %[[D1]] : tensor<2x1024x5760xf32>
+@@ -1033,7 +1033,7 @@ func.func @im2col_dynamic(%arg0: tensor<?x?x?x?xf32>, %s0: index, %s1: index, %s
+   %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+            m_offset = [%mOffset] * [1] k_offset = [%kOffset] * [1]
+            batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+-           input_filter_perm = [0, 1, 2]
++           input_k_perm = [0, 1, 2]
+            ins(%arg0 : tensor<?x?x?x?xf32>)
+            outs(%0 : tensor<?x?x?xf32>) -> tensor<?x?x?xf32>
+   return %1 : tensor<?x?x?xf32>
+@@ -1045,7 +1045,7 @@ func.func @im2col_dynamic(%arg0: tensor<?x?x?x?xf32>, %s0: index, %s1: index, %s
+ // CHECK:         %[[D1:.+]] = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+ // CHECK-SAME:      m_offset = [%[[MOFFSET]]] * [1] k_offset = [%[[KOFFSET]]] * [1]
+ // CHECK-SAME:      batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+-// CHECK-SAME:      input_filter_perm = [0, 1, 2]
++// CHECK-SAME:      input_k_perm = [0, 1, 2]
+ // CHECK-SAME:      ins(%[[ARG0]] : tensor<?x?x?x?xf32>)
+ // CHECK-SAME:      outs(%[[D0]] : tensor<?x?x?xf32>) -> tensor<?x?x?xf32>
+ // CHECK:         return %[[D1]] : tensor<?x?x?xf32>
+@@ -1057,7 +1057,7 @@ func.func @im2col_strided(%arg0: tensor<2x65x96x640xf32>) -> tensor<2x1024x5760x
+   %1 = iree_linalg_ext.im2col strides = [2, 3] dilations = [1, 1] kernel_size = [3, 3]
+            m_offset = [0] * [1] k_offset = [0] * [1]
+            batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+-           input_filter_perm = [0, 1, 2]
++           input_k_perm = [0, 1, 2]
+            ins(%arg0 : tensor<2x65x96x640xf32>)
+            outs(%0 : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+   return %1 : tensor<2x1024x5760xf32>
+@@ -1068,7 +1068,7 @@ func.func @im2col_strided(%arg0: tensor<2x65x96x640xf32>) -> tensor<2x1024x5760x
+ // CHECK:         %[[D1:.+]] = iree_linalg_ext.im2col strides = [2, 3] dilations = [1, 1] kernel_size = [3, 3]
+ // CHECK-SAME:      m_offset = [0] * [1] k_offset = [0] * [1]
+ // CHECK-SAME:      batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+-// CHECK-SAME:      input_filter_perm = [0, 1, 2]
++// CHECK-SAME:      input_k_perm = [0, 1, 2]
+ // CHECK-SAME:      ins(%[[ARG0]] : tensor<2x65x96x640xf32>)
+ // CHECK-SAME:      outs(%[[D0]] : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+ // CHECK:         return %[[D1]] : tensor<2x1024x5760xf32>
+@@ -1080,7 +1080,7 @@ func.func @im2col_dilated(%arg0: tensor<2x44x46x640xf32>) -> tensor<2x1024x5760x
+   %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [6, 7] kernel_size = [3, 3]
+            m_offset = [0] * [1] k_offset = [0] * [1]
+            batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+-           input_filter_perm = [0, 1, 2]
++           input_k_perm = [0, 1, 2]
+            ins(%arg0 : tensor<2x44x46x640xf32>)
+            outs(%0 : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+   return %1 : tensor<2x1024x5760xf32>
+@@ -1091,7 +1091,7 @@ func.func @im2col_dilated(%arg0: tensor<2x44x46x640xf32>) -> tensor<2x1024x5760x
+ // CHECK:         %[[D1:.+]] = iree_linalg_ext.im2col strides = [1, 1] dilations = [6, 7] kernel_size = [3, 3]
+ // CHECK-SAME:      m_offset = [0] * [1] k_offset = [0] * [1]
+ // CHECK-SAME:      batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+-// CHECK-SAME:      input_filter_perm = [0, 1, 2]
++// CHECK-SAME:      input_k_perm = [0, 1, 2]
+ // CHECK-SAME:      ins(%[[ARG0]] : tensor<2x44x46x640xf32>)
+ // CHECK-SAME:      outs(%[[D0]] : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+ // CHECK:         return %[[D1]] : tensor<2x1024x5760xf32>
+@@ -1103,7 +1103,7 @@ func.func @im2col_strided_dilated_mixed_kernel(%arg0: tensor<2x172x101x640xf32>)
+   %1 = iree_linalg_ext.im2col strides = [5, 3] dilations = [4, 7] kernel_size = [5, 2]
+            m_offset = [0] * [1] k_offset = [0] * [1]
+            batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+-           input_filter_perm = [0, 1, 2]
++           input_k_perm = [0, 1, 2]
+            ins(%arg0 : tensor<2x172x101x640xf32>)
+            outs(%0 : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+   return %1 : tensor<2x1024x5760xf32>
+@@ -1114,7 +1114,7 @@ func.func @im2col_strided_dilated_mixed_kernel(%arg0: tensor<2x172x101x640xf32>)
+ // CHECK:         %[[D1:.+]] = iree_linalg_ext.im2col strides = [5, 3] dilations = [4, 7] kernel_size = [5, 2]
+ // CHECK-SAME:      m_offset = [0] * [1] k_offset = [0] * [1]
+ // CHECK-SAME:      batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+-// CHECK-SAME:      input_filter_perm = [0, 1, 2]
++// CHECK-SAME:      input_k_perm = [0, 1, 2]
+ // CHECK-SAME:      ins(%[[ARG0]] : tensor<2x172x101x640xf32>)
+ // CHECK-SAME:      outs(%[[D0]] : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+ // CHECK:         return %[[D1]] : tensor<2x1024x5760xf32>
+@@ -1126,7 +1126,7 @@ func.func @im2col_transposed_m_pos(%arg0: tensor<640x2x101x172xf32>) -> tensor<2
+   %1 = iree_linalg_ext.im2col strides = [5, 3] dilations = [4, 7] kernel_size = [5, 2]
+            m_offset = [0] * [1] k_offset = [0] * [1]
+            batch_pos = [1] m_pos = [3, 2] k_pos = [0]
+-           input_filter_perm = [0, 1, 2]
++           input_k_perm = [0, 1, 2]
+            ins(%arg0 : tensor<640x2x101x172xf32>)
+            outs(%0 : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+   return %1 : tensor<2x1024x5760xf32>
+@@ -1137,7 +1137,7 @@ func.func @im2col_transposed_m_pos(%arg0: tensor<640x2x101x172xf32>) -> tensor<2
+ // CHECK:         %[[D1:.+]] = iree_linalg_ext.im2col strides = [5, 3] dilations = [4, 7] kernel_size = [5, 2]
+ // CHECK-SAME:      m_offset = [0] * [1] k_offset = [0] * [1]
+ // CHECK-SAME:      batch_pos = [1] m_pos = [3, 2] k_pos = [0]
+-// CHECK-SAME:      input_filter_perm = [0, 1, 2]
++// CHECK-SAME:      input_k_perm = [0, 1, 2]
+ // CHECK-SAME:      ins(%[[ARG0]] : tensor<640x2x101x172xf32>)
+ // CHECK-SAME:      outs(%[[D0]] : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+ // CHECK:         return %[[D1]] : tensor<2x1024x5760xf32>
+@@ -1149,7 +1149,7 @@ func.func @im2col_expanded(%arg0: tensor<2x3x34x34x640xf32>) -> tensor<2x3x128x8
+   %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+            m_offset = [0, 0] * [8, 1] k_offset = [0, 0] * [64, 1]
+            batch_pos = [0, 1] m_pos = [2, 3] k_pos = [4]
+-           input_filter_perm = [0, 1, 2]
++           input_k_perm = [0, 1, 2]
+            ins(%arg0 : tensor<2x3x34x34x640xf32>)
+            outs(%0 : tensor<2x3x128x8x90x64xf32>) -> tensor<2x3x128x8x90x64xf32>
+   return %1 : tensor<2x3x128x8x90x64xf32>
+@@ -1160,7 +1160,7 @@ func.func @im2col_expanded(%arg0: tensor<2x3x34x34x640xf32>) -> tensor<2x3x128x8
+ // CHECK:         %[[D1:.+]] = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+ // CHECK-SAME:      m_offset = [0, 0] * [8, 1] k_offset = [0, 0] * [64, 1]
+ // CHECK-SAME:      batch_pos = [0, 1] m_pos = [2, 3] k_pos = [4]
+-// CHECK-SAME:      input_filter_perm = [0, 1, 2]
++// CHECK-SAME:      input_k_perm = [0, 1, 2]
+ // CHECK-SAME:      ins(%[[ARG0]] : tensor<2x3x34x34x640xf32>)
+ // CHECK-SAME:      outs(%[[D0]] : tensor<2x3x128x8x90x64xf32>) -> tensor<2x3x128x8x90x64xf32>
+ // CHECK:         return %[[D1]] : tensor<2x3x128x8x90x64xf32>
+diff --git a/compiler/src/iree/compiler/Dialect/LinalgExt/Transforms/ConvertConvToIm2ColOp.cpp b/compiler/src/iree/compiler/Dialect/LinalgExt/Transforms/ConvertConvToIm2ColOp.cpp
+index a5265be0bbb1..08c49b121adc 100644
+--- a/compiler/src/iree/compiler/Dialect/LinalgExt/Transforms/ConvertConvToIm2ColOp.cpp
++++ b/compiler/src/iree/compiler/Dialect/LinalgExt/Transforms/ConvertConvToIm2ColOp.cpp
+@@ -12,6 +12,8 @@
+ #include "mlir/Dialect/Tensor/IR/Tensor.h"
+ #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+ 
++#define DEBUG_TYPE "iree-linalg-ext-convert-conv-to-im2col-op"
++
+ namespace mlir::iree_compiler::IREE::LinalgExt {
+ 
+ #define GEN_PASS_DEF_CONVERTCONVTOIM2COLOPPASS
+@@ -69,15 +71,16 @@ static void collectDimExprs(ArrayRef<AffineExpr> exprs,
+     } else if (auto binOpExpr = dyn_cast<AffineBinaryOpExpr>(expr)) {
+       collectDimExprs({binOpExpr.getLHS(), binOpExpr.getRHS()}, out);
+     } else {
+-      llvm::errs() << "Non-dimension expression found: " << expr << "\n";
++      LLVM_DEBUG(llvm::dbgs()
++                 << "Non-dimension expression found: " << expr << "\n");
+     }
+   }
+ }
+ 
+-// Computes `inputFilterPerm` that maps the input spatial and channel order to
++// Computes `inputKPerm` that maps the input spatial and channel order to
+ // filter's.
+-static SmallVector<int64_t> computeInputFilterPerm(AffineMap inputMap,
+-                                                   AffineMap filterMap) {
++static SmallVector<int64_t> computeinputKPerm(AffineMap inputMap,
++                                              AffineMap filterMap) {
+   DenseSet<AffineExpr> inputDimsSet;
+   DenseSet<AffineExpr> filterDimsSet;
+   collectDimExprs(inputMap.getResults(), inputDimsSet);
+@@ -101,16 +104,14 @@ static SmallVector<int64_t> computeInputFilterPerm(AffineMap inputMap,
+     });
+   }
+   // Compute the permutation that maps inputSharedDims to filterSharedDims.
+-  SmallVector<int64_t> inputFilterPerm;
++  SmallVector<int64_t> inputKPerm;
+   for (AffineExpr filterExpr : filterSharedDims) {
+     auto it = llvm::find(inputSharedDims, filterExpr);
+-    if (it == inputSharedDims.end()) {
+-      llvm_unreachable(
+-          "Filter dimension not found in input shared dimensions.");
+-    }
+-    inputFilterPerm.push_back(std::distance(inputSharedDims.begin(), it));
++    assert(it != inputSharedDims.end() &&
++           "Filter dimension not found in input shared dimensions");
++    inputKPerm.push_back(std::distance(inputSharedDims.begin(), it));
+   }
+-  return inputFilterPerm;
++  return inputKPerm;
+ }
+ 
+ namespace {
+@@ -265,8 +266,7 @@ class ConvertConvGeneric final
+     SmallVector<OpFoldResult> kOffset(kBasis.size(), rewriter.getIndexAttr(0));
+     SmallVector<OpFoldResult> mOffset(mBasis.size(), rewriter.getIndexAttr(0));
+ 
+-    SmallVector<int64_t> inputFilterPerm =
+-        computeInputFilterPerm(inputMap, filterMap);
++    SmallVector<int64_t> inputKPerm = computeinputKPerm(inputMap, filterMap);
+ 
+     auto loc = linalgOp.getLoc();
+     Value colTensor = rewriter.create<tensor::EmptyOp>(
+@@ -276,7 +276,7 @@ class ConvertConvGeneric final
+             .create<IREE::LinalgExt::Im2colOp>(
+                 loc, input, /*output=*/colTensor, convDims.strides,
+                 convDims.dilations, kernelSizes, mOffset, mBasis, kOffset,
+-                kBasis, batchPos, mPos, kPos, inputFilterPerm)
++                kBasis, batchPos, mPos, kPos, inputKPerm)
+             .getResult(0);
+ 
+     Value reshapedFilter = rewriter.create<tensor::CollapseShapeOp>(
+diff --git a/compiler/src/iree/compiler/Dialect/LinalgExt/Transforms/test/conv_to_im2col.mlir b/compiler/src/iree/compiler/Dialect/LinalgExt/Transforms/test/conv_to_im2col.mlir
+index 33a1500e3b1b..6abf0e5a7cae 100644
+--- a/compiler/src/iree/compiler/Dialect/LinalgExt/Transforms/test/conv_to_im2col.mlir
++++ b/compiler/src/iree/compiler/Dialect/LinalgExt/Transforms/test/conv_to_im2col.mlir
+@@ -19,7 +19,7 @@ util.func public @conv_2d_nhwc_hwcf(%arg0: tensor<1x16x16x4xf32>, %arg1: tensor<
+ // CHECK-SAME:   strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+ // CHECK-SAME:   m_offset = [0, 0] * [14, 1] k_offset = [0] * [1]
+ // CHECK-SAME:   batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+-// CHECK-SAME:   input_filter_perm = [0, 1, 2]
++// CHECK-SAME:   input_k_perm = [0, 1, 2]
+ // CHECK-SAME:   ins(%[[ARG0]] : tensor<1x16x16x4xf32>)
+ // CHECK-SAME:   outs(%[[EMPTY]] : tensor<1x14x14x36xf32>) -> tensor<1x14x14x36xf32>
+ // CHECK-DAG:  %[[COLLAPSED:.+]] = tensor.collapse_shape %[[ARG1]] {{\[}}[0, 1, 2], [3]] : tensor<3x3x4x16xf32> into tensor<36x16xf32>
+@@ -54,7 +54,7 @@ util.func public @conv_2d_nchw_fchw(%arg0: tensor<1x4x16x16xf32>, %arg1: tensor<
+ // CHECK-SAME:   strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+ // CHECK-SAME:   m_offset = [0, 0] * [14, 1] k_offset = [0] * [1]
+ // CHECK-SAME:   batch_pos = [0] m_pos = [2, 3] k_pos = [1]
+-// CHECK-SAME:   input_filter_perm = [0, 1, 2]
++// CHECK-SAME:   input_k_perm = [0, 1, 2]
+ // CHECK-SAME:   ins(%[[ARG0]] : tensor<1x4x16x16xf32>)
+ // CHECK-SAME:   outs(%[[EMPTY]] : tensor<1x14x14x36xf32>) -> tensor<1x14x14x36xf32>
+ // CHECK-DAG:  %[[COLLAPSED:.+]] = tensor.collapse_shape %[[ARG1]] {{\[}}[0], [1, 2, 3]] : tensor<16x4x3x3xf32> into tensor<16x36xf32>
+@@ -89,7 +89,7 @@ util.func public @conv_mixed_types(%arg0: tensor<1x16x16x4xf16>, %arg1: tensor<3
+ // CHECK-SAME:   strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+ // CHECK-SAME:   m_offset = [0, 0] * [14, 1] k_offset = [0] * [1]
+ // CHECK-SAME:   batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+-// CHECK-SAME:   input_filter_perm = [0, 1, 2]
++// CHECK-SAME:   input_k_perm = [0, 1, 2]
+ // CHECK-SAME:   ins(%[[ARG0]] : tensor<1x16x16x4xf16>)
+ // CHECK-SAME:   outs(%[[EMPTY]] : tensor<1x14x14x36xf16>) -> tensor<1x14x14x36xf16>
+ // CHECK-DAG:  %[[COLLAPSED:.+]] = tensor.collapse_shape %[[ARG1]] {{\[}}[0, 1, 2], [3]] : tensor<3x3x4x16xf16> into tensor<36x16xf16>
+@@ -126,7 +126,7 @@ util.func public @conv_strided(%arg0: tensor<1x16x16x4xf16>, %arg1: tensor<3x3x4
+ // CHECK-SAME:   strides = [2, 2] dilations = [1, 1] kernel_size = [3, 3]
+ // CHECK-SAME:   m_offset = [0, 0] * [7, 1] k_offset = [0] * [1]
+ // CHECK-SAME:   batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+-// CHECK-SAME:   input_filter_perm = [0, 1, 2]
++// CHECK-SAME:   input_k_perm = [0, 1, 2]
+ // CHECK-SAME:   ins(%[[ARG0]] : tensor<1x16x16x4xf16>)
+ // CHECK-SAME:   outs(%[[EMPTY]] : tensor<1x7x7x36xf16>) -> tensor<1x7x7x36xf16>
+ // CHECK-DAG:  %[[COLLAPSED:.+]] = tensor.collapse_shape %[[ARG1]] {{\[}}[0, 1, 2], [3]] : tensor<3x3x4x16xf16> into tensor<36x16xf16>
+@@ -237,7 +237,7 @@ util.func public @conv_1d_ncw_fcw_transpose_maps(%arg0: tensor<1x8x130xf32>, %ar
+ // CHECK-SAME:   strides = [1] dilations = [1] kernel_size = [3]
+ // CHECK-SAME:   m_offset = [0] * [1] k_offset = [0] * [1]
+ // CHECK-SAME:   batch_pos = [0] m_pos = [2] k_pos = [1]
+-// CHECK-SAME:   input_filter_perm = [0, 1]
++// CHECK-SAME:   input_k_perm = [0, 1]
+ // CHECK-SAME:   ins(%[[ARG0]] : tensor<1x8x130xf32>)
+ // CHECK-SAME:   outs(%[[EMPTY2]] : tensor<1x128x24xf32>) -> tensor<1x128x24xf32>
+ // CHECK-DAG:  %[[COLLAPSED:.+]] = tensor.collapse_shape %[[ARG1]] {{\[}}[0], [1, 2]] : tensor<16x8x3xf32> into tensor<16x24xf32>
+@@ -278,7 +278,7 @@ util.func public @conv_2d_chwn_chwf(%arg0: tensor<16x26x18x288xf32>, %arg1: tens
+ // CHECK-SAME:   strides = [1, 1] dilations = [1, 1] kernel_size = [24, 16]
+ // CHECK-SAME:   m_offset = [0, 0] * [3, 1] k_offset = [0] * [1]
+ // CHECK-SAME:   batch_pos = [3] m_pos = [1, 2] k_pos = [0]
+-// CHECK-SAME:   input_filter_perm = [0, 1, 2]
++// CHECK-SAME:   input_k_perm = [0, 1, 2]
+ // CHECK-SAME:   ins(%[[ARG0]] : tensor<16x26x18x288xf32>)
+ // CHECK-SAME:   outs(%[[EMPTY]] : tensor<288x3x3x6144xf32>) -> tensor<288x3x3x6144xf32>
+ // CHECK-DAG:  %[[COLLAPSED:.+]] = tensor.collapse_shape %[[ARG1]] {{\[}}[0, 1, 2], [3]] : tensor<16x24x16x288xf32> into tensor<6144x288xf32>
+@@ -319,7 +319,7 @@ util.func public @conv_2d_hwcn_hwcf(%arg0: tensor<26x18x16x288xf32>, %arg1: tens
+ // CHECK-SAME:   strides = [1, 1] dilations = [1, 1] kernel_size = [24, 16]
+ // CHECK-SAME:   m_offset = [0, 0] * [3, 1] k_offset = [0] * [1]
+ // CHECK-SAME:   batch_pos = [3] m_pos = [0, 1] k_pos = [2]
+-// CHECK-SAME:   input_filter_perm = [0, 1, 2]
++// CHECK-SAME:   input_k_perm = [0, 1, 2]
+ // CHECK-SAME:   ins(%[[ARG0]] : tensor<26x18x16x288xf32>)
+ // CHECK-SAME:   outs(%[[EMPTY]] : tensor<288x3x3x6144xf32>) -> tensor<288x3x3x6144xf32>
+ // CHECK-DAG:  %[[COLLAPSED:.+]] = tensor.collapse_shape %[[ARG1]] {{\[}}[0, 1, 2], [3]] : tensor<24x16x16x288xf32> into tensor<6144x288xf32>
+@@ -358,7 +358,7 @@ util.func public @conv_nhwc_hwfc_nobatch(%arg0: tensor<16x16x4xf32>, %arg1: tens
+ // CHECK:      %[[EMPTY:.+]] = tensor.empty() : tensor<14x14x9x4xf32>
+ // CHECK:      %[[IM2COL:.+]] = iree_linalg_ext.im2col
+ // CHECK-SAME:   m_offset = [0, 0] * [14, 1] k_offset = [0, 0] * [4, 1] batch_pos = []
+-// CHECK-SAME:   input_filter_perm = [0, 1, 2]
++// CHECK-SAME:   input_k_perm = [0, 1, 2]
+ // CHECK-SAME:   ins(%[[ARG0]] : tensor<16x16x4xf32>)
+ // CHECK-SAME:   outs(%[[EMPTY]] : tensor<14x14x9x4xf32>) -> tensor<14x14x9x4xf32>
+ // CHECK-DAG:  %[[COLLAPSED:.+]] = tensor.collapse_shape %[[ARG1]] {{\[}}[0, 1], [2], [3]] : tensor<3x3x16x4xf32> into tensor<9x16x4xf32>
+@@ -383,31 +383,14 @@ util.func public @conv_2d_nhwc_chwf(%arg0: tensor<1x16x16x4xf32>, %arg1: tensor<
+   util.return %0 : tensor<1x14x14x16xf32>
+ }
+ 
+-// CHECK-DAG:  #[[MAP:.+]] = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d4)>
+-// CHECK-DAG:  #[[MAP1:.+]] = affine_map<(d0, d1, d2, d3, d4) -> (d4, d3)>
+-// CHECK-DAG:  #[[MAP2:.+]] = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3)>
+ // CHECK:      util.func public @conv_2d_nhwc_chwf(
+-// CHECK-SAME:   %[[ARG0:[a-zA-Z0-9_]+]]: tensor<1x16x16x4xf32>
+-// CHECK-SAME:   %[[ARG1:[a-zA-Z0-9_]+]]: tensor<4x3x3x16xf32>
+-// CHECK-SAME:   %[[ARG2:[a-zA-Z0-9_]+]]: tensor<1x14x14x16xf32>
+-// CHECK:      %[[EMPTY:.+]] = tensor.empty() : tensor<1x14x14x36xf32>
+-// CHECK:      %[[IM2COL:.+]] = iree_linalg_ext.im2col
++// CHECK:        %[[IM2COL:.+]] = iree_linalg_ext.im2col
+ // CHECK-SAME:   strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+ // CHECK-SAME:   m_offset = [0, 0] * [14, 1] k_offset = [0] * [1]
+ // CHECK-SAME:   batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+-// CHECK-SAME:   input_filter_perm = [2, 0, 1]
+-// CHECK-SAME:   ins(%[[ARG0]] : tensor<1x16x16x4xf32>)
+-// CHECK-SAME:   outs(%[[EMPTY]] : tensor<1x14x14x36xf32>) -> tensor<1x14x14x36xf32>
+-// CHECK-DAG:  %[[COLLAPSED:.+]] = tensor.collapse_shape %[[ARG1]] {{\[}}[0, 1, 2], [3]] : tensor<4x3x3x16xf32> into tensor<36x16xf32>
+-// CHECK:      %[[MATMUL:.+]] = linalg.generic
+-// CHECK-SAME:   indexing_maps = [#[[MAP]], #[[MAP1]], #[[MAP2]]]
+-// CHECK-SAME:   iterator_types = ["parallel", "parallel", "parallel", "parallel", "reduction"]
+-// CHECK-SAME:   ins(%[[IM2COL]], %[[COLLAPSED]] : tensor<1x14x14x36xf32>, tensor<36x16xf32>)
+-// CHECK-SAME:   outs(%[[ARG2]] : tensor<1x14x14x16xf32>) {
+-// CHECK:          arith.mulf
+-// CHECK:          arith.addf
+-// CHECK:      } -> tensor<1x14x14x16xf32>
+-// CHECK:      util.return %[[MATMUL]] : tensor<1x14x14x16xf32>
++// CHECK-SAME:   input_k_perm = [2, 0, 1]
++// CHECK-SAME:   ins({{.*}} : tensor<1x16x16x4xf32>)
++// CHECK-SAME:   outs({{.*}} : tensor<1x14x14x36xf32>) -> tensor<1x14x14x36xf32>
+ 
+ // -----
+ 
+@@ -424,28 +407,11 @@ util.func public @conv_1d_nhc_chf(%arg0: tensor<1x3x2xf32>, %arg1: tensor<2x2x2x
+   util.return %0 : tensor<1x2x2xf32>
+ }
+ 
+-// CHECK-DAG:  #[[MAP:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d1, d3)>
+-// CHECK-DAG:  #[[MAP1:.+]] = affine_map<(d0, d1, d2, d3) -> (d3, d2)>
+-// CHECK-DAG:  #[[MAP2:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2)>
+ // CHECK:      util.func public @conv_1d_nhc_chf(
+-// CHECK-SAME:   %[[ARG0:[a-zA-Z0-9_]+]]: tensor<1x3x2xf32>
+-// CHECK-SAME:   %[[ARG1:[a-zA-Z0-9_]+]]: tensor<2x2x2xf32>
+-// CHECK-SAME:   %[[ARG2:[a-zA-Z0-9_]+]]: tensor<1x2x2xf32>
+-// CHECK:      %[[EMPTY:.+]] = tensor.empty() : tensor<1x2x4xf32>
+-// CHECK:      %[[IM2COL:.+]] = iree_linalg_ext.im2col
++// CHECK:        %[[IM2COL:.+]] = iree_linalg_ext.im2col
+ // CHECK-SAME:   strides = [1] dilations = [1] kernel_size = [2]
+ // CHECK-SAME:   m_offset = [0] * [1] k_offset = [0] * [1]
+ // CHECK-SAME:   batch_pos = [0] m_pos = [1] k_pos = [2]
+-// CHECK-SAME:   input_filter_perm = [1, 0]
+-// CHECK-SAME:   ins(%[[ARG0]] : tensor<1x3x2xf32>)
+-// CHECK-SAME:   outs(%[[EMPTY]] : tensor<1x2x4xf32>) -> tensor<1x2x4xf32>
+-// CHECK-DAG:  %[[COLLAPSED:.+]] = tensor.collapse_shape %[[ARG1]] {{\[}}[0, 1], [2]] : tensor<2x2x2xf32> into tensor<4x2xf32>
+-// CHECK:      %[[MATMUL:.+]] = linalg.generic
+-// CHECK-SAME:   indexing_maps = [#[[MAP]], #[[MAP1]], #[[MAP2]]]
+-// CHECK-SAME:   iterator_types = ["parallel", "parallel", "parallel", "reduction"]
+-// CHECK-SAME:   ins(%[[IM2COL]], %[[COLLAPSED]] : tensor<1x2x4xf32>, tensor<4x2xf32>)
+-// CHECK-SAME:   outs(%[[ARG2]] : tensor<1x2x2xf32>) {
+-// CHECK:          arith.mulf
+-// CHECK:          arith.addf
+-// CHECK:      } -> tensor<1x2x2xf32>
+-// CHECK:      util.return %[[MATMUL]] : tensor<1x2x2xf32>
++// CHECK-SAME:   input_k_perm = [1, 0]
++// CHECK-SAME:   ins({{.*}} : tensor<1x3x2xf32>)
++// CHECK-SAME:   outs({{.*}} : tensor<1x2x4xf32>) -> tensor<1x2x4xf32>
+diff --git a/compiler/src/iree/compiler/Dialect/LinalgExt/Transforms/test/decompose_im2col.mlir b/compiler/src/iree/compiler/Dialect/LinalgExt/Transforms/test/decompose_im2col.mlir
+index 45ff7e3129f7..2f315cd42350 100644
+--- a/compiler/src/iree/compiler/Dialect/LinalgExt/Transforms/test/decompose_im2col.mlir
++++ b/compiler/src/iree/compiler/Dialect/LinalgExt/Transforms/test/decompose_im2col.mlir
+@@ -10,7 +10,7 @@ module {
+             strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+             m_offset = [%m_off] * [1] k_offset = [%k_off] * [1]
+             batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+-            input_filter_perm = [0, 1, 2]
++            input_k_perm = [0, 1, 2]
+             ins(%arg0 : tensor<2x34x34x640xf32>)
+             outs(%0 : tensor<2x?x4xf32>) -> tensor<2x?x4xf32>
+     return %7 : tensor<2x?x4xf32>
+@@ -55,7 +55,7 @@ module {
+             strides = [5, 3] dilations = [4, 7] kernel_size = [5, 2]
+             m_offset = [%m_off] * [1] k_offset = [%k_off] * [1]
+             batch_pos = [1] m_pos = [3, 2] k_pos = [0]
+-            input_filter_perm = [0, 1, 2]
++            input_k_perm = [0, 1, 2]
+             ins(%arg0 : tensor<640x2x101x172xf32>)
+             outs(%0 : tensor<2x?x?xf32>) -> tensor<2x?x?xf32>
+     return %8 : tensor<2x?x?xf32>
+@@ -101,7 +101,7 @@ module {
+             strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+             m_offset = [%m0, %m1] * [%m_stride, 1] k_offset = [%k, 0] * [4, 1]
+             batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+-            input_filter_perm = [0, 1, 2]
++            input_k_perm = [0, 1, 2]
+             ins(%arg0 : tensor<2x34x34x640xf32>)
+             outs(%0 : tensor<2x?x?x2x4xf32>) -> tensor<2x?x?x2x4xf32>
+     return %7 : tensor<2x?x?x2x4xf32>
+@@ -151,7 +151,7 @@ module {
+             strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+             m_offset = [%m0, %m1] * [32, 1] k_offset = [%k, 0] * [4, 1]
+             batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+-            input_filter_perm = [0, 1, 2]
++            input_k_perm = [0, 1, 2]
+             ins(%arg0 : tensor<2x640x34x34xf32>)
+             outs(%0 : tensor<2x1x1x2x4xf32>) -> tensor<2x1x1x2x4xf32>
+     return %7 : tensor<2x1x1x2x4xf32>
+@@ -172,7 +172,7 @@ module {
+             strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+             m_offset = [%m_off] * [1] k_offset = [%k_off] * [1]
+             batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+-            input_filter_perm = [0, 1, 2]
++            input_k_perm = [0, 1, 2]
+             ins(%arg0 : tensor<2x34x34x640xf32>)
+             outs(%0 : tensor<2x2x4xf32>) -> tensor<2x2x4xf32>
+     return %7 : tensor<2x2x4xf32>
+@@ -252,7 +252,7 @@ module {
+   %im2col = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+                               m_offset = [0, 0] * [2, 1] k_offset = [0] * [1]
+                               batch_pos = [0] m_pos = [2, 3] k_pos = [1]
+-                              input_filter_perm = [0, 1, 2]
++                              input_k_perm = [0, 1, 2]
+                               ins(%padded : tensor<1x8x9x9xf32>)
+                               outs(%empty : tensor<1x2x2x12xf32>) -> tensor<1x2x2x12xf32>
+   return %im2col : tensor<1x2x2x12xf32>
+@@ -275,7 +275,7 @@ module {
+     %1 = iree_linalg_ext.im2col strides = [1] dilations = [1] kernel_size = [2]
+                             m_offset = [0] * [1] k_offset = [0] * [1]
+                             batch_pos = [0] m_pos = [1] k_pos = [2]
+-                            input_filter_perm = [1, 0]
++                            input_k_perm = [1, 0]
+                             ins(%arg0 : tensor<1x3x2xf32>)
+                             outs(%0 : tensor<1x2x4xf32>) -> tensor<1x2x4xf32>
+     return %1 : tensor<1x2x4xf32>
+@@ -309,7 +309,7 @@ module {
+     %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+                             m_offset = [0, 0] * [14, 1] k_offset = [0] * [1]
+                             batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+-                            input_filter_perm = [2, 0, 1]
++                            input_k_perm = [2, 0, 1]
+                             ins(%arg0 : tensor<1x16x16x4xf32>)
+                             outs(%0 : tensor<1x14x14x36xf32>) -> tensor<1x14x14x36xf32>
+     return %1 : tensor<1x14x14x36xf32>
+diff --git a/compiler/src/iree/compiler/Dialect/LinalgExt/Transforms/test/tiling.mlir b/compiler/src/iree/compiler/Dialect/LinalgExt/Transforms/test/tiling.mlir
+index 659553a9b1d0..b852ed08ac65 100644
+--- a/compiler/src/iree/compiler/Dialect/LinalgExt/Transforms/test/tiling.mlir
++++ b/compiler/src/iree/compiler/Dialect/LinalgExt/Transforms/test/tiling.mlir
+@@ -793,7 +793,7 @@ func.func @im2col(%arg0: tensor<2x34x34x640xf32>) -> tensor<2x1024x5760xf32> {
+   %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+            m_offset = [34] * [1] k_offset = [1000] * [1]
+            batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+-           input_filter_perm = [0, 1, 2]
++           input_k_perm = [0, 1, 2]
+            ins(%arg0 : tensor<2x34x34x640xf32>)
+            outs(%0 : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+   return %1 : tensor<2x1024x5760xf32>
+@@ -833,7 +833,7 @@ module attributes { transform.with_named_sequence } {
+ // CHECK:              %[[IM2COL:.+]] = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+ // CHECK-SAME:           m_offset = [%[[MOFFSET]]] * [1] k_offset = [%[[KOFFSET]]] * [1]
+ // CHECK-SAME:           batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+-// CHECK-SAME:           input_filter_perm = [0, 1, 2]
++// CHECK-SAME:           input_k_perm = [0, 1, 2]
+ // CHECK-SAME:           ins(%[[EXTRACTED_SLICE]] : tensor<1x34x34x640xf32>)
+ // CHECK-SAME:           outs(%[[EXTRACTED_SLICE_0]] : tensor<1x?x4xf32>) -> tensor<1x?x4xf32>
+ // CHECK:              %[[INSERTED_SLICE:.+]] = tensor.insert_slice %[[IM2COL]] into %[[ARG6]]
+@@ -851,7 +851,7 @@ func.func @im2col_transposed_m_pos(%arg0: tensor<640x2x101x172xf32>) -> tensor<2
+   %1 = iree_linalg_ext.im2col strides = [5, 3] dilations = [4, 7] kernel_size = [5, 2]
+            m_offset = [42] * [1] k_offset = [7] * [1]
+            batch_pos = [1] m_pos = [3, 2] k_pos = [0]
+-           input_filter_perm = [0, 1, 2]
++           input_k_perm = [0, 1, 2]
+            ins(%arg0 : tensor<640x2x101x172xf32>)
+            outs(%0 : tensor<2x1024x5760xf32>) -> tensor<2x1024x5760xf32>
+   return %1 : tensor<2x1024x5760xf32>
+@@ -893,7 +893,7 @@ module attributes { transform.with_named_sequence } {
+ // CHECK:              %[[IM2COL:.+]] = iree_linalg_ext.im2col strides = [5, 3] dilations = [4, 7] kernel_size = [5, 2]
+ // CHECK-SAME:           m_offset = [%[[MOFFSET]]] * [1] k_offset = [%[[KOFFSET]]] * [1]
+ // CHECK-SAME:           batch_pos = [1] m_pos = [3, 2] k_pos = [0]
+-// CHECK-SAME:           input_filter_perm = [0, 1, 2]
++// CHECK-SAME:           input_k_perm = [0, 1, 2]
+ // CHECK-SAME:           ins(%[[EXTRACTED_SLICE]] : tensor<640x1x101x172xf32>)
+ // CHECK-SAME:           outs(%[[EXTRACTED_SLICE_0]] : tensor<1x?x?xf32>) -> tensor<1x?x?xf32>
+ // CHECK:              %[[INSERTED_SLICE:.+]] = tensor.insert_slice %[[IM2COL]] into %[[ARG6]]
+@@ -912,7 +912,7 @@ func.func @im2col_dynamic(%arg0: tensor<?x?x?x?xf32>, %s0: index, %s1: index, %s
+   %1 = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+            m_offset = [%mOffset] * [1] k_offset = [%kOffset] * [1]
+            batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+-           input_filter_perm = [0, 1, 2]
++           input_k_perm = [0, 1, 2]
+            ins(%arg0 : tensor<?x?x?x?xf32>)
+            outs(%0 : tensor<?x?x?xf32>) -> tensor<?x?x?xf32>
+   return %1 : tensor<?x?x?xf32>
+@@ -958,7 +958,7 @@ module attributes { transform.with_named_sequence } {
+ // CHECK:              %[[IM2COL:.+]] = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+ // CHECK-SAME:           m_offset = [%[[MOFFSET]]] * [1] k_offset = [%[[KOFFSET]]] * [1]
+ // CHECK-SAME:           batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+-// CHECK-SAME:           input_filter_perm = [0, 1, 2]
++// CHECK-SAME:           input_k_perm = [0, 1, 2]
+ // CHECK-SAME:           ins(%[[EXTRACTED_SLICE]] : tensor<?x?x?x?xf32>)
+ // CHECK-SAME:           outs(%[[EXTRACTED_SLICE_0]] : tensor<?x?x?xf32>) -> tensor<?x?x?xf32>
+ // CHECK:              %[[INSERTED_SLICE:.+]] = tensor.insert_slice %[[IM2COL]] into %[[ARG6]]
+@@ -978,7 +978,7 @@ module {
+             strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+             m_offset = [0, 0] * [%m_stride, 1] k_offset = [0, 0] * [4, 1]
+             batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+-            input_filter_perm = [0, 1, 2]
++            input_k_perm = [0, 1, 2]
+             ins(%arg0 : tensor<2x34x34x640xf32>)
+             outs(%0 : tensor<2x32x32x1440x4xf32>) -> tensor<2x32x32x1440x4xf32>
+     return %7 : tensor<2x32x32x1440x4xf32>
+@@ -1027,7 +1027,7 @@ module attributes { transform.with_named_sequence } {
+ // CHECK:                  %[[IM2COL:.+]] = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+ // CHECK-SAME:               m_offset = [%[[ARG3]], %[[ARG5]]] * [%[[M_STRIDE]], 1] k_offset = [%[[ARG7]], %[[ARG9]]] * [4, 1]
+ // CHECK-SAME:               batch_pos = [0] m_pos = [1, 2] k_pos = [3]
+-// CHECK-SAME:               input_filter_perm = [0, 1, 2]
++// CHECK-SAME:               input_k_perm = [0, 1, 2]
+ // CHECK-SAME:               ins(%[[EXTRACTED_SLICE]] : tensor<1x34x34x640xf32>)
+ // CHECK-SAME:               outs(%[[EXTRACTED_SLICE_0]] : tensor<1x?x?x?x2xf32>) -> tensor<1x?x?x?x2xf32>
+ // CHECK:                  %[[INSERTED_SLICE:.+]] = tensor.insert_slice %[[IM2COL]] into %[[ARG10]]
+
+From d0bfcaefbb4bdd4147e021c4f005eac130127ee4 Mon Sep 17 00:00:00 2001
+From: yzhang93 <zhyuhang88@gmail.com>
+Date: Mon, 14 Apr 2025 12:23:33 -0700
+Subject: [PATCH 4/5] Fix format
+
+Signed-off-by: yzhang93 <zhyuhang88@gmail.com>
+---
+ .../LinalgExt/IR/AggregatedOpInterfaceImpl.cpp       |  2 +-
+ .../compiler/Dialect/LinalgExt/IR/LinalgExtOps.td    | 12 ++++++------
+ 2 files changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/Dialect/LinalgExt/IR/AggregatedOpInterfaceImpl.cpp b/compiler/src/iree/compiler/Dialect/LinalgExt/IR/AggregatedOpInterfaceImpl.cpp
+index 412ba1aba100..5f6b59bbf063 100644
+--- a/compiler/src/iree/compiler/Dialect/LinalgExt/IR/AggregatedOpInterfaceImpl.cpp
++++ b/compiler/src/iree/compiler/Dialect/LinalgExt/IR/AggregatedOpInterfaceImpl.cpp
+@@ -781,7 +781,7 @@ FailureOr<SmallVector<Value>> Im2colOp::decomposeOperation(OpBuilder &b) {
+   // Transpose the order of (P, Q, C) according to `inputKPerm` encoded in
+   // im2col metadata.
+   ArrayRef<int64_t> inputKPerm = getInputKPerm();
+-  applyPermutationToVector(kBasis, getInputKPerm());
++  applyPermutationToVector(kBasis, inputKPerm);
+ 
+   OpFoldResult kIndex = kOffset;
+   for (auto [i, ivIdx, stride] :
+diff --git a/compiler/src/iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.td b/compiler/src/iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.td
+index 839304b3aa74..ec01581cc046 100644
+--- a/compiler/src/iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.td
++++ b/compiler/src/iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.td
+@@ -795,14 +795,14 @@ def IREELinalgExt_Im2colOp : IREELinalgExt_Op<"im2col",
+     index into the flat `K` increases by 4. The strides in M from `m_strides`
+     are orthogonal to the strides in `K` from `k_strides`.
+ 
+-    The `input_k_perm` attribute defines the permutation needed to align the 
+-    reduction dimensions of the input layout with those of the filter layout 
++    The `input_k_perm` attribute defines the permutation needed to align the
++    reduction dimensions of the input layout with those of the filter layout
+     when computing the K dimension of the im2col output. This is useful when the
+-    layout of the filter (e.g., `CHW`) differs from that of the input (e.g., `HWC`). 
+-    For instance, an `input_k_perm = [2, 0, 1]` indicates the input indices needs 
++    layout of the filter (e.g., `CHW`) differs from that of the input (e.g., `HWC`).
++    For instance, an `input_k_perm = [2, 0, 1]` indicates the input indices needs
+     to be transposed from `HWC` to `CHW` layout before extracting slices during
+-    decomposition. The identity permutation (e.g., input_k_perm = [0, 1, 2]) 
+-    indicates that the input layout is already aligned with the filter layout 
++    decomposition. The identity permutation (e.g., input_k_perm = [0, 1, 2])
++    indicates that the input layout is already aligned with the filter layout
+     in terms of reduction dimensions, so no transposition of indices is necessary
+     before slice extraction.
+   }];
+
+From bdb6db75263d7a66e81a3be3304823982b93dcb8 Mon Sep 17 00:00:00 2001
+From: yzhang93 <zhyuhang88@gmail.com>
+Date: Tue, 15 Apr 2025 17:01:17 +0000
+Subject: [PATCH 5/5] Minor fixes
+
+Signed-off-by: yzhang93 <zhyuhang88@gmail.com>
+---
+ .../LinalgExt/Transforms/ConvertConvToIm2ColOp.cpp        | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/Dialect/LinalgExt/Transforms/ConvertConvToIm2ColOp.cpp b/compiler/src/iree/compiler/Dialect/LinalgExt/Transforms/ConvertConvToIm2ColOp.cpp
+index 08c49b121adc..14eaac8735f0 100644
+--- a/compiler/src/iree/compiler/Dialect/LinalgExt/Transforms/ConvertConvToIm2ColOp.cpp
++++ b/compiler/src/iree/compiler/Dialect/LinalgExt/Transforms/ConvertConvToIm2ColOp.cpp
+@@ -77,9 +77,9 @@ static void collectDimExprs(ArrayRef<AffineExpr> exprs,
+   }
+ }
+ 
+-// Computes `inputKPerm` that maps the input spatial and channel order to
+-// filter's.
+-static SmallVector<int64_t> computeinputKPerm(AffineMap inputMap,
++// Computes `inputKPerm` that maps the input spatial and channel dimension order
++// to filter's.
++static SmallVector<int64_t> computeInputKPerm(AffineMap inputMap,
+                                               AffineMap filterMap) {
+   DenseSet<AffineExpr> inputDimsSet;
+   DenseSet<AffineExpr> filterDimsSet;
+@@ -266,7 +266,7 @@ class ConvertConvGeneric final
+     SmallVector<OpFoldResult> kOffset(kBasis.size(), rewriter.getIndexAttr(0));
+     SmallVector<OpFoldResult> mOffset(mBasis.size(), rewriter.getIndexAttr(0));
+ 
+-    SmallVector<int64_t> inputKPerm = computeinputKPerm(inputMap, filterMap);
++    SmallVector<int64_t> inputKPerm = computeInputKPerm(inputMap, filterMap);
+ 
+     auto loc = linalgOp.getLoc();
+     Value colTensor = rewriter.create<tensor::EmptyOp>(

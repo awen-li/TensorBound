@@ -1,0 +1,111 @@
+From ecf9426109ba2d1c8d6a9628cdb0eecb772f4291 Mon Sep 17 00:00:00 2001
+From: Quinn Dawkins <quinn@nod-labs.com>
+Date: Thu, 9 Nov 2023 11:47:28 -0500
+Subject: [PATCH 1/2] [Bindings][Python] Allow copies into a larger target
+ buffer than the source
+
+---
+ runtime/bindings/python/hal.cc            |  9 +++++----
+ runtime/bindings/python/tests/hal_test.py | 15 ++++++++-------
+ 2 files changed, 13 insertions(+), 11 deletions(-)
+
+diff --git a/runtime/bindings/python/hal.cc b/runtime/bindings/python/hal.cc
+index e08d5a3467ea..9843c6888e2b 100644
+--- a/runtime/bindings/python/hal.cc
++++ b/runtime/bindings/python/hal.cc
+@@ -584,13 +584,14 @@ void HalDevice::QueueCopy(HalBuffer& source_buffer, HalBuffer& target_buffer,
+     }
+   }
+ 
+-  // TODO: Accept params for src_offset and target_offset.
++  // TODO: Accept params for src_offset and target_offset. Just check that
++  // the source will fit in the target buffer for now.
+   iree_device_size_t source_length =
+       iree_hal_buffer_byte_length(source_buffer.raw_ptr());
+-  if (source_length != iree_hal_buffer_byte_length(target_buffer.raw_ptr())) {
++  if (source_length > iree_hal_buffer_byte_length(target_buffer.raw_ptr())) {
+     throw std::invalid_argument(
+-        "Source and target buffer length must match and it does not. Please "
+-        "check allocations");
++        "Source and buffer length must be less than the target buffer length "
++        "and it does not. Please check allocations");
+   }
+   CheckApiStatus(iree_hal_device_queue_copy(
+                      raw_ptr(), IREE_HAL_QUEUE_AFFINITY_ANY, wait_list,
+diff --git a/runtime/bindings/python/tests/hal_test.py b/runtime/bindings/python/tests/hal_test.py
+index c7407bc58a94..95eccf1de25a 100644
+--- a/runtime/bindings/python/tests/hal_test.py
++++ b/runtime/bindings/python/tests/hal_test.py
+@@ -303,13 +303,14 @@ def testDifferentSizeQueueCopy(self):
+             allocation_size=13,
+         )
+         sem = self.device.create_semaphore(0)
+-        with self.assertRaisesRegex(ValueError, "length must match"):
+-            self.device.queue_copy(
+-                source_buffer,
+-                target_buffer,
+-                wait_semaphores=iree.runtime.HalFence.create_at(sem, 0),
+-                signal_semaphores=iree.runtime.HalFence.create_at(sem, 1),
+-            )
++        self.device.queue_copy(
++            source_buffer,
++            target_buffer,
++            wait_semaphores=iree.runtime.HalFence.create_at(sem, 0),
++            signal_semaphores=iree.runtime.HalFence.create_at(sem, 1),
++        )
++        iree.runtime.HalFence.create_at(sem, 1).wait()
++        # Just check that it runs?
+ 
+     def testCommandBufferStartsByDefault(self):
+         cb = iree.runtime.HalCommandBuffer(self.device)
+
+From 90c4f2ffd807a938ee01fb1975ae1c7c9a3e5a69 Mon Sep 17 00:00:00 2001
+From: Quinn Dawkins <quinn@nod-labs.com>
+Date: Thu, 9 Nov 2023 15:30:00 -0500
+Subject: [PATCH 2/2] Bring back test with larger source than target
+
+---
+ runtime/bindings/python/tests/hal_test.py | 21 ++++++++++-----------
+ 1 file changed, 10 insertions(+), 11 deletions(-)
+
+diff --git a/runtime/bindings/python/tests/hal_test.py b/runtime/bindings/python/tests/hal_test.py
+index 95eccf1de25a..b38da4763270 100644
+--- a/runtime/bindings/python/tests/hal_test.py
++++ b/runtime/bindings/python/tests/hal_test.py
+@@ -291,26 +291,25 @@ def testRoundTripQueueCopy(self):
+         copy_ary = target_buffer.map().asarray(original_ary.shape, original_ary.dtype)
+         np.testing.assert_array_equal(original_ary, copy_ary)
+ 
+-    def testDifferentSizeQueueCopy(self):
++    def testIncompatibleSizeQueueCopy(self):
+         source_buffer = self.allocator.allocate_buffer(
+             memory_type=iree.runtime.MemoryType.DEVICE_LOCAL,
+             allowed_usage=iree.runtime.BufferUsage.DEFAULT,
+-            allocation_size=12,
++            allocation_size=13,
+         )
+         target_buffer = self.allocator.allocate_buffer(
+             memory_type=iree.runtime.MemoryType.DEVICE_LOCAL,
+             allowed_usage=iree.runtime.BufferUsage.DEFAULT,
+-            allocation_size=13,
++            allocation_size=12,
+         )
+         sem = self.device.create_semaphore(0)
+-        self.device.queue_copy(
+-            source_buffer,
+-            target_buffer,
+-            wait_semaphores=iree.runtime.HalFence.create_at(sem, 0),
+-            signal_semaphores=iree.runtime.HalFence.create_at(sem, 1),
+-        )
+-        iree.runtime.HalFence.create_at(sem, 1).wait()
+-        # Just check that it runs?
++        with self.assertRaisesRegex(ValueError, "length must be less than"):
++            self.device.queue_copy(
++                source_buffer,
++                target_buffer,
++                wait_semaphores=iree.runtime.HalFence.create_at(sem, 0),
++                signal_semaphores=iree.runtime.HalFence.create_at(sem, 1),
++            )
+ 
+     def testCommandBufferStartsByDefault(self):
+         cb = iree.runtime.HalCommandBuffer(self.device)

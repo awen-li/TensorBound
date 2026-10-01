@@ -1,0 +1,607 @@
+{
+  "analysis_scope": {
+    "cause_level": "The 149 distinct repair-backed causes support complete provenance, obligation, failure, and repair comparisons.",
+    "repair_level": "Repair-strategy counts use the 149 distinct repair-backed causes.",
+    "report_level": "All 264 confirmed reports contribute the archived trigger, observed decision, physical effect, and consequence available for that report."
+  },
+  "by_stack": {
+    "iree": {
+      "distinct_causes": 46,
+      "obligation_family": {
+        "alias independence": 3,
+        "completion and progress": 3,
+        "happens-before ordering": 3,
+        "identity correspondence": 8,
+        "index and offset preservation": 6,
+        "initialization before publication": 2,
+        "ownership and lifetime": 8,
+        "placement and context consistency": 2,
+        "policy and configuration propagation": 1,
+        "range and alignment safety": 4,
+        "representation fidelity": 2,
+        "resource and capability agreement": 3,
+        "transformation equivalence": 1
+      },
+      "relation_family": {
+        "logical value--storage content": 2,
+        "operation--completion": 4,
+        "operation--execution context": 6,
+        "storage--ownership/lifetime": 9,
+        "value--operation/identity": 10,
+        "value--representation": 2,
+        "value--shared storage": 3,
+        "value--storage/layout": 10
+      },
+      "transition_family": {
+        "identity or index remapping": 11,
+        "initialization or content update": 3,
+        "ordering or completion handoff": 4,
+        "ownership or lifetime change": 11,
+        "placement or context change": 6,
+        "representation or layout change": 8,
+        "storage, alias, or mutation change": 3
+      }
+    },
+    "pytorch-inductor-triton": {
+      "distinct_causes": 55,
+      "obligation_family": {
+        "alias independence": 7,
+        "happens-before ordering": 10,
+        "identity correspondence": 5,
+        "index and offset preservation": 8,
+        "layout compatibility": 8,
+        "range and alignment safety": 6,
+        "representation fidelity": 7,
+        "transformation equivalence": 4
+      },
+      "relation_family": {
+        "operation--completion": 9,
+        "value--operation/identity": 8,
+        "value--representation": 8,
+        "value--shared storage": 9,
+        "value--storage/layout": 21
+      },
+      "transition_family": {
+        "identity or index remapping": 13,
+        "ordering or completion handoff": 10,
+        "representation or layout change": 23,
+        "storage, alias, or mutation change": 9
+      }
+    },
+    "xla-jax-pjrt": {
+      "distinct_causes": 48,
+      "obligation_family": {
+        "alias independence": 1,
+        "completion and progress": 1,
+        "happens-before ordering": 7,
+        "identity correspondence": 3,
+        "index and offset preservation": 4,
+        "initialization before publication": 2,
+        "layout compatibility": 3,
+        "ownership and lifetime": 5,
+        "placement and context consistency": 11,
+        "policy and configuration propagation": 6,
+        "representation fidelity": 2,
+        "transformation equivalence": 2,
+        "value semantics preservation": 1
+      },
+      "relation_family": {
+        "logical value--storage content": 1,
+        "operation--completion": 8,
+        "operation--execution context": 16,
+        "storage--ownership/lifetime": 7,
+        "value--operation/identity": 5,
+        "value--representation": 3,
+        "value--shared storage": 2,
+        "value--storage/layout": 6
+      },
+      "transition_family": {
+        "identity or index remapping": 7,
+        "initialization or content update": 1,
+        "ordering or completion handoff": 9,
+        "ownership or lifetime change": 5,
+        "placement or context change": 17,
+        "representation or layout change": 6,
+        "storage, alias, or mutation change": 3
+      }
+    }
+  },
+  "cohort_reports": 264,
+  "confirmed_reports_without_traceable_landed_repair": 102,
+  "consequence_tags_nonexclusive": {
+    "hang or deadlock": 7,
+    "memory safety": 8,
+    "other observable failure": 39,
+    "resource leak or exhaustion": 6,
+    "runtime rejection or crash": 49,
+    "wrong result": 55
+  },
+  "cross_tabs": {
+    "failure_by_repair": {
+      "incorrect mapping or translation": {
+        "constrain unsafe transformation": 1,
+        "correct mapping or representation": 33,
+        "correct ownership or lifetime": 1
+      },
+      "lost or omitted relation": {
+        "constrain unsafe transformation": 1,
+        "correct mapping or representation": 1,
+        "correct ownership or lifetime": 3,
+        "preserve or propagate relation": 27
+      },
+      "missing eligibility check": {
+        "constrain unsafe transformation": 2,
+        "correct ownership or lifetime": 1,
+        "strengthen eligibility check": 34
+      },
+      "missing ordering or enforcement": {
+        "restore ordering or synchronization": 8
+      },
+      "omitted operation": {
+        "perform omitted operation": 5
+      },
+      "premature invalidation or stale state": {
+        "preserve or propagate relation": 3
+      },
+      "premature or unordered transition": {
+        "constrain unsafe transformation": 1,
+        "correct ownership or lifetime": 5,
+        "preserve or propagate relation": 1,
+        "restore ordering or synchronization": 3
+      },
+      "unsound assumption or inference": {
+        "constrain unsafe transformation": 3,
+        "correct mapping or representation": 8,
+        "correct ownership or lifetime": 2,
+        "perform omitted operation": 1,
+        "preserve or propagate relation": 1,
+        "strengthen eligibility check": 4
+      }
+    },
+    "obligation_by_repair": {
+      "alias independence": {
+        "preserve or propagate relation": 1,
+        "strengthen eligibility check": 10
+      },
+      "completion and progress": {
+        "restore ordering or synchronization": 3,
+        "strengthen eligibility check": 1
+      },
+      "happens-before ordering": {
+        "constrain unsafe transformation": 2,
+        "correct mapping or representation": 2,
+        "preserve or propagate relation": 3,
+        "restore ordering or synchronization": 8,
+        "strengthen eligibility check": 5
+      },
+      "identity correspondence": {
+        "constrain unsafe transformation": 2,
+        "correct mapping or representation": 9,
+        "perform omitted operation": 1,
+        "preserve or propagate relation": 4
+      },
+      "index and offset preservation": {
+        "correct mapping or representation": 11,
+        "preserve or propagate relation": 5,
+        "strengthen eligibility check": 2
+      },
+      "initialization before publication": {
+        "correct mapping or representation": 1,
+        "perform omitted operation": 3
+      },
+      "layout compatibility": {
+        "constrain unsafe transformation": 1,
+        "correct mapping or representation": 1,
+        "preserve or propagate relation": 3,
+        "strengthen eligibility check": 6
+      },
+      "ownership and lifetime": {
+        "correct ownership or lifetime": 12,
+        "strengthen eligibility check": 1
+      },
+      "placement and context consistency": {
+        "correct mapping or representation": 4,
+        "preserve or propagate relation": 9
+      },
+      "policy and configuration propagation": {
+        "constrain unsafe transformation": 1,
+        "preserve or propagate relation": 6
+      },
+      "range and alignment safety": {
+        "correct mapping or representation": 4,
+        "strengthen eligibility check": 6
+      },
+      "representation fidelity": {
+        "constrain unsafe transformation": 2,
+        "correct mapping or representation": 7,
+        "perform omitted operation": 1,
+        "preserve or propagate relation": 1
+      },
+      "resource and capability agreement": {
+        "correct mapping or representation": 1,
+        "strengthen eligibility check": 2
+      },
+      "transformation equivalence": {
+        "correct mapping or representation": 1,
+        "perform omitted operation": 1,
+        "strengthen eligibility check": 5
+      },
+      "value semantics preservation": {
+        "correct mapping or representation": 1
+      }
+    },
+    "relation_by_obligation": {
+      "logical value--storage content": {
+        "initialization before publication": 3
+      },
+      "operation--completion": {
+        "completion and progress": 3,
+        "happens-before ordering": 17,
+        "transformation equivalence": 1
+      },
+      "operation--execution context": {
+        "happens-before ordering": 1,
+        "initialization before publication": 1,
+        "placement and context consistency": 13,
+        "policy and configuration propagation": 5,
+        "resource and capability agreement": 2
+      },
+      "storage--ownership/lifetime": {
+        "completion and progress": 1,
+        "happens-before ordering": 1,
+        "ownership and lifetime": 13,
+        "policy and configuration propagation": 1
+      },
+      "value--operation/identity": {
+        "identity correspondence": 14,
+        "index and offset preservation": 3,
+        "range and alignment safety": 1,
+        "resource and capability agreement": 1,
+        "transformation equivalence": 3,
+        "value semantics preservation": 1
+      },
+      "value--representation": {
+        "index and offset preservation": 1,
+        "representation fidelity": 10,
+        "transformation equivalence": 2
+      },
+      "value--shared storage": {
+        "alias independence": 11,
+        "happens-before ordering": 1,
+        "identity correspondence": 1,
+        "policy and configuration propagation": 1
+      },
+      "value--storage/layout": {
+        "identity correspondence": 1,
+        "index and offset preservation": 14,
+        "layout compatibility": 11,
+        "range and alignment safety": 9,
+        "representation fidelity": 1,
+        "transformation equivalence": 1
+      }
+    },
+    "relation_by_transition": {
+      "logical value--storage content": {
+        "initialization or content update": 3
+      },
+      "operation--completion": {
+        "ordering or completion handoff": 21
+      },
+      "operation--execution context": {
+        "placement or context change": 22
+      },
+      "storage--ownership/lifetime": {
+        "ordering or completion handoff": 1,
+        "ownership or lifetime change": 14,
+        "storage, alias, or mutation change": 1
+      },
+      "value--operation/identity": {
+        "identity or index remapping": 20,
+        "ownership or lifetime change": 2,
+        "storage, alias, or mutation change": 1
+      },
+      "value--representation": {
+        "identity or index remapping": 1,
+        "placement or context change": 1,
+        "representation or layout change": 11
+      },
+      "value--shared storage": {
+        "ordering or completion handoff": 1,
+        "storage, alias, or mutation change": 13
+      },
+      "value--storage/layout": {
+        "identity or index remapping": 10,
+        "initialization or content update": 1,
+        "representation or layout change": 26
+      }
+    }
+  },
+  "distinct_repair_backed_causes": 149,
+  "failure_mode": {
+    "incorrect mapping or translation": 35,
+    "lost or omitted relation": 32,
+    "missing eligibility check": 37,
+    "missing ordering or enforcement": 8,
+    "omitted operation": 5,
+    "premature invalidation or stale state": 3,
+    "premature or unordered transition": 10,
+    "unsound assumption or inference": 19
+  },
+  "multilabel_causes": 68,
+  "obligation_codebook": {
+    "alias independence": "A destructive or reusing action occurs only when observable values do not depend on overlapping storage.",
+    "completion and progress": "Required work completes before access, reuse, or release, and the execution retains a path to completion.",
+    "happens-before ordering": "Dependencies and synchronization order conflicting operations before the later access or state change.",
+    "identity correspondence": "The logical entity, position, or role selects the intended physical entity.",
+    "index and offset preservation": "Coordinate, index, stride contribution, or byte offset denotes the same element or region after translation.",
+    "initialization before publication": "Required content or runtime state is initialized successfully before it becomes observable or usable.",
+    "layout compatibility": "Producer, consumer, view, and interface agree on shape, stride, and physical layout.",
+    "ownership and lifetime": "Every object or reference remains owned and live through its last use and is released exactly once.",
+    "placement and context consistency": "Device, stream, sharding, backend, or execution context remains consistent at use.",
+    "policy and configuration propagation": "A semantic option, copy policy, precision request, or dynamic configuration reaches every decision it governs.",
+    "range and alignment safety": "The selected extent, ordinal, allocation, vector width, or address satisfies its bound or alignment requirement.",
+    "representation fidelity": "Bit width, signedness, precision, dtype, or packed representation preserves the intended value.",
+    "resource and capability agreement": "Compiler assumptions and runtime resources or capabilities agree, or incompatibility is rejected.",
+    "transformation equivalence": "A fusion, rewrite, cache reuse, or fast path is selected only when its semantic preconditions hold.",
+    "value semantics preservation": "A rewrite or state change preserves the value visible to downstream computation."
+  },
+  "obligation_family": {
+    "alias independence": 11,
+    "completion and progress": 4,
+    "happens-before ordering": 20,
+    "identity correspondence": 16,
+    "index and offset preservation": 18,
+    "initialization before publication": 4,
+    "layout compatibility": 11,
+    "ownership and lifetime": 13,
+    "placement and context consistency": 13,
+    "policy and configuration propagation": 7,
+    "range and alignment safety": 10,
+    "representation fidelity": 11,
+    "resource and capability agreement": 3,
+    "transformation equivalence": 7,
+    "value semantics preservation": 1
+  },
+  "primary_category_rule": "Assign the obligation whose violation first permits the physical effect at the earliest invalid decision on the reconstructed failing path; retain other independently necessary conditions as secondary labels.",
+  "provenance_path_length": {
+    "3": 116,
+    "4": 32,
+    "5": 1
+  },
+  "relation_family": {
+    "logical value--storage content": 3,
+    "operation--completion": 21,
+    "operation--execution context": 22,
+    "storage--ownership/lifetime": 16,
+    "value--operation/identity": 23,
+    "value--representation": 13,
+    "value--shared storage": 14,
+    "value--storage/layout": 37
+  },
+  "repair_backed_reports": 162,
+  "repair_strategy": {
+    "constrain unsafe transformation": 8,
+    "correct mapping or representation": 42,
+    "correct ownership or lifetime": 12,
+    "perform omitted operation": 6,
+    "preserve or propagate relation": 32,
+    "restore ordering or synchronization": 11,
+    "strengthen eligibility check": 38
+  },
+  "schema_version": "2.1.0",
+  "secondary_obligation_analysis": {
+    "binary_label_decisions": 2235,
+    "causes_with_consensus_secondary": 68,
+    "cohens_kappa": 0.5665008960921075,
+    "consensus_secondary_labels": 72,
+    "exact_set_agreements": 73,
+    "primary_secondary_pairs": [
+      {
+        "count": 7,
+        "primary": "layout compatibility",
+        "secondary": "index and offset preservation"
+      },
+      {
+        "count": 6,
+        "primary": "happens-before ordering",
+        "secondary": "completion and progress"
+      },
+      {
+        "count": 5,
+        "primary": "index and offset preservation",
+        "secondary": "layout compatibility"
+      },
+      {
+        "count": 4,
+        "primary": "completion and progress",
+        "secondary": "happens-before ordering"
+      },
+      {
+        "count": 4,
+        "primary": "happens-before ordering",
+        "secondary": "alias independence"
+      },
+      {
+        "count": 4,
+        "primary": "placement and context consistency",
+        "secondary": "identity correspondence"
+      },
+      {
+        "count": 3,
+        "primary": "index and offset preservation",
+        "secondary": "identity correspondence"
+      },
+      {
+        "count": 3,
+        "primary": "ownership and lifetime",
+        "secondary": "happens-before ordering"
+      },
+      {
+        "count": 2,
+        "primary": "alias independence",
+        "secondary": "value semantics preservation"
+      },
+      {
+        "count": 2,
+        "primary": "happens-before ordering",
+        "secondary": "transformation equivalence"
+      },
+      {
+        "count": 2,
+        "primary": "ownership and lifetime",
+        "secondary": "completion and progress"
+      },
+      {
+        "count": 2,
+        "primary": "policy and configuration propagation",
+        "secondary": "representation fidelity"
+      },
+      {
+        "count": 2,
+        "primary": "range and alignment safety",
+        "secondary": "layout compatibility"
+      },
+      {
+        "count": 1,
+        "primary": "alias independence",
+        "secondary": "identity correspondence"
+      },
+      {
+        "count": 1,
+        "primary": "alias independence",
+        "secondary": "layout compatibility"
+      },
+      {
+        "count": 1,
+        "primary": "alias independence",
+        "secondary": "ownership and lifetime"
+      },
+      {
+        "count": 1,
+        "primary": "alias independence",
+        "secondary": "transformation equivalence"
+      },
+      {
+        "count": 1,
+        "primary": "completion and progress",
+        "secondary": "ownership and lifetime"
+      },
+      {
+        "count": 1,
+        "primary": "happens-before ordering",
+        "secondary": "identity correspondence"
+      },
+      {
+        "count": 1,
+        "primary": "happens-before ordering",
+        "secondary": "initialization before publication"
+      },
+      {
+        "count": 1,
+        "primary": "happens-before ordering",
+        "secondary": "ownership and lifetime"
+      },
+      {
+        "count": 1,
+        "primary": "identity correspondence",
+        "secondary": "index and offset preservation"
+      },
+      {
+        "count": 1,
+        "primary": "identity correspondence",
+        "secondary": "ownership and lifetime"
+      },
+      {
+        "count": 1,
+        "primary": "index and offset preservation",
+        "secondary": "representation fidelity"
+      },
+      {
+        "count": 1,
+        "primary": "initialization before publication",
+        "secondary": "resource and capability agreement"
+      },
+      {
+        "count": 1,
+        "primary": "layout compatibility",
+        "secondary": "alias independence"
+      },
+      {
+        "count": 1,
+        "primary": "layout compatibility",
+        "secondary": "placement and context consistency"
+      },
+      {
+        "count": 1,
+        "primary": "ownership and lifetime",
+        "secondary": "identity correspondence"
+      },
+      {
+        "count": 1,
+        "primary": "ownership and lifetime",
+        "secondary": "range and alignment safety"
+      },
+      {
+        "count": 1,
+        "primary": "policy and configuration propagation",
+        "secondary": "completion and progress"
+      },
+      {
+        "count": 1,
+        "primary": "policy and configuration propagation",
+        "secondary": "ownership and lifetime"
+      },
+      {
+        "count": 1,
+        "primary": "range and alignment safety",
+        "secondary": "identity correspondence"
+      },
+      {
+        "count": 1,
+        "primary": "representation fidelity",
+        "secondary": "identity correspondence"
+      },
+      {
+        "count": 1,
+        "primary": "representation fidelity",
+        "secondary": "value semantics preservation"
+      },
+      {
+        "count": 1,
+        "primary": "resource and capability agreement",
+        "secondary": "policy and configuration propagation"
+      },
+      {
+        "count": 1,
+        "primary": "transformation equivalence",
+        "secondary": "happens-before ordering"
+      },
+      {
+        "count": 1,
+        "primary": "transformation equivalence",
+        "secondary": "index and offset preservation"
+      },
+      {
+        "count": 1,
+        "primary": "transformation equivalence",
+        "secondary": "value semantics preservation"
+      },
+      {
+        "count": 1,
+        "primary": "value semantics preservation",
+        "secondary": "identity correspondence"
+      }
+    ],
+    "raw_label_agreement": 0.9552572706935123,
+    "resolution_rule": "A label is published as secondary only when both independent reviewers selected it after the reconciled primary label is removed from each set."
+  },
+  "transition_family": {
+    "identity or index remapping": 31,
+    "initialization or content update": 4,
+    "ordering or completion handoff": 23,
+    "ownership or lifetime change": 16,
+    "placement or context change": 23,
+    "representation or layout change": 37,
+    "storage, alias, or mutation change": 15
+  }
+}

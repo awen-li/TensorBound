@@ -1,0 +1,54 @@
+From 21addb84a7f3689ebbd714b134dc43612b518a83 Mon Sep 17 00:00:00 2001
+From: Dan Foreman-Mackey <danfm@google.com>
+Date: Tue, 28 Jan 2025 18:22:55 -0800
+Subject: [PATCH] Always dispatch CPU executables synchronously when they
+ include callbacks.
+
+As discussed in https://github.com/jax-ml/jax/issues/25861 and https://github.com/jax-ml/jax/issues/24255, using host callbacks within an asynchronously-dispatched CPU executable can deadlock when the body of the callback itself asynchronously dispatches JAX CPU code. My rough understanding of the problem is that the XLA intra op thread pool gets filled up with callbacks waiting for their body to execute, but there aren't enough resources to schedule the inner computations.
+
+There's probably a better way to fix this within XLA:CPU, but the temporary fix that I've come up with is to disable asynchronous dispatch on CPU when either:
+
+1. Executing a program that includes any host callbacks, or
+2. when running within the body of a callback.
+
+It seems like both of these conditions are needed in general because I was able to find test cases that failed with just one or the other implemented.
+
+This PR includes just the first change, and the second will be implemented in a follow-up.
+
+PiperOrigin-RevId: 720777713
+---
+ xla/python/pjrt_ifrt/pjrt_executable.cc | 7 +++++++
+ xla/python/xla_client.py                | 2 +-
+ 2 files changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/xla/python/pjrt_ifrt/pjrt_executable.cc b/xla/python/pjrt_ifrt/pjrt_executable.cc
+index f243a7f8d7d50..26611a302dcec 100644
+--- a/xla/python/pjrt_ifrt/pjrt_executable.cc
++++ b/xla/python/pjrt_ifrt/pjrt_executable.cc
+@@ -554,6 +554,13 @@ PjRtLoadedExecutable::Execute(
+         client_->runtime_type());
+   }
+ 
++  // When using host callbacks on CPU, we need to use synchronous dispatch to
++  // avoid deadlocks with reentrant callbacks. Note that this option only
++  // affects the CPU runtime.
++  if (!all_loaded_host_callbacks_->empty()) {
++    opts.execution_mode = xla::ExecuteOptions::ExecutionMode::kSynchronous;
++  }
++
+   std::unique_ptr<HostCallbackStates> host_callback_states;
+   if (!host_send_recv_callbacks_.empty()) {
+     host_callback_states = std::make_unique<HostCallbackStates>();
+diff --git a/xla/python/xla_client.py b/xla/python/xla_client.py
+index eaa783ccb4005..430d3d8c35fed 100644
+--- a/xla/python/xla_client.py
++++ b/xla/python/xla_client.py
+@@ -50,7 +50,7 @@
+ 
+ # Just an internal arbitrary increasing number to help with backward-compatible
+ # changes. In JAX, reference this via jax._src.lib.xla_extension_version.
+-_version = 305
++_version = 306
+ 
+ # Version number for MLIR:Python components.
+ mlir_api_version = 57

@@ -1,0 +1,125 @@
+From c2f6035ee4fa1d53cdfb7a7aff5a6c541b36b4c3 Mon Sep 17 00:00:00 2001
+From: Adrian Kuegel <akuegel@google.com>
+Date: Tue, 15 Sep 2026 05:33:31 -0700
+Subject: [PATCH] [XLA:CPU] Read scatter operand from loop-carried output
+ tensor
+
+In `EmitScatterComputation`, `ProvideParameterRange` emitted an
+`xla.pure_call` that read the scatter operand from the entry function
+argument (`%arg0`) instead of the loop-carried `output_tensors` (`iter_args`
+of the scatter loop). When the scatter destination index is loop-invariant
+(such as when `scatter_dims_to_operand_dims` is empty and the update window
+has 1 element), MLIR's LICM hoisted `tensor.extract %arg0[%c0]` out of the
+loop, causing every iteration to combine its update with the initial operand
+value rather than the accumulated value.
+
+Extract the current operand element directly from `output_tensors` using
+`tensor::ExtractOp` so that the SSA dependency on the loop-carried tensor is
+preserved across iterations.
+
+Fixes https://github.com/openxla/xla/issues/48716
+
+PiperOrigin-RevId: 981759824
+---
+ .../emitters/cpu_fusion_emitter_test.cc       |  2 +-
+ .../codegen/emitters/cpu_scatter_emitter.cc   | 22 +++++++--------
+ xla/tests/scatter_test.cc                     | 28 +++++++++++++++++++
+ 3 files changed, 40 insertions(+), 12 deletions(-)
+
+diff --git a/xla/backends/cpu/codegen/emitters/cpu_fusion_emitter_test.cc b/xla/backends/cpu/codegen/emitters/cpu_fusion_emitter_test.cc
+index 230ed3d661463..8936c990b56ef 100644
+--- a/xla/backends/cpu/codegen/emitters/cpu_fusion_emitter_test.cc
++++ b/xla/backends/cpu/codegen/emitters/cpu_fusion_emitter_test.cc
+@@ -103,7 +103,7 @@ TEST_F(CpuFusionEmitterTest, ScatterMlir) {
+     CHECK:           xla.pure_call
+     CHECK:           scf.if
+     CHECK:             xla.pure_call
+-    CHECK:             xla.pure_call
++    CHECK:             tensor.extract
+     CHECK:             arith.addf
+     CHECK:           return %[[XLA_LOOP]]
+   )";
+diff --git a/xla/backends/cpu/codegen/emitters/cpu_scatter_emitter.cc b/xla/backends/cpu/codegen/emitters/cpu_scatter_emitter.cc
+index b4a9943744d33..e50cec94c38d9 100644
+--- a/xla/backends/cpu/codegen/emitters/cpu_scatter_emitter.cc
++++ b/xla/backends/cpu/codegen/emitters/cpu_scatter_emitter.cc
+@@ -151,17 +151,18 @@ std::optional<IndexingMap> CpuScatterFusion::ComputeThreadIdToInputIndexing(
+ SmallVector<Value> EmitScatterComputation(
+     int64_t num_threads, const HloScatterInstruction* scatter,
+     ValueRange indices, ValueRange update_elems, ValueRange output_tensors,
+-    const emitters::PartitionedComputation& root_computation,
+     const emitters::CallTargetProvider& call_targets,
+-    mlir::func::FuncOp entry_function, mlir::ImplicitLocOpBuilder& b) {
++    mlir::ImplicitLocOpBuilder& b) {
+   auto reducer =
+       call_targets(scatter->called_computations()[0]->root_instruction());
+   if (scatter->unique_indices() || num_threads == 1 ||
+       scatter->scatter_operand_count() > 1) {
+-    SmallVector<Value> computation_args =
+-        ProvideParameterRange(root_computation, scatter, /*start=*/0,
+-                              /*num=*/scatter->scatter_operand_count(), indices,
+-                              call_targets, entry_function, b);
++    SmallVector<Value> computation_args;
++    computation_args.reserve(output_tensors.size() + update_elems.size());
++    for (Value output_tensor : output_tensors) {
++      computation_args.push_back(
++          mlir::tensor::ExtractOp::create(b, output_tensor, indices));
++    }
+     computation_args.append(update_elems.begin(), update_elems.end());
+     auto reduced_values =
+         emitters::InlineBlock(b, reducer.getBody().front(), computation_args);
+@@ -441,11 +442,10 @@ absl::Status CpuScatterFusion::EmitEntryFunction(
+                                 update_indices[i + 1], output_indices[i]);
+                       }
+                       SmallVector<Value> updated_outputs =
+-                          EmitScatterComputation(
+-                              num_threads_, scatter, output_indices,
+-                              update_elems, output_tensors, root_computation,
+-                              call_targets, entry_function,
+-                              implicit_then_builder);
++                          EmitScatterComputation(num_threads_, scatter,
++                                                 output_indices, update_elems,
++                                                 output_tensors, call_targets,
++                                                 implicit_then_builder);
+                       implicit_then_builder.create<scf::YieldOp>(
+                           updated_outputs);
+                     },
+diff --git a/xla/tests/scatter_test.cc b/xla/tests/scatter_test.cc
+index 88e7fe72f7ff2..664532c03c793 100644
+--- a/xla/tests/scatter_test.cc
++++ b/xla/tests/scatter_test.cc
+@@ -1085,6 +1085,34 @@ ENTRY main.2 {
+   RunTest(hlo_text, {&updates});
+ }
+ 
++TEST_F(ScatterTest, EmptyIndexVector) {
++  const std::string hlo_text = R"(
++HloModule ScatterEmptyIndexVector
++
++mul_s32 (lhs: s32[], rhs: s32[]) -> s32[] {
++  lhs = s32[] parameter(0)
++  rhs = s32[] parameter(1)
++  ROOT mul = s32[] multiply(lhs, rhs)
++}
++
++ENTRY main {
++  operand = s32[1]{0} parameter(0)
++  indices = s32[2,0]{1,0} parameter(1)
++  updates = s32[2,1]{1,0} parameter(2)
++  ROOT scatter = s32[1]{0} scatter(operand, indices, updates),
++      update_window_dims={1},
++      inserted_window_dims={},
++      scatter_dims_to_operand_dims={},
++      index_vector_dim=1,
++      to_apply=mul_s32
++}
++)";
++  Literal operand = LiteralUtil::CreateR1<int32_t>({1});
++  Literal scatter_indices(ShapeUtil::MakeShape(S32, {2, 0}));
++  Literal updates = LiteralUtil::CreateR2<int32_t>({{2}, {3}});
++  RunTest(hlo_text, &operand, &scatter_indices, &updates);
++}
++
+ // Test min/max/add scatters with edge-case values.
+ class ScatterEdgeCaseTestP
+     : public ScatterTest,

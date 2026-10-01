@@ -1,0 +1,508 @@
+From 12430eb30bfb01ea38d113bcebe1667e60bc726f Mon Sep 17 00:00:00 2001
+From: "meadowlark@google.com" <meadowlark@google.com>
+Date: Wed, 7 Apr 2021 23:36:55 -0500
+Subject: [PATCH 1/3] Add support for returning Python lists
+
+---
+ bindings/python/iree/runtime/function_abi.cc  |  2 +-
+ .../python/iree/tf/support/tf_utils.py        |  3 +-
+ integrations/tensorflow/e2e/BUILD             |  2 +
+ integrations/tensorflow/e2e/CMakeLists.txt    |  3 +-
+ integrations/tensorflow/e2e/fft_test.py       | 90 +++++--------------
+ integrations/tensorflow/e2e/pytree_test.py    | 69 ++++++++++++++
+ 6 files changed, 96 insertions(+), 73 deletions(-)
+ create mode 100644 integrations/tensorflow/e2e/pytree_test.py
+
+diff --git a/bindings/python/iree/runtime/function_abi.cc b/bindings/python/iree/runtime/function_abi.cc
+index ad6592182dbd..46b3cb057177 100644
+--- a/bindings/python/iree/runtime/function_abi.cc
++++ b/bindings/python/iree/runtime/function_abi.cc
+@@ -213,7 +213,7 @@ class SipStructureResultsVisitor {
+           bool extended = false;
+           int list_size = l.size();
+           if (list_size <= index) {
+-            while (l.size() <= index) {
++            while (l.size() < index) {
+               l.append(py::none());
+               extended = true;
+             }
+diff --git a/integrations/tensorflow/bindings/python/iree/tf/support/tf_utils.py b/integrations/tensorflow/bindings/python/iree/tf/support/tf_utils.py
+index a700395f2602..176c8c7a4ad5 100644
+--- a/integrations/tensorflow/bindings/python/iree/tf/support/tf_utils.py
++++ b/integrations/tensorflow/bindings/python/iree/tf/support/tf_utils.py
+@@ -166,8 +166,7 @@ def decorator(*args, **kwargs):
+     for real, imag in zip(args[::2], args[1::2]):
+       inputs.append(tf.complex(real, imag))
+     result = function(*inputs, **kwargs)
+-    # TODO(meadowlark): Support returning complex numbers.
+-    return tf.math.real(result) + tf.math.imag(result)
++    return [tf.math.real(result), tf.math.imag(result)]
+ 
+   return decorator
+ 
+diff --git a/integrations/tensorflow/e2e/BUILD b/integrations/tensorflow/e2e/BUILD
+index ceb80fa53b57..3c44ab913c67 100644
+--- a/integrations/tensorflow/e2e/BUILD
++++ b/integrations/tensorflow/e2e/BUILD
+@@ -72,6 +72,7 @@ ALL_SRCS = [
+     "mandelbrot_test.py",
+     "matrix_ops_dynamic_test.py",
+     "matrix_ops_static_test.py",
++    "pytree_test.py",
+     "quantization_dyn_test.py",
+     "quantization_test.py",
+     "range_test.py",
+@@ -96,6 +97,7 @@ TFLITE_FAILING = [
+     "gather_test.py",
+     "image_resize_test.py",
+     "mandelbrot_test.py",
++    "pytree_test.py",
+     "resource_ops_test.py",
+     "ring_buffer_test.py",
+     "scatter_update_test.py",
+diff --git a/integrations/tensorflow/e2e/CMakeLists.txt b/integrations/tensorflow/e2e/CMakeLists.txt
+index 846a1f9efe43..401851973a7c 100644
+--- a/integrations/tensorflow/e2e/CMakeLists.txt
++++ b/integrations/tensorflow/e2e/CMakeLists.txt
+@@ -19,7 +19,7 @@ iree_e2e_cartesian_product_test_suite(
+     "target_backends"
+     "reference_backend"
+   MATRIX_VALUES
+-    "batch_norm_test.py;batch_to_space_nd_test.py;broadcast_to_test.py;broadcasting_test.py;concat_test.py;control_flow_test.py;conv_test.py;conv_transpose_test.py;depth_conv_test.py;dynamic_mlp_relu_test.py;dynamic_mlp_test.py;einsum_dynamic_test.py;einsum_static_test.py;einsum_vector_test.py;fft_test.py;fill_test.py;gather_test.py;image_resize_test.py;linspace_test.py;mandelbrot_test.py;matrix_ops_dynamic_test.py;matrix_ops_static_test.py;quantization_dyn_test.py;quantization_test.py;range_test.py;resource_ops_test.py;ring_buffer_test.py;scatter_update_test.py;simple_arithmetic_test.py;simple_stateful_test.py;sliding_window_test.py;space_to_batch_nd_test.py;strings_test.py;tensorlist_test.py"
++    "batch_norm_test.py;batch_to_space_nd_test.py;broadcast_to_test.py;broadcasting_test.py;concat_test.py;control_flow_test.py;conv_test.py;conv_transpose_test.py;depth_conv_test.py;dynamic_mlp_relu_test.py;dynamic_mlp_test.py;einsum_dynamic_test.py;einsum_static_test.py;einsum_vector_test.py;fft_test.py;fill_test.py;gather_test.py;image_resize_test.py;linspace_test.py;mandelbrot_test.py;matrix_ops_dynamic_test.py;matrix_ops_static_test.py;pytree_test.py;quantization_dyn_test.py;quantization_test.py;range_test.py;resource_ops_test.py;ring_buffer_test.py;scatter_update_test.py;simple_arithmetic_test.py;simple_stateful_test.py;sliding_window_test.py;space_to_batch_nd_test.py;strings_test.py;tensorlist_test.py"
+     "tf;tflite;iree_vmla;iree_llvmaot;iree_vulkan"
+     "tf"
+   FAILING_CONFIGURATIONS
+@@ -31,6 +31,7 @@ iree_e2e_cartesian_product_test_suite(
+     "gather_test.py,tflite,"
+     "image_resize_test.py,tflite,"
+     "mandelbrot_test.py,tflite,"
++    "pytree_test.py,tflite,"
+     "resource_ops_test.py,tflite,"
+     "ring_buffer_test.py,tflite,"
+     "scatter_update_test.py,tflite,"
+diff --git a/integrations/tensorflow/e2e/fft_test.py b/integrations/tensorflow/e2e/fft_test.py
+index c16a77249a16..ffa6b7156ac3 100644
+--- a/integrations/tensorflow/e2e/fft_test.py
++++ b/integrations/tensorflow/e2e/fft_test.py
+@@ -19,48 +19,28 @@
+ 
+ 
+ class FftModule(tf.Module):
+-  # TODO(natashaknk) when multiple outputs are supported, make into one test.
+ 
+   complex_input_signature = [
+       tf.TensorSpec([16], tf.float32),
+       tf.TensorSpec([16], tf.float32)
+   ]
+ 
+-  real_input_signature = [tf.TensorSpec([32], tf.float32)]
+-
+-  @tf.function(input_signature=complex_input_signature)
+-  def fft_real(self, real_array, imag_array):
+-    complex_in = tf.complex(real_array, imag_array)
+-    complex_out = tf.signal.fft(complex_in)
+-    return tf.math.real(complex_out)
+-
+   @tf.function(input_signature=complex_input_signature)
+-  def fft_imag(self, real_array, imag_array):
++  def fft(self, real_array, imag_array):
+     complex_in = tf.complex(real_array, imag_array)
+     complex_out = tf.signal.fft(complex_in)
+-    return tf.math.imag(complex_out)
++    return [tf.math.real(complex_out), tf.math.imag(complex_out)]
+ 
+   @tf.function(input_signature=complex_input_signature)
+-  def ifft_real(self, real_array, imag_array):
++  def ifft(self, real_array, imag_array):
+     complex_in = tf.complex(real_array, imag_array)
+     complex_out = tf.signal.ifft(complex_in)
+-    return tf.math.real(complex_out)
++    return [tf.math.real(complex_out), tf.math.imag(complex_out)]
+ 
+-  @tf.function(input_signature=complex_input_signature)
+-  def ifft_imag(self, real_array, imag_array):
+-    complex_in = tf.complex(real_array, imag_array)
+-    complex_out = tf.signal.ifft(complex_in)
+-    return tf.math.imag(complex_out)
+-
+-  @tf.function(input_signature=real_input_signature)
+-  def rfft_real(self, real_array):
+-    complex_out = tf.signal.rfft(real_array)
+-    return tf.math.real(complex_out)
+-
+-  @tf.function(input_signature=real_input_signature)
+-  def rfft_imag(self, real_array):
++  @tf.function(input_signature=[tf.TensorSpec([32], tf.float32)])
++  def rfft(self, real_array):
+     complex_out = tf.signal.rfft(real_array)
+-    return tf.math.imag(complex_out)
++    return [tf.math.real(complex_out), tf.math.imag(complex_out)]
+ 
+   # TODO(natashaknk): Enable IRFFT tests when Linalg on tensors changes land.
+   # @tf.function(input_signature=complex_input_signature)
+@@ -90,56 +70,28 @@ def __init__(self, *args, **kwargs):
+     self.long_real_array = np.concatenate((self.real_array, self.real_array),
+                                           axis=None)
+ 
+-  def test_fft_real(self):
+-
+-    def fft_real(module):
+-      module.fft_real(self.real_array, self.imag_array, rtol=1e-4)
+-
+-    self.compare_backends(fft_real, self._modules)
+-
+-  def test_fft_imag(self):
+-
+-    def fft_imag(module):
+-      module.fft_imag(self.real_array, self.imag_array, rtol=1e-4)
++  # yapf: disable
++  def test_fft(self):
++    def fft(module):
++      module.fft(self.real_array, self.imag_array, rtol=1e-4)
++    self.compare_backends(fft, self._modules)
+ 
+-    self.compare_backends(fft_imag, self._modules)
+-
+-  def test_ifft_real(self):
+-
+-    def ifft_real(module):
+-      module.ifft_real(self.real_array, self.imag_array, rtol=1e-4)
+-
+-    self.compare_backends(ifft_real, self._modules)
+-
+-  def test_ifft_imag(self):
+-
+-    def ifft_imag(module):
+-      module.ifft_imag(self.real_array, self.imag_array, rtol=1e-4)
+-
+-    self.compare_backends(ifft_imag, self._modules)
+-
+-  def test_rfft_real(self):
+-
+-    def rfft_real(module):
+-      module.rfft_real(self.long_real_array, rtol=1e-4)
+-
+-    self.compare_backends(rfft_real, self._modules)
+-
+-  def test_rfft_imag(self):
+-
+-    def rfft_imag(module):
+-      module.rfft_imag(self.long_real_array, rtol=1e-4)
+-
+-    self.compare_backends(rfft_imag, self._modules)
++  def test_ifft(self):
++    def ifft(module):
++      module.ifft(self.real_array, self.imag_array, rtol=1e-4)
++    self.compare_backends(ifft, self._modules)
+ 
++  def test_rfft(self):
++    def rfft(module):
++      module.rfft(self.long_real_array, rtol=1e-4)
++    self.compare_backends(rfft, self._modules)
+ 
+ # TODO(natashaknk): Enable IRFFT tests when Linalg on tensors changes land.
+ #   def test_irfft(self):
+-
+ #     def irfft(module):
+ #       module.irfft(self.real_array, self.imag_array, rtol=1e-4)
+-
+ #     self.compare_backends(irfft, self._modules)
++# yapf: enable
+ 
+ 
+ def main(argv):
+diff --git a/integrations/tensorflow/e2e/pytree_test.py b/integrations/tensorflow/e2e/pytree_test.py
+new file mode 100644
+index 000000000000..a9f4d00aa38f
+--- /dev/null
++++ b/integrations/tensorflow/e2e/pytree_test.py
+@@ -0,0 +1,69 @@
++# Copyright 2021 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#      https://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from absl import app
++from iree.tf.support import tf_test_utils
++import tensorflow as tf
++
++
++# Empty lists and dicts are currently unsupported. IREE also currently does not
++# preserve tuples but converts them into lists.
++class PyTreeModule(tf_test_utils.TestModule):
++
++  @tf_test_utils.tf_function_unit_test(input_signature=[])
++  def output_list_len_1(self):
++    return [0]
++
++  @tf_test_utils.tf_function_unit_test(input_signature=[])
++  def output_list_len_2(self):
++    return [0, 1]
++
++  @tf_test_utils.tf_function_unit_test(input_signature=[])
++  def output_list_len_3(self):
++    return [0, 1, 2]
++
++  @tf_test_utils.tf_function_unit_test(input_signature=[])
++  def output_nested_pytree(self):
++    return {"key_a": [0, 1, 2], "key_b": [0, 1, {"key_c": [0, 1]}]}
++
++  @tf_test_utils.tf_function_unit_test(input_signature=[{
++      "key_a": [tf.TensorSpec([]),
++                tf.TensorSpec([]),
++                tf.TensorSpec([])],
++      "key_b": [
++          tf.TensorSpec([]),
++          tf.TensorSpec([]), {
++              "key_c": [tf.TensorSpec([]), tf.TensorSpec([])]
++          }
++      ]
++  }])
++  def input_nested_pytree(self, input_pytree):
++    return input_pytree
++
++
++class PyTreeTest(tf_test_utils.TracedModuleTestCase):
++
++  def __init__(self, *args, **kwargs):
++    super().__init__(*args, **kwargs)
++    self._modules = tf_test_utils.compile_tf_module(PyTreeModule)
++
++
++def main(argv):
++  del argv  # Unused
++  PyTreeTest.generate_unit_tests(PyTreeModule)
++  tf.test.main()
++
++
++if __name__ == '__main__':
++  app.run(main)
+
+From 6826b19745c9477dd142a0e2590349954690b5b0 Mon Sep 17 00:00:00 2001
+From: "meadowlark@google.com" <meadowlark@google.com>
+Date: Thu, 8 Apr 2021 12:15:16 -0500
+Subject: [PATCH 2/3] Pin yapf to 0.30.0 to avoid
+ https://github.com/google/yapf/issues/913
+
+---
+ .github/workflows/lint.yml              | 3 ++-
+ integrations/tensorflow/e2e/fft_test.py | 1 -
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/.github/workflows/lint.yml b/.github/workflows/lint.yml
+index 106bde0572ac..c349e61af385 100644
+--- a/.github/workflows/lint.yml
++++ b/.github/workflows/lint.yml
+@@ -56,7 +56,8 @@ jobs:
+         # We have to explicitly fetch the base branch as well
+         run: git fetch --no-tags --prune --depth=1 origin "${BASE_REF?}:${BASE_REF?}"
+       - name: Install yapf
+-        run: python3 -m pip install yapf
++        run: |
++          python3 -m pip install yapf==0.30.0
+       - name: Run format_diff.py with yapf
+         run: |
+           git diff -U0 "${BASE_REF?}" | python3 third_party/format_diff/format_diff.py yapf -i
+diff --git a/integrations/tensorflow/e2e/fft_test.py b/integrations/tensorflow/e2e/fft_test.py
+index ffa6b7156ac3..f662985e3984 100644
+--- a/integrations/tensorflow/e2e/fft_test.py
++++ b/integrations/tensorflow/e2e/fft_test.py
+@@ -100,6 +100,5 @@ def main(argv):
+     tf.enable_v2_behavior()
+   tf.test.main()
+ 
+-
+ if __name__ == '__main__':
+   app.run(main)
+
+From 396d250909901a3351f85c81463f14c051063c32 Mon Sep 17 00:00:00 2001
+From: "meadowlark@google.com" <meadowlark@google.com>
+Date: Thu, 8 Apr 2021 16:58:26 -0500
+Subject: [PATCH 3/3] Interpret SIP ABI sequences as Tuples
+
+---
+ bindings/python/iree/runtime/system_api.py    | 29 ++++++++++++++---
+ .../python/iree/tf/support/tf_utils.py        |  3 +-
+ integrations/tensorflow/e2e/fft_test.py       |  6 ++--
+ integrations/tensorflow/e2e/pytree_test.py    | 31 ++++++++-----------
+ 4 files changed, 43 insertions(+), 26 deletions(-)
+
+diff --git a/bindings/python/iree/runtime/system_api.py b/bindings/python/iree/runtime/system_api.py
+index fc7f7aadd6f2..ab7e5f0a417b 100644
+--- a/bindings/python/iree/runtime/system_api.py
++++ b/bindings/python/iree/runtime/system_api.py
+@@ -36,7 +36,7 @@
+ import os
+ import sys
+ 
+-from typing import Any, List, Optional, Sequence, Tuple, Union
++from typing import Any, List, Mapping, Optional, Sequence, Tuple, Union
+ 
+ from . import binding as _binding
+ 
+@@ -139,9 +139,7 @@ def _bool_to_int8(
+     return array
+ 
+   # IREE models booleans as i8s.
+-  # TODO: This cast should be moved into the function abi. If it's possible to
+-  # tell that the result should have boolean type from the IR, then the return
+-  # type should also be recast to np.bool at that level.
++  # TODO(#5359): This cast should be moved into the function abi.
+   if array.dtype == np.bool:
+     array = array.astype(np.int8)
+   return array
+@@ -158,6 +156,7 @@ def normalize_value(
+     return value
+ 
+   array = np.asarray(value)
++  # TODO(#5359): Move into the function abi.
+   if isinstance(value, (bool, int, float)):
+     # Manually convert ints and floats to 32 bits.
+     if array.dtype == np.float64:
+@@ -168,6 +167,17 @@ def normalize_value(
+   return array
+ 
+ 
++def _convert_lists_to_tuples(pytree):
++  if isinstance(pytree, Sequence):
++    return tuple(_convert_lists_to_tuples(leaf) for leaf in pytree)
++  elif isinstance(pytree, Mapping):
++    for key in pytree:
++      pytree[key] = _convert_lists_to_tuples(pytree[key])
++    return pytree
++  else:
++    return pytree
++
++
+ class BoundFunction:
+   """Wraps a VmFunction, VmContext and ABI into a pythonic function."""
+ 
+@@ -195,6 +205,17 @@ def __call__(self, *args, **kwargs):
+     self._context._vm_context.invoke(self._vm_function, inputs, results)
+     self._serialized_outputs = tuple(self._abi.serialize_vm_list(results))
+     unpacked_results = self._abi.unpack_results(results)
++
++    # TODO(#5359): Add support for list and tuple return types.
++    # The SIP signature used by the runtime bindings cannot differentiate
++    # between Lists and Tuples, as it only has a single 'sequence' type.
++    # The function abi uses py::list when unpacking the results according to the
++    # SIP signature. The most common instance of a returned Sequence in Python
++    # however is multiple return values, and that is represented by a tuple.
++    # We manually change the return types of all Sequences to Tuple in order to
++    # match the semantics of this case.
++    unpacked_results = _convert_lists_to_tuples(unpacked_results)
++
+     return unpacked_results
+ 
+   def __repr__(self):
+diff --git a/integrations/tensorflow/bindings/python/iree/tf/support/tf_utils.py b/integrations/tensorflow/bindings/python/iree/tf/support/tf_utils.py
+index 176c8c7a4ad5..f5f0258ceb46 100644
+--- a/integrations/tensorflow/bindings/python/iree/tf/support/tf_utils.py
++++ b/integrations/tensorflow/bindings/python/iree/tf/support/tf_utils.py
+@@ -166,7 +166,7 @@ def decorator(*args, **kwargs):
+     for real, imag in zip(args[::2], args[1::2]):
+       inputs.append(tf.complex(real, imag))
+     result = function(*inputs, **kwargs)
+-    return [tf.math.real(result), tf.math.imag(result)]
++    return tf.math.real(result), tf.math.imag(result)
+ 
+   return decorator
+ 
+@@ -235,6 +235,7 @@ def check_same(ref: Any, tar: Any, rtol: float,
+ 
+   # Base check for numpy arrays.
+   elif isinstance(ref, np.ndarray):
++    # TODO(#5359): Simplify this and verify that the types are actually the same
+     # Ignore np.bool != np.int8 because the IREE python runtime awkwardly
+     # returns np.int8s instead of np.bools.
+     if ref.dtype != tar.dtype and not (
+diff --git a/integrations/tensorflow/e2e/fft_test.py b/integrations/tensorflow/e2e/fft_test.py
+index f662985e3984..5c9bb01632fb 100644
+--- a/integrations/tensorflow/e2e/fft_test.py
++++ b/integrations/tensorflow/e2e/fft_test.py
+@@ -29,18 +29,18 @@ class FftModule(tf.Module):
+   def fft(self, real_array, imag_array):
+     complex_in = tf.complex(real_array, imag_array)
+     complex_out = tf.signal.fft(complex_in)
+-    return [tf.math.real(complex_out), tf.math.imag(complex_out)]
++    return tf.math.real(complex_out), tf.math.imag(complex_out)
+ 
+   @tf.function(input_signature=complex_input_signature)
+   def ifft(self, real_array, imag_array):
+     complex_in = tf.complex(real_array, imag_array)
+     complex_out = tf.signal.ifft(complex_in)
+-    return [tf.math.real(complex_out), tf.math.imag(complex_out)]
++    return tf.math.real(complex_out), tf.math.imag(complex_out)
+ 
+   @tf.function(input_signature=[tf.TensorSpec([32], tf.float32)])
+   def rfft(self, real_array):
+     complex_out = tf.signal.rfft(real_array)
+-    return [tf.math.real(complex_out), tf.math.imag(complex_out)]
++    return tf.math.real(complex_out), tf.math.imag(complex_out)
+ 
+   # TODO(natashaknk): Enable IRFFT tests when Linalg on tensors changes land.
+   # @tf.function(input_signature=complex_input_signature)
+diff --git a/integrations/tensorflow/e2e/pytree_test.py b/integrations/tensorflow/e2e/pytree_test.py
+index a9f4d00aa38f..be11892e10d4 100644
+--- a/integrations/tensorflow/e2e/pytree_test.py
++++ b/integrations/tensorflow/e2e/pytree_test.py
+@@ -17,36 +17,31 @@
+ import tensorflow as tf
+ 
+ 
+-# Empty lists and dicts are currently unsupported. IREE also currently does not
+-# preserve tuples but converts them into lists.
++# Empty lists and dicts are currently unsupported. IREE also currently cannot
++# represent multiple sequence types, so we turn all sequences into tuples.
+ class PyTreeModule(tf_test_utils.TestModule):
+ 
+   @tf_test_utils.tf_function_unit_test(input_signature=[])
+-  def output_list_len_1(self):
+-    return [0]
++  def output_tuple_len_1(self):
++    return (0,)
+ 
+   @tf_test_utils.tf_function_unit_test(input_signature=[])
+-  def output_list_len_2(self):
+-    return [0, 1]
++  def output_tuple_len_2(self):
++    return 0, 1
+ 
+   @tf_test_utils.tf_function_unit_test(input_signature=[])
+-  def output_list_len_3(self):
+-    return [0, 1, 2]
++  def output_tuple_len_3(self):
++    return 0, 1, 2
+ 
+   @tf_test_utils.tf_function_unit_test(input_signature=[])
+   def output_nested_pytree(self):
+-    return {"key_a": [0, 1, 2], "key_b": [0, 1, {"key_c": [0, 1]}]}
++    return {"key_a": (0, 1, 2), "key_b": (0, 1, {"key_c": (0, 1)})}
+ 
+   @tf_test_utils.tf_function_unit_test(input_signature=[{
+-      "key_a": [tf.TensorSpec([]),
+-                tf.TensorSpec([]),
+-                tf.TensorSpec([])],
+-      "key_b": [
+-          tf.TensorSpec([]),
+-          tf.TensorSpec([]), {
+-              "key_c": [tf.TensorSpec([]), tf.TensorSpec([])]
+-          }
+-      ]
++      "key_a": (tf.TensorSpec([]), tf.TensorSpec([]), tf.TensorSpec([])),
++      "key_b": (tf.TensorSpec([]), tf.TensorSpec([]), {
++          "key_c": (tf.TensorSpec([]), tf.TensorSpec([]))
++      })
+   }])
+   def input_nested_pytree(self, input_pytree):
+     return input_pytree

@@ -1,0 +1,43 @@
+From 7fbbe0190ccd98b6ae73ed1db39f4d9e6ab14e7b Mon Sep 17 00:00:00 2001
+From: Yash Katariya <yashkatariya@google.com>
+Date: Sat, 21 Feb 2026 13:04:23 -0800
+Subject: [PATCH] Canonicalize indexer.slice_sharding. Fixes
+ https://github.com/jax-ml/jax/issues/35273
+
+PiperOrigin-RevId: 873414882
+---
+ jax/_src/numpy/indexing.py | 3 ++-
+ tests/multi_device_test.py | 6 ++++++
+ 2 files changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/jax/_src/numpy/indexing.py b/jax/_src/numpy/indexing.py
+index c8d393c611fa..f886523a54cd 100644
+--- a/jax/_src/numpy/indexing.py
++++ b/jax/_src/numpy/indexing.py
+@@ -1460,7 +1460,8 @@ def _index_to_gather(indexer: NDIndexer, *, x_sharding: NamedSharding | Any,
+     collapsed_slice_dims = tuple(sorted(collapsed_slice_dims)),
+     start_index_map = tuple(start_index_map)
+   )
+-  slice_sharding = x_sharding.update(spec=slice_spec)
++  slice_sharding = canonicalize_sharding(x_sharding.update(spec=slice_spec),
++                                         "index_to_gather")
+   return _GatherIndexer(
+     slice_shape=slice_shape,
+     newaxis_dims=tuple(newaxis_dims),
+diff --git a/tests/multi_device_test.py b/tests/multi_device_test.py
+index 5b04fa3b2749..f2e80077161a 100644
+--- a/tests/multi_device_test.py
++++ b/tests/multi_device_test.py
+@@ -343,6 +343,12 @@ def test_full_like_replicated_sharding_different_shape(self):
+     y = jax.lax.full_like(x, 1, shape=(5,))
+     self.assertEqual(x.sharding, y.sharding)
+ 
++  def test_indexing_empty_shape_preserves_sharding(self):
++    dev = self.get_devices()[1]
++    cpu_array = jnp.asarray([1], device=dev)
++    masked = cpu_array[jnp.asarray([False], device=dev)]
++    self.assertEqual(masked.device, dev)
++
+   def test_lax_full_like_efficient(self):
+     devices = self.get_devices()
+     if len(devices) < 4:

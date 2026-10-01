@@ -1,0 +1,106 @@
+From af24caa7f7d8140e09bacaa29385fb665c4afdcc Mon Sep 17 00:00:00 2001
+From: bobrenjc93 <bobrenjc93@users.noreply.github.com>
+Date: Tue, 14 Apr 2026 03:14:28 +0000
+Subject: [PATCH] Fix slice_scatter meta overlap handling (#180166)
+
+## Summary
+Fix #180164
+
+## Root cause problem
+`aten.slice_scatter` is a functional op, but its meta kernel was always using `clone_preserve_strides(self)`. When the backward graph fed it an expanded tensor with internal overlap, that preserved an impossible stride-0 layout for the result. Inductor trusted that fake layout, collapsed the iteration space, and produced incorrect `x.grad` values.
+
+## Proposed fix
+- Route `slice_scatter` and `select_scatter` through a shared `_scatter_meta_output()` helper.
+- If the base tensor has internal overlap, return `self.clone()` so the meta result matches eager's clone fallback instead of preserving overlapping strides.
+- Keep `clone_preserve_strides()` for the non-overlapping case.
+- Add a TorchInductor regression test for the overlapping-base backward case and record the current CPU Pallas failure in expected failures.
+
+## Why this is the right long term fix
+This fixes the bad layout metadata at the source instead of adding an Inductor-only workaround. Functional scatter ops cannot legally preserve overlapping logical strides after the write, and eager already falls back to a real clone in that case. Matching that behavior in meta keeps fake tensor semantics aligned with eager and avoids the same bug in other compiler paths.
+
+## Testing
+- Added `test_slice_scatter_backward_with_overlapping_base`
+- PR CI
+
+Drafted via Codex, published after manual review by @bobrenjc93
+
+Pull Request resolved: https://github.com/pytorch/pytorch/pull/180166
+Approved by: https://github.com/Lucaskabela
+---
+ ...scatter_backward_with_overlapping_base_cpu |  2 ++
+ test/inductor/test_torchinductor.py           | 24 +++++++++++++++++++
+ torch/_meta_registrations.py                  | 13 +++++++++-
+ 3 files changed, 38 insertions(+), 1 deletion(-)
+ create mode 100644 test/inductor/pallas_expected_failures/CpuTests.test_slice_scatter_backward_with_overlapping_base_cpu
+
+diff --git a/test/inductor/pallas_expected_failures/CpuTests.test_slice_scatter_backward_with_overlapping_base_cpu b/test/inductor/pallas_expected_failures/CpuTests.test_slice_scatter_backward_with_overlapping_base_cpu
+new file mode 100644
+index 0000000000000..2c3f456e070c8
+--- /dev/null
++++ b/test/inductor/pallas_expected_failures/CpuTests.test_slice_scatter_backward_with_overlapping_base_cpu
+@@ -0,0 +1,2 @@
++ERROR
++ValueError: Incompatible shapes for broadcasting
+diff --git a/test/inductor/test_torchinductor.py b/test/inductor/test_torchinductor.py
+index d2c08e2f23022..4e16f544516ab 100644
+--- a/test/inductor/test_torchinductor.py
++++ b/test/inductor/test_torchinductor.py
+@@ -9466,6 +9466,30 @@ def fn(x, a):
+             ],
+         )
+ 
++    @skip_if_gpu_halide  # accuracy issue
++    def test_slice_scatter_backward_with_overlapping_base(self):
++        def fn(x, y):
++            return torch.slice_scatter(x, y, dim=1, start=0, end=6).sum(dim=1)
++
++        torch.manual_seed(0)
++        x = torch.randn(4, 13, 33, device=self.device, requires_grad=True)
++        y = torch.randn(4, 6, 33, device=self.device, requires_grad=True)
++        grad = torch.randn(4, 33, device=self.device)
++
++        x_ref = x.detach().clone().requires_grad_(True)
++        y_ref = y.detach().clone().requires_grad_(True)
++
++        out_ref = fn(x_ref, y_ref)
++        out_ref.backward(grad)
++
++        compiled_fn = torch.compile(fn, backend="inductor", fullgraph=True)
++        out = compiled_fn(x, y)
++        out.backward(grad)
++
++        self.assertEqual(out, out_ref)
++        self.assertEqual(x.grad, x_ref.grad)
++        self.assertEqual(y.grad, y_ref.grad)
++
+     def test_slice_scatter2(self):
+         def fn(a, b):
+             return aten.slice_scatter(a, b, 0, 0, 9223372036854775807)
+diff --git a/torch/_meta_registrations.py b/torch/_meta_registrations.py
+index 87d2ddd597b6f..f5662d897b186 100644
+--- a/torch/_meta_registrations.py
++++ b/torch/_meta_registrations.py
+@@ -5722,11 +5722,22 @@ def meta_zeros(
+ 
+ @register_meta(aten.select_scatter.default)
+ def meta_select_scatter(self, src, dim, index):
+-    return utils.clone_preserve_strides(self)
++    return _scatter_meta_output(self)
+ 
+ 
+ @register_meta(aten.slice_scatter.default)
+ def meta_slice_scatter(self, src, dim=0, start=None, end=None, step=1):
++    return _scatter_meta_output(self)
++
++
++def _scatter_meta_output(self):
++    from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
++
++    # Match clone_preserve_strides() in aten/native/TensorShape.cpp: overlapping
++    # bases cannot preserve their logical strides because the scatter writes would
++    # alias, so eager falls back to clone().
++    if not free_unbacked_symbols(self) and torch._debug_has_internal_overlap(self) == 1:
++        return self.clone()
+     return utils.clone_preserve_strides(self)
+ 
+ 

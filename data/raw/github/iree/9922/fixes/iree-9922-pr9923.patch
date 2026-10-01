@@ -1,0 +1,77 @@
+From 9a69dcde03217e4d1672aca7d0062f322287b4a2 Mon Sep 17 00:00:00 2001
+From: Jakub Kuderski <kubak@google.com>
+Date: Wed, 27 Jul 2022 16:07:43 -0400
+Subject: [PATCH] [cmake] Add cmake option to enable UBSan
+
+UBSan features checks not performed by ASan. Both UBSan and ASan can be
+enabled simultaneously.
+
+Issue: https://github.com/iree-org/iree/issues/9922
+---
+ CMakeLists.txt                                         |  1 +
+ build_tools/cmake/sanitizers.cmake                     |  4 ++++
+ docs/developers/developing_iree/sanitizers.md          | 10 ++++++++++
+ .../get_started/cmake_options_and_variables.md         |  5 +++++
+ 4 files changed, 20 insertions(+)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 94d8fdeb3461..41679538d879 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -246,6 +246,7 @@ option(IREE_ENABLE_ASAN "Enable address sanitizer" OFF)
+ option(IREE_ENABLE_MSAN "Enable memory sanitizer" OFF)
+ option(IREE_ENABLE_TSAN "Enable thread sanitizer" OFF)
+ option(IREE_BYTECODE_MODULE_ENABLE_TSAN "Enable thread sanitizer in IREE modules in tests" OFF)
++option(IREE_ENABLE_UBSAN "Enable undefined behavior sanitizer" OFF)
+ 
+ # STREQUAL feels wrong here - we don't care about the exact true-value used,
+ # ON or TRUE or something else. But we haven't been able to think of a less bad
+diff --git a/build_tools/cmake/sanitizers.cmake b/build_tools/cmake/sanitizers.cmake
+index 95ce3bb85772..4df913f202f5 100644
+--- a/build_tools/cmake/sanitizers.cmake
++++ b/build_tools/cmake/sanitizers.cmake
+@@ -25,3 +25,7 @@ if(IREE_ENABLE_TSAN)
+   string(APPEND CMAKE_CXX_FLAGS " -fsanitize=thread")
+   string(APPEND CMAKE_C_FLAGS " -fsanitize=thread")
+ endif()
++if(IREE_ENABLE_UBSAN)
++  string(APPEND CMAKE_CXX_FLAGS " -fsanitize=undefined")
++  string(APPEND CMAKE_C_FLAGS " -fsanitize=undefined")
++endif()
+diff --git a/docs/developers/developing_iree/sanitizers.md b/docs/developers/developing_iree/sanitizers.md
+index 7de8065e1b2b..2004fca59aaf 100644
+--- a/docs/developers/developing_iree/sanitizers.md
++++ b/docs/developers/developing_iree/sanitizers.md
+@@ -89,6 +89,16 @@ As of April 2022, all of IREE's tests succeeded with MSan on Linux/x86-64,
+ provided that the `vulkan` driver was disabled (due to lack of MSan
+ instrumentation in the NVIDIA Vulkan driver).
+ 
++### UBSan (UndefinedBehaviorSanitizer)
++
++Enabling UBSan in the IREE build is a simple matter of setting the
++`IREE_ENABLE_UBSAN` CMake option:
++
++```
++cmake -DIREE_ENABLE_UBSAN=ON ...
++```
++
++Note that both ASan and UBSan can be enabled in the same build.
+ 
+ ## Symbolizing the reports
+ 
+diff --git a/docs/developers/get_started/cmake_options_and_variables.md b/docs/developers/get_started/cmake_options_and_variables.md
+index 19f16fbec9d4..b952ee659dcc 100644
+--- a/docs/developers/get_started/cmake_options_and_variables.md
++++ b/docs/developers/get_started/cmake_options_and_variables.md
+@@ -109,6 +109,11 @@ the current build type is Debug and the compiler supports it.
+ Enable [thread sanitizer](https://clang.llvm.org/docs/ThreadSanitizer.html) if
+ the current build type is Debug and the compiler supports it.
+ 
++#### `IREE_ENABLE_UBSAN`:BOOL
++
++Enable [undefiend behavior sanitizer](https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html)
++if the current build type is Debug and the compiler supports it.
++
+ ## Cross-compilation
+ 
+ When cross compiling (using a toolchain file like

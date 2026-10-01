@@ -1,0 +1,63 @@
+{
+  "cause_denominator": 149,
+  "fact_consumer_layer": {
+    "compiler IR or analysis": 101,
+    "runtime state": 48
+  },
+  "fact_origin_layer": {
+    "api or frontend": 64,
+    "backend or device contract": 2,
+    "compiler IR or analysis": 64,
+    "runtime state": 19
+  },
+  "joint_origin_by_consumer": {
+    "api or frontend": {
+      "compiler IR or analysis": 41,
+      "runtime state": 23
+    },
+    "backend or device contract": {
+      "compiler IR or analysis": 1,
+      "runtime state": 1
+    },
+    "compiler IR or analysis": {
+      "compiler IR or analysis": 59,
+      "runtime state": 5
+    },
+    "runtime state": {
+      "compiler IR or analysis": 0,
+      "runtime state": 19
+    }
+  },
+  "joint_origin_by_consumer_totals": {
+    "compiler IR or analysis": 101,
+    "runtime state": 48
+  },
+  "layer_codebook": {
+    "api or frontend": "User-facing API state, language-level values, and frontend trace inputs.",
+    "backend or device contract": "A fact supplied by an external library, device context, or hardware representation contract.",
+    "compiler IR or analysis": "IR, compiler metadata, analyses, transformations, scheduling, and code generation.",
+    "runtime state": "Executable, buffer, owner, cache, callback, stream, and completion state managed at runtime."
+  },
+  "layer_scope": {
+    "cross-layer": 71,
+    "same-layer": 78
+  },
+  "schema_version": "1.0.0",
+  "semantic_boundary_count": {
+    "1": 104,
+    "2": 45
+  },
+  "semantic_boundary_types_nonexclusive": {
+    "alias, storage, or mutation": 16,
+    "content": 4,
+    "identity or index": 34,
+    "layout or address": 37,
+    "ordering or completion": 23,
+    "ownership or lifetime": 18,
+    "placement or context": 23,
+    "representation or layout": 39
+  },
+  "unit": "distinct repair-backed cause",
+  "counting_rule": "One primary repair-relevant provenance record per cause, associated with its primary validity obligation. A record may involve several values. Secondary obligations do not add RQ2 rows.",
+  "semantic_boundary_rule": "Distinct boundary types derived from the primary relation and transition labels; not independently counted boundary-crossing events."
+}

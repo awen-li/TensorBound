@@ -1,0 +1,32 @@
+From 4b2296282686041f6de912cd5cbb3d3fba3eb987 Mon Sep 17 00:00:00 2001
+From: Marius Brehler <marius.brehler@iml.fraunhofer.de>
+Date: Fri, 1 Jul 2022 11:34:29 +0000
+Subject: [PATCH] Fix setting IREE_MEMORY_ACCESS_ALIGNMENT_REQUIRED
+
+Even if `IREE_MEMORY_ACCESS_ALIGNMENT_REQUIRED` was defined it was
+always set to 0. However, it is only valid to set it to 0 if
+`IREE_MEMORY_ACCESS_ALIGNMENT_REQUIRED` isn't defined.
+
+Makes progress on #9593 and allows to control the alignment behavior
+via `IREE_MEMORY_ACCESS_ALIGNMENT_REQUIRED` instead of being
+forced to pass `-mno-unaligned-access`.
+---
+ runtime/src/iree/base/target_platform.h | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/runtime/src/iree/base/target_platform.h b/runtime/src/iree/base/target_platform.h
+index a15f80c97750..d7eaec17d343 100644
+--- a/runtime/src/iree/base/target_platform.h
++++ b/runtime/src/iree/base/target_platform.h
+@@ -163,10 +163,9 @@ static_assert(sizeof(void*) == sizeof(uintptr_t),
+ // every load/store.
+ #define IREE_MEMORY_ACCESS_ALIGNMENT_REQUIRED 1
+ 
+-#endif  // IREE_ARCH_*
+-
+ #else
+ #define IREE_MEMORY_ACCESS_ALIGNMENT_REQUIRED 0
++#endif  // IREE_ARCH_*
+ #endif  // !IREE_MEMORY_ACCESS_ALIGNMENT_REQUIRED
+ 
+ //==============================================================================

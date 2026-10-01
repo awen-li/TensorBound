@@ -1,0 +1,51 @@
+From f96b68cdce95fc467b022e3df32fc1c341060c65 Mon Sep 17 00:00:00 2001
+From: Scott Todd <scott.todd0@gmail.com>
+Date: Thu, 20 Mar 2025 09:14:44 -0700
+Subject: [PATCH 1/2] Skip flaky test_top_k onnx op test on rdna3.
+
+Signed-off-by: Scott Todd <scott.todd0@gmail.com>
+---
+ .../iree-test-suites/onnx_ops/onnx_ops_gpu_rocm_rdna3.json    | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/tests/external/iree-test-suites/onnx_ops/onnx_ops_gpu_rocm_rdna3.json b/tests/external/iree-test-suites/onnx_ops/onnx_ops_gpu_rocm_rdna3.json
+index ac926cbd6b1d..f93dc90b70da 100644
+--- a/tests/external/iree-test-suites/onnx_ops/onnx_ops_gpu_rocm_rdna3.json
++++ b/tests/external/iree-test-suites/onnx_ops/onnx_ops_gpu_rocm_rdna3.json
+@@ -14,7 +14,9 @@
+     "onnx/node/generated/test_group_normalization_example_expanded",
+     "onnx/node/generated/test_einsum_inner_prod"
+   ],
+-  "skip_run_tests": [],
++  "skip_run_tests": [
++    "onnx/node/generated/test_top_k"
++  ],
+   "expected_compile_failures": [
+     "onnx/node/generated/test_affine_grid_2d",
+     "onnx/node/generated/test_affine_grid_2d_align_corners",
+
+From 010601e4d0bbb1f3ce393fbea12c7d333d3e7623 Mon Sep 17 00:00:00 2001
+From: Scott Todd <scott.todd0@gmail.com>
+Date: Thu, 20 Mar 2025 09:50:05 -0700
+Subject: [PATCH 2/2] Skip related tests too.
+
+Signed-off-by: Scott Todd <scott.todd0@gmail.com>
+---
+ .../iree-test-suites/onnx_ops/onnx_ops_gpu_rocm_rdna3.json    | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/tests/external/iree-test-suites/onnx_ops/onnx_ops_gpu_rocm_rdna3.json b/tests/external/iree-test-suites/onnx_ops/onnx_ops_gpu_rocm_rdna3.json
+index f93dc90b70da..4b9a3fdb5dd3 100644
+--- a/tests/external/iree-test-suites/onnx_ops/onnx_ops_gpu_rocm_rdna3.json
++++ b/tests/external/iree-test-suites/onnx_ops/onnx_ops_gpu_rocm_rdna3.json
+@@ -15,7 +15,9 @@
+     "onnx/node/generated/test_einsum_inner_prod"
+   ],
+   "skip_run_tests": [
+-    "onnx/node/generated/test_top_k"
++    "onnx/node/generated/test_top_k",
++    "onnx/node/generated/test_top_k_negative_axis",
++    "onnx/node/generated/test_top_k_smallest"
+   ],
+   "expected_compile_failures": [
+     "onnx/node/generated/test_affine_grid_2d",

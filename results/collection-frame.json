@@ -1,0 +1,78 @@
+{
+  "schema_version": "1.0.0",
+  "source_manifest_commit": "ce7c927a202c1019c2b67f249389ac9379b85a1c",
+  "collection_boundary": "2026-06-24",
+  "github": {
+    "endpoint": "https://api.github.com/search/issues",
+    "item_type": "issue",
+    "sort": "created",
+    "order": "asc",
+    "per_page": 100,
+    "partition_rule": "Use the whole-range query when its reported total is at most 1000; otherwise paginate disjoint calendar-year intervals, ending with the partial final year.",
+    "repositories": [
+      {
+        "repository": "iree-org/iree",
+        "system": "iree",
+        "labels_all": ["bug 🐞"],
+        "whole_range_query": "repo:iree-org/iree is:issue created:<=2026-06-24 label:\"bug 🐞\"",
+        "partitioned": true,
+        "partition_start": "2008-01-01",
+        "unique_records": 1869
+      },
+      {
+        "repository": "pytorch/pytorch",
+        "system": "pytorch-inductor-triton",
+        "labels_all": ["module: inductor", "module: correctness (silent)"],
+        "whole_range_query": "repo:pytorch/pytorch is:issue created:<=2026-06-24 label:\"module: inductor\" label:\"module: correctness (silent)\"",
+        "partitioned": false,
+        "unique_records": 248
+      },
+      {
+        "repository": "triton-lang/triton",
+        "system": "pytorch-inductor-triton",
+        "labels_all": ["bug"],
+        "whole_range_query": "repo:triton-lang/triton is:issue created:<=2026-06-24 label:\"bug\"",
+        "partitioned": false,
+        "unique_records": 510
+      },
+      {
+        "repository": "jax-ml/jax",
+        "system": "xla-jax-pjrt",
+        "labels_all": ["bug"],
+        "whole_range_query": "repo:jax-ml/jax is:issue created:<=2026-06-24 label:\"bug\"",
+        "partitioned": true,
+        "partition_start": "2008-01-01",
+        "unique_records": 3908
+      },
+      {
+        "repository": "openxla/xla",
+        "system": "xla-jax-pjrt",
+        "labels_all": ["bug"],
+        "whole_range_query": "repo:openxla/xla is:issue created:<=2026-06-24 label:\"bug\"",
+        "partitioned": false,
+        "unique_records": 281
+      }
+    ],
+    "unique_records": 6816
+  },
+  "cve_list": {
+    "repository": "CVEProject/cvelistV5",
+    "revision": "308dee2f7ba40b22f8672f752077a6a9b755f9c1",
+    "query_template": "repo:CVEProject/cvelistV5 path:cves \"{term}\"",
+    "per_page": 100,
+    "pagination": "all pages returned by GitHub code search",
+    "terms": [
+      {"term": "IREE", "system": "iree", "reported_hits": 75, "retrieved_hits": 75},
+      {"term": "PJRT", "system": "xla-jax-pjrt", "reported_hits": 0, "retrieved_hits": 0},
+      {"term": "PyTorch", "system": "pytorch-inductor-triton", "reported_hits": 194, "retrieved_hits": 181},
+      {"term": "Triton", "system": "pytorch-inductor-triton", "reported_hits": 111, "retrieved_hits": 110},
+      {"term": "XLA", "system": "xla-jax-pjrt", "reported_hits": 332, "retrieved_hits": 326},
+      {"term": "jaxlib", "system": "xla-jax-pjrt", "reported_hits": 1, "retrieved_hits": 1}
+    ],
+    "reported_hits": 713,
+    "retrieved_unique_records": 693,
+    "unreturned_hits": 20,
+    "limitation": "GitHub code search did not return every reported hit for PyTorch, Triton, and XLA; the study frame contains the 693 retrieved records only."
+  },
+  "total_records": 7509
+}

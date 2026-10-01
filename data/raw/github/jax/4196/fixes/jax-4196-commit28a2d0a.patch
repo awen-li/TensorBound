@@ -1,0 +1,27 @@
+From 28a2d0a1a83b3dfa3c903ce645aa9d319a4fd5ef Mon Sep 17 00:00:00 2001
+From: Qiao Zhang <zhangqiaorjc@google.com>
+Date: Tue, 8 Sep 2020 14:19:09 -0700
+Subject: [PATCH] Fix a bug in strides to layout conversion.
+
+Do not rely on implicit bool conversion of iterator.
+
+PiperOrigin-RevId: 330584856
+Change-Id: I42e2128542e11c6704e24a9319358462c780490f
+---
+ tensorflow/compiler/xla/python/dlpack.cc | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/tensorflow/compiler/xla/python/dlpack.cc b/tensorflow/compiler/xla/python/dlpack.cc
+index 974816407ee8cc..67afa25d23e287 100644
+--- a/tensorflow/compiler/xla/python/dlpack.cc
++++ b/tensorflow/compiler/xla/python/dlpack.cc
+@@ -321,7 +321,8 @@ StatusOr<std::unique_ptr<PyBuffer>> DLPackManagedTensorToBuffer(
+                       DLDataTypeToPrimitiveType(dlmt->dl_tensor.dtype));
+ 
+   std::vector<int64> minor_to_major;
+-  if (dlmt->dl_tensor.strides && !absl::c_find(dimensions, 0)) {
++  if (dlmt->dl_tensor.strides &&
++      absl::c_find(dimensions, 0) == dimensions.end()) {
+     absl::Span<int64 const> strides(
+         reinterpret_cast<int64*>(dlmt->dl_tensor.strides),
+         dlmt->dl_tensor.ndim);

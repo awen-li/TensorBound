@@ -1,0 +1,207 @@
+From d8d5a36dfec400918d51ffa08b1dc744149b7d42 Mon Sep 17 00:00:00 2001
+From: Peter Hawkins <phawkins@google.com>
+Date: Fri, 26 Aug 2022 14:32:32 -0700
+Subject: [PATCH] [JAX] Handle non-contiguous GPU IDs in NCCL collectives.
+
+Fixes https://github.com/google/jax/issues/12119
+
+PiperOrigin-RevId: 470335156
+---
+ tensorflow/compiler/tf2xla/xla_helpers.cc           |  4 ++--
+ tensorflow/compiler/xla/pjrt/gpu_device.cc          |  7 +------
+ tensorflow/compiler/xla/python/xla_client.py        |  2 +-
+ .../xla/service/gpu/gpu_executable_run_options.cc   | 13 ++++++++-----
+ .../xla/service/gpu/gpu_executable_run_options.h    | 13 +++++++------
+ .../xla/service/gpu/nccl_collective_thunk.cc        |  9 ++++++++-
+ tensorflow/compiler/xrt/kernels/xrt_execute_op.cc   |  7 ++++---
+ 7 files changed, 31 insertions(+), 24 deletions(-)
+
+diff --git a/tensorflow/compiler/tf2xla/xla_helpers.cc b/tensorflow/compiler/tf2xla/xla_helpers.cc
+index 49bd779bfde9f7..f52e83c8c632c4 100644
+--- a/tensorflow/compiler/tf2xla/xla_helpers.cc
++++ b/tensorflow/compiler/tf2xla/xla_helpers.cc
+@@ -17,6 +17,7 @@ limitations under the License.
+ 
+ #include "tensorflow/compiler/tf2xla/xla_helpers.h"
+ 
++#include <map>
+ #include <string>
+ 
+ #include "absl/synchronization/notification.h"
+@@ -223,8 +224,7 @@ Status ResolveDeviceAssignment(
+     // For GPU collectives, `xla_global_id`s are arbitrary integers, and XLA
+     // requires a mapping from local device IDs to global device IDs.
+     const DeviceMgr* device_mgr = ctx->function_library()->device_mgr();
+-    std::vector<xla::GlobalDeviceId> global_device_ids(
+-        device_mgr->NumDeviceType(params->group.device_type.type_string()));
++    std::map<int, xla::GlobalDeviceId> global_device_ids;
+ 
+     for (int device_idx = 0; device_idx < params->group.group_size;
+          device_idx++) {
+diff --git a/tensorflow/compiler/xla/pjrt/gpu_device.cc b/tensorflow/compiler/xla/pjrt/gpu_device.cc
+index 3605022c6818c2..68a40a61f2c43c 100644
+--- a/tensorflow/compiler/xla/pjrt/gpu_device.cc
++++ b/tensorflow/compiler/xla/pjrt/gpu_device.cc
+@@ -381,13 +381,8 @@ Status BuildDistributedDevices(
+   for (const auto& device : local_device_states) {
+     TF_RET_CHECK(device.second == nullptr);
+   }
+-  std::vector<GlobalDeviceId> sorted_global_device_ids;
+-  sorted_global_device_ids.reserve(gpu_device_ids.size());
+-  for (const auto& e : gpu_device_ids) {
+-    sorted_global_device_ids.push_back(e.second);
+-  }
+   gpu_executable_run_options->set_gpu_global_device_ids(
+-      std::move(sorted_global_device_ids));
++      std::move(gpu_device_ids));
+ #ifdef GOOGLE_CUDA
+   auto nccl_id_store = std::make_shared<NcclIdStore>(
+       node_id, distributed_client, device_to_node);
+diff --git a/tensorflow/compiler/xla/python/xla_client.py b/tensorflow/compiler/xla/python/xla_client.py
+index 893c143a9bc8c5..4a8fd3fbfc75c7 100644
+--- a/tensorflow/compiler/xla/python/xla_client.py
++++ b/tensorflow/compiler/xla/python/xla_client.py
+@@ -43,7 +43,7 @@
+ 
+ # Just an internal arbitrary increasing number to help with backward-compatible
+ # changes.
+-_version = 90
++_version = 91
+ 
+ # Version number for MLIR:Python components.
+ mlir_api_version = 33
+diff --git a/tensorflow/compiler/xla/service/gpu/gpu_executable_run_options.cc b/tensorflow/compiler/xla/service/gpu/gpu_executable_run_options.cc
+index f587128b38381a..9d05b05852de75 100644
+--- a/tensorflow/compiler/xla/service/gpu/gpu_executable_run_options.cc
++++ b/tensorflow/compiler/xla/service/gpu/gpu_executable_run_options.cc
+@@ -15,6 +15,9 @@ limitations under the License.
+ 
+ #include "tensorflow/compiler/xla/service/gpu/gpu_executable_run_options.h"
+ 
++#include <map>
++#include <optional>
++
+ #include "absl/algorithm/container.h"
+ #include "tensorflow/compiler/xla/status_macros.h"
+ 
+@@ -29,12 +32,12 @@ std::string NcclCliqueKey::ToString() const {
+ }
+ 
+ GpuExecutableRunOptions& GpuExecutableRunOptions::set_gpu_global_device_ids(
+-    std::optional<std::vector<GlobalDeviceId>> gpu_global_device_ids) {
++    std::optional<std::map<int, GlobalDeviceId>> gpu_global_device_ids) {
+   gpu_global_device_ids_ = std::move(gpu_global_device_ids);
+   return *this;
+ }
+ 
+-const std::optional<std::vector<GlobalDeviceId>>&
++const std::optional<std::map<int, GlobalDeviceId>>&
+ GpuExecutableRunOptions::gpu_global_device_ids() const {
+   return gpu_global_device_ids_;
+ }
+@@ -69,9 +72,9 @@ NcclExecuteParams::NcclExecuteParams(
+ StatusOr<GlobalDeviceId> NcclExecuteParams::GetGlobalDeviceId() const {
+   int64_t local_device_ordinal = stream->parent()->device_ordinal();
+   if (gpu_global_device_ids) {
+-    TF_RET_CHECK(0 <= local_device_ordinal &&
+-                 local_device_ordinal < gpu_global_device_ids->size());
+-    return (*gpu_global_device_ids)[local_device_ordinal];
++    auto it = gpu_global_device_ids->find(local_device_ordinal);
++    TF_RET_CHECK(it != gpu_global_device_ids->end()) << local_device_ordinal;
++    return it->second;
+   } else {
+     // No local -> global mapping was provided; assume the identity mapping.
+     return GlobalDeviceId(local_device_ordinal);
+diff --git a/tensorflow/compiler/xla/service/gpu/gpu_executable_run_options.h b/tensorflow/compiler/xla/service/gpu/gpu_executable_run_options.h
+index a3d7b748fcee4b..fad5340e58f84b 100644
+--- a/tensorflow/compiler/xla/service/gpu/gpu_executable_run_options.h
++++ b/tensorflow/compiler/xla/service/gpu/gpu_executable_run_options.h
+@@ -17,6 +17,7 @@ limitations under the License.
+ #define TENSORFLOW_COMPILER_XLA_SERVICE_GPU_GPU_EXECUTABLE_RUN_OPTIONS_H_
+ 
+ #include <functional>
++#include <map>
+ #include <optional>
+ #include <string>
+ #include <vector>
+@@ -65,8 +66,8 @@ class GpuExecutableRunOptions {
+   // elements of `device_assignment` are interpreted as global device IDs, not
+   // local device ordinals.
+   GpuExecutableRunOptions& set_gpu_global_device_ids(
+-      std::optional<std::vector<GlobalDeviceId>> gpu_global_device_ids);
+-  const std::optional<std::vector<GlobalDeviceId>>& gpu_global_device_ids()
++      std::optional<std::map<int, GlobalDeviceId>> gpu_global_device_ids);
++  const std::optional<std::map<int, GlobalDeviceId>>& gpu_global_device_ids()
+       const;
+ 
+   // Callback that returns a ncclUniqueId encoded as a string for a group of
+@@ -76,7 +77,7 @@ class GpuExecutableRunOptions {
+   const NcclUniqueIdCallback& nccl_unique_id_callback() const;
+ 
+  private:
+-  std::optional<std::vector<GlobalDeviceId>> gpu_global_device_ids_;
++  std::optional<std::map<int, GlobalDeviceId>> gpu_global_device_ids_;
+   NcclUniqueIdCallback nccl_unique_id_callback_;
+ };
+ 
+@@ -87,9 +88,9 @@ struct NcclExecuteParams {
+ 
+   se::Stream* stream;
+   RunId run_id;
+-  const DeviceAssignment* device_assn;                       // never null
+-  const std::vector<GlobalDeviceId>* gpu_global_device_ids;  // may be null
+-  const NcclUniqueIdCallback* nccl_unique_id_callback;       // may be null
++  const DeviceAssignment* device_assn;                         // never null
++  const std::map<int, GlobalDeviceId>* gpu_global_device_ids;  // may be null
++  const NcclUniqueIdCallback* nccl_unique_id_callback;         // may be null
+ 
+   StatusOr<GlobalDeviceId> GetGlobalDeviceId() const;
+ };
+diff --git a/tensorflow/compiler/xla/service/gpu/nccl_collective_thunk.cc b/tensorflow/compiler/xla/service/gpu/nccl_collective_thunk.cc
+index 3a2c81cd484ed0..cd80827779c34e 100644
+--- a/tensorflow/compiler/xla/service/gpu/nccl_collective_thunk.cc
++++ b/tensorflow/compiler/xla/service/gpu/nccl_collective_thunk.cc
+@@ -133,8 +133,15 @@ StatusOr<NcclComm::Lock> LockNcclComm(
+   TF_RET_CHECK(it != participants.end());
+   int rank = it - participants.begin();
+ 
++  std::vector<GlobalDeviceId> local_devices;
++  if (params.gpu_global_device_ids) {
++    local_devices.reserve(params.gpu_global_device_ids->size());
++    for (const auto& entry : *params.gpu_global_device_ids) {
++      local_devices.push_back(entry.second);
++    }
++  }
+   size_t num_local_participants = GetNumLocalParticipants(
+-      participants, /*local_devices=*/params.gpu_global_device_ids);
++      participants, params.gpu_global_device_ids ? &local_devices : nullptr);
+ 
+   bool is_local = participants.size() == num_local_participants;
+   TF_ASSIGN_OR_RETURN(
+diff --git a/tensorflow/compiler/xrt/kernels/xrt_execute_op.cc b/tensorflow/compiler/xrt/kernels/xrt_execute_op.cc
+index f1433a4623f1e8..bb867dbe4b7fce 100644
+--- a/tensorflow/compiler/xrt/kernels/xrt_execute_op.cc
++++ b/tensorflow/compiler/xrt/kernels/xrt_execute_op.cc
+@@ -13,6 +13,7 @@ See the License for the specific language governing permissions and
+ limitations under the License.
+ ==============================================================================*/
+ 
++#include <map>
+ #include <memory>
+ #include <string>
+ #include <vector>
+@@ -325,11 +326,11 @@ xla::StatusOr<RefPtr<XRTTupleAllocation>> RunExecutable(
+         &executable->executable()->module_config().static_device_assignment());
+   }
+   xla::gpu::GpuExecutableRunOptions gpu_options;
+-  std::vector<xla::GlobalDeviceId> gpu_global_ids;
++  std::map<int, xla::GlobalDeviceId> gpu_global_ids;
+   if (config.local_replica_mapping_size() > 0) {
+-    gpu_global_ids.reserve(config.local_replica_mapping_size());
++    int i = 0;
+     for (auto& gid : config.local_replica_mapping()) {
+-      gpu_global_ids.emplace_back(xla::GlobalDeviceId(gid));
++      gpu_global_ids[i++] = xla::GlobalDeviceId(gid);
+     }
+     gpu_options.set_gpu_global_device_ids(gpu_global_ids);
+   }

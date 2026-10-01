@@ -1,0 +1,99 @@
+From c4a94e56a702c29a1a8a71245224f2c2e5a16817 Mon Sep 17 00:00:00 2001
+From: weimin023 <tnwilly@gmail.com>
+Date: Mon, 7 Sep 2026 17:29:44 +0000
+Subject: [PATCH] [CUDA] Preserve export names
+
+Signed-off-by: weimin023 <tnwilly@gmail.com>
+---
+ compiler/plugins/target/CUDA/CUDATarget.cpp   |  2 ++
+ .../iree/hal/drivers/cuda/native_executable.c | 30 ++++++++++++++-----
+ .../src/iree/schemas/cuda_executable_def.fbs  |  4 +++
+ 3 files changed, 28 insertions(+), 8 deletions(-)
+
+diff --git a/compiler/plugins/target/CUDA/CUDATarget.cpp b/compiler/plugins/target/CUDA/CUDATarget.cpp
+index 239e85ce9653..97b84f38d422 100644
+--- a/compiler/plugins/target/CUDA/CUDATarget.cpp
++++ b/compiler/plugins/target/CUDA/CUDATarget.cpp
+@@ -657,6 +657,7 @@ class CUDATargetBackend final : public TargetBackend {
+ 
+       auto kernelNameRef =
+           builder.createString(sanitizeSymbolName(exportOp.getName()));
++      auto exportNameRef = builder.createString(exportOp.getName());
+ 
+       iree_hal_cuda_BlockDims_t blockDims = {0};
+       if (auto workgroupSizeAttr = exportOp.getWorkgroupSize()) {
+@@ -700,6 +701,7 @@ class CUDATargetBackend final : public TargetBackend {
+       iree_hal_cuda_ExportDef_binding_flags_add(builder, bindingFlagsRef);
+       iree_hal_cuda_ExportDef_debug_info_add(builder,
+                                              exportDebugInfos[ordinal]);
++      iree_hal_cuda_ExportDef_export_name_add(builder, exportNameRef);
+       exportRefs[ordinal] = iree_hal_cuda_ExportDef_end(builder);
+     }
+     auto exportsRef = builder.createOffsetVecDestructive(exportRefs);
+diff --git a/runtime/src/iree/hal/drivers/cuda/native_executable.c b/runtime/src/iree/hal/drivers/cuda/native_executable.c
+index 93d9d6f36adb..29fcc7f29154 100644
+--- a/runtime/src/iree/hal/drivers/cuda/native_executable.c
++++ b/runtime/src/iree/hal/drivers/cuda/native_executable.c
+@@ -293,10 +293,15 @@ iree_status_t iree_hal_cuda_native_executable_create(
+   for (iree_host_size_t i = 0; i < export_count; ++i) {
+     iree_hal_cuda_ExportDef_table_t export_def =
+         iree_hal_cuda_ExportDef_vec_at(exports_vec, i);
++    flatbuffers_string_t export_name =
++        iree_hal_cuda_ExportDef_export_name_get(export_def);
++    if (!export_name) {
++      // Binaries produced before export_name was added used kernel_name for
++      // both PTX lookup and IREE executable export lookup.
++      export_name = iree_hal_cuda_ExportDef_kernel_name_get(export_def);
++    }
+     if (IREE_UNLIKELY(!iree_host_size_checked_add(
+-            total_export_name_length,
+-            flatbuffers_string_len(
+-                iree_hal_cuda_ExportDef_kernel_name_get(export_def)),
++            total_export_name_length, flatbuffers_string_len(export_name),
+             &total_export_name_length))) {
+       return iree_make_status(IREE_STATUS_OUT_OF_RANGE,
+                               "export name storage size overflow");
+@@ -431,14 +436,23 @@ iree_status_t iree_hal_cuda_native_executable_create(
+           "cuFuncSetAttribute");
+       if (!iree_status_is_ok(status)) break;
+ 
++      // Preserve the original executable export identity separately from the
++      // sanitized PTX symbol used for cuModuleGetFunction. Binaries produced
++      // before export_name was added use kernel_name for both.
++      flatbuffers_string_t export_name =
++          iree_hal_cuda_ExportDef_export_name_get(export_def);
++      if (!export_name) {
++        export_name = kernel_name;
++      }
++
+       // Package required parameters for kernel launches for each entry point.
+       iree_hal_cuda_kernel_params_t* kernel_info = &executable->exports[i];
+-      const iree_host_size_t kernel_name_length =
+-          flatbuffers_string_len(kernel_name);
++      const iree_host_size_t export_name_length =
++          flatbuffers_string_len(export_name);
+       kernel_info->name =
+-          iree_make_string_view(export_name_ptr, kernel_name_length);
+-      memcpy(export_name_ptr, kernel_name, kernel_name_length);
+-      export_name_ptr += kernel_name_length;
++          iree_make_string_view(export_name_ptr, export_name_length);
++      memcpy(export_name_ptr, export_name, export_name_length);
++      export_name_ptr += export_name_length;
+       kernel_info->function = function;
+       const iree_hal_cuda_BlockDims_t* block_dims =
+           iree_hal_cuda_ExportDef_block_dims_get(export_def);
+diff --git a/runtime/src/iree/schemas/cuda_executable_def.fbs b/runtime/src/iree/schemas/cuda_executable_def.fbs
+index afb2834829f0..038d125777e5 100644
+--- a/runtime/src/iree/schemas/cuda_executable_def.fbs
++++ b/runtime/src/iree/schemas/cuda_executable_def.fbs
+@@ -48,6 +48,10 @@ table ExportDef {
+ 
+   // Optional debug information related to the export.
+   debug_info:iree.hal.debug.ExportDef;
++
++  // Original IREE executable export name used for runtime lookup. When absent,
++  // runtimes fall back to kernel_name for compatibility with older binaries.
++  export_name:string;
+ }
+ 
+ // A library containing one or more exported functions.

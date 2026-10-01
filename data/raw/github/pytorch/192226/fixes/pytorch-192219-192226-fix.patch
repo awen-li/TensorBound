@@ -1,0 +1,1106 @@
+From c99abe7cc63182dd44087ac05e3181545f82ec27 Mon Sep 17 00:00:00 2001
+From: Kyle Mylonakis <kyle@protopia.ai>
+Date: Wed, 5 Aug 2026 06:48:25 -0500
+Subject: [PATCH 1/6] Fix silent out-of-bounds read for mutated Triton args
+ that are offset views
+
+Passing a view with a non-zero storage_offset as a mutated pointer argument to a
+raw triton.jit kernel silently produced wrong results under torch.compile:
+elements the kernel chose not to write came back holding data read from past the
+end of a buffer instead of their original values. No exception, no warning, no
+graph break. Found in the wild in Liger-Kernel, where it corrupted training
+losses and produced NaNs (see linkedin/Liger-Kernel#1338).
+
+The root cause is a contract mismatch between two components. Functionalizing a
+mutated Triton arg clones it with clone_preserve_strides(), which allocates
+storage_offset + span elements and copies them out of the tensor's storage via
+as_strided(x, (needed_size,), (1,), 0). That is correct in eager, where the whole
+storage is addressable. Inductor, though, materializes an intermediate view as a
+buffer sized to the view alone, so the leading storage_offset elements lie
+outside any allocation: aten.as_strided offsets are storage-relative, but
+Inductor's as_strided lowering interprets them relative to whichever buffer got
+realized, and built a ReinterpretView describing memory past the end with no
+extent check. For a (4, 2048) base that emitted an unmasked copy kernel reading
+4096 elements out of a 2048-element buffer, and the user's kernel then received a
+pointer into precisely the garbage half.
+
+The fix has two halves. The clone no longer asks for storage the tensor does not
+own: for a dense tensor at a non-zero offset, a plain clone() reproduces its
+strides and lands at storage_offset 0, which is all a triton.jit kernel needs,
+since it only ever sees a data pointer plus the strides passed to it. A tensor
+with gaps between its elements needs those gaps materialized too, so it is cloned
+through its base, which clone_preserve_strides now accepts as an opt-in keyword.
+The base is captured at the functionalization boundary and threaded through the
+functional HOP, because reading _base inside the functional impl yields an
+untracked tensor that the tracer lifts to a constant. Separately, Inductor's
+as_strided lowering now refuses to reinterpret past a realized buffer rather than
+silently doing so, so any remaining or future producer of this pattern fails
+loudly instead of corrupting data.
+
+Suggested review order: torch/_prims_common (the opt-in base), then
+triton_kernel_wrap (which clone is chosen, and how the base is threaded), then
+lowering.py (the backstop), then post_grad.py (keeps the new HOP kwarg off the
+mutation node), then the tests.
+
+Two alternatives were considered and rejected. Changing clone_preserve_strides'
+default semantics to clone compactly would break prims.as_strided_scatter, whose
+documented contract is "clone then as_strided(...).copy_()" with a
+storage-relative offset, and would make the runtime callers (cudagraphs, compiled
+autograd) copy whole bases; hence an opt-in keyword instead. Building the compact
+clone as empty_strided(size, stride).copy_(val) reads more simply but is wrong:
+empty_strided is a factory with no tensor input, so two clones of the same tensor
+are identical calls that get CSE'd into a single buffer, and a kernel with two
+mutated args then writes both of its outputs to the same memory.
+
+The clones themselves cannot simply be dropped. They are what makes the
+functional HOP functional, and eliding them is the reinplacing pass's job; that
+pass handles a view of a graph input but bails for an intra-graph base, where
+functionalization emits slice_scatter rather than copy_ and there is no copy-back
+node to key on.
+
+Test Plan:
+
+New tests, each confirmed to fail with the corresponding half of the fix reverted
+and to pass with it restored:
+
+```
+python test/inductor/test_triton_kernels.py -k mutated_offset_view
+python test/inductor/test_torchinductor.py CpuTests.test_as_strided_past_input_extent_cpu GPUTests.test_as_strided_past_input_extent_cuda CpuTests.test_as_strided_past_realized_buffer_raises_cpu GPUTests.test_as_strided_past_realized_buffer_raises_cuda
+```
+
+test_as_strided_past_input_extent pins the InputBuffer exemption in the new
+check: a graph input aliasing a larger storage may legitimately be as_strided
+past its own extent, because Inductor rebases the offset onto the incoming
+pointer, and the check must not reject that. The gap=2 parametrization covers a
+non-dense view, whose required extent exceeds its numel even at offset 0.
+test_triton_kernel_mutated_offset_view_large_tensor uses a base of 2147485696
+elements to confirm Inductor promotes its generated kernels to 64-bit indexing
+past int32 max; it is gated with largeTensorTest("6GB").
+
+Regression suites:
+
+```
+python test/inductor/test_triton_kernels.py
+python test/inductor/test_auto_functionalize.py
+python test/inductor/test_torchinductor.py -k as_strided
+python test/inductor/test_torchinductor_dynamic_shapes.py -k as_strided
+lintrunner -a
+```
+
+test_triton_kernels.py runs 428 tests with 2 failures, both
+test_tma_capture_and_functionalize_*_tma_version_new, which fail identically with
+this change reverted. Everything else passes.
+
+Also checked by hand against a deliberately poisoned caching allocator, so that
+corruption would be identifiable rather than incidental: static shapes,
+dynamic=True, inference_mode, no_grad, a non-dense offset view, and a mutable
+custom op taking an offset view all return correct results with no freed-memory
+values present.
+
+This change was authored with the assistance of an AI coding assistant (Claude
+Code). Claude Opus 5 (1M context) <noreply@anthropic.com>
+
+Signed-off-by: Kyle Mylonakis <kyle@protopia.ai>
+---
+ test/inductor/test_torchinductor.py           | 24 ++++++
+ test/inductor/test_triton_kernels.py          | 76 ++++++++++++++++++
+ torch/_higher_order_ops/triton_kernel_wrap.py | 79 ++++++++++++++++---
+ torch/_inductor/fx_passes/post_grad.py        |  3 +-
+ torch/_inductor/lowering.py                   | 18 +++++
+ torch/_prims_common/__init__.py               | 18 ++++-
+ 6 files changed, 203 insertions(+), 15 deletions(-)
+
+diff --git a/test/inductor/test_torchinductor.py b/test/inductor/test_torchinductor.py
+index 65ccdc3b4bbc5..94f9b56c78a49 100644
+--- a/test/inductor/test_torchinductor.py
++++ b/test/inductor/test_torchinductor.py
+@@ -7350,6 +7350,30 @@ def fn(x):
+ 
+         self.common(fn, (torch.arange(6, dtype=torch.float32),))
+ 
++    def test_as_strided_past_input_extent(self):
++        # A graph input aliasing a larger storage may legitimately be
++        # as_strided'd past its own extent: Inductor rebases the storage-relative
++        # offset onto the input pointer, so the read stays in bounds at runtime.
++        # The extent check on realized buffers must not reject this.
++        def fn(x):
++            return torch.as_strided(x, (12,), (1,), 0) + 1.0
++
++        # Not self.common: its host-to-device input copy compacts the view and
++        # drops the aliased storage this test is about.
++        base = torch.arange(12, dtype=torch.float32, device=self.device)
++        self.assertEqual(torch.compile(fn)(base[6:9]), fn(base[6:9]))
++
++    def test_as_strided_past_realized_buffer_raises(self):
++        # An intermediate is allocated to exactly its layout, so an as_strided past
++        # that extent has no data to read. Inductor must fail loudly rather than
++        # reinterpret unallocated memory into an unmasked load.
++        def fn(x):
++            y = x * 2
++            return torch.as_strided_copy(y, (2 * y.numel(),), (1,), 0)
++
++        with self.assertRaisesRegex(torch._inductor.exc.InductorError, "holds only"):
++            torch.compile(fn, fullgraph=True)(torch.randn(64, device=self.device))
++
+     def test_repeat_interleave(self):
+         def fn(x):
+             return (
+diff --git a/test/inductor/test_triton_kernels.py b/test/inductor/test_triton_kernels.py
+index beafcdeadb33f..00419c9bb33b6 100644
+--- a/test/inductor/test_triton_kernels.py
++++ b/test/inductor/test_triton_kernels.py
+@@ -36,6 +36,7 @@
+ from torch._library import capture_triton
+ from torch.testing import FileCheck
+ from torch.testing._internal import common_utils
++from torch.testing._internal.common_device_type import largeTensorTest
+ from torch.testing._internal.common_utils import (
+     parametrize,
+     skipIfRocm,
+@@ -1656,6 +1657,81 @@ def f(inp):
+         compiled_out = torch.compile(f)(inp)
+         self.assertEqual(compiled_out, eager_out)
+ 
++    @requires_gpu
++    @common_utils.parametrize("gap", [1, 2])
++    def test_triton_kernel_mutated_offset_view_not_miscompiled(self, gap):
++        # Functionalizing a mutated pointer arg used to clone the view itself, via an
++        # as_strided spanning storage_offset + span elements of the *base* storage.
++        # Once Inductor realized the view as its own buffer that extent was past the
++        # end, and the copy kernel read out of bounds with no mask -- returning freed
++        # memory for the elements the kernel chose not to write.
++        # gap=1 gives a dense row; gap=2 makes the view non-dense, so its clone has
++        # to materialize the gaps between elements as well.
++        @triton.jit
++        def maybe_fill_kernel(
++            out_ptr, do_write, n_cols, GAP: tl.constexpr, BLOCK: tl.constexpr
++        ):
++            # do_write has to stay a runtime arg: as a tl.constexpr Triton folds
++            # the store away and the pointer is no longer seen as mutated.
++            if do_write != 0:
++                offs = tl.arange(0, BLOCK)
++                tl.store(out_ptr + offs * GAP, 1.0, mask=offs < n_cols)
++
++        n_cols, n_rows, skipped_row = 256, 2, 1
++        width = n_cols * gap
++
++        def f():
++            base = torch.zeros(n_rows, width, device=GPU_TYPE)
++            for i in range(n_rows):
++                row = base[i : i + 1, ::gap]  # storage_offset = i * width
++                maybe_fill_kernel[(1,)](
++                    row, 0 if i == skipped_row else 1, n_cols, GAP=gap, BLOCK=n_cols
++                )
++                # The write-back is what forces the view to be realized as its own
++                # buffer, which is what used to put the as_strided out of bounds.
++                base[i : i + 1, ::gap] = row
++            return base
++
++        expected = torch.zeros(n_rows, width, device=GPU_TYPE)
++        for i in range(n_rows):
++            if i != skipped_row:
++                expected[i, ::gap] = 1.0
++        self.assertEqual(f(), expected)
++        self.assertEqual(torch.compile(f, fullgraph=True)(), expected)
++
++    @requires_gpu
++    @largeTensorTest("6GB", device=GPU_TYPE)
++    def test_triton_kernel_mutated_offset_view_large_tensor(self):
++        # Same shape as above, but the base holds more than 2**31 elements, so
++        # Inductor has to index its own generated kernels with int64. An int32 index
++        # would wrap and corrupt the row the kernel leaves alone.
++        @triton.jit
++        def maybe_fill_kernel(out_ptr, do_write, n_elements, BLOCK: tl.constexpr):
++            if do_write != 0:
++                offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++                tl.store(out_ptr + offs, 1, mask=offs < n_elements)
++
++        n_cols, n_rows, skipped_row, block = 2**30 + 1024, 2, 1, 1024
++        self.assertGreater(n_rows * n_cols, torch.iinfo(torch.int32).max)
++
++        def f():
++            base = torch.zeros(n_rows, n_cols, device=GPU_TYPE, dtype=torch.int8)
++            for i in range(n_rows):
++                row = base[i : i + 1]
++                maybe_fill_kernel[(triton.cdiv(n_cols, block),)](
++                    row, 0 if i == skipped_row else 1, n_cols, BLOCK=block
++                )
++                base[i : i + 1] = row
++            return base
++
++        out = torch.compile(f, fullgraph=True)()
++        # min/max per row rather than a full compare, which would need another copy
++        # of a multi-gigabyte tensor.
++        for i in range(n_rows):
++            want = 0 if i == skipped_row else 1
++            self.assertEqual(out[i].min().item(), want)
++            self.assertEqual(out[i].max().item(), want)
++
+     @requires_gpu
+     def test_triton_kernel_fallback(self):
+         def f(x, y):
+diff --git a/torch/_higher_order_ops/triton_kernel_wrap.py b/torch/_higher_order_ops/triton_kernel_wrap.py
+index 4c16850e55427..6545472f0b0a1 100644
+--- a/torch/_higher_order_ops/triton_kernel_wrap.py
++++ b/torch/_higher_order_ops/triton_kernel_wrap.py
+@@ -22,13 +22,16 @@
+ from torch._C import _dispatch_keys, DispatchKey
+ from torch._higher_order_ops.utils import redirect_to_mode, register_fake
+ from torch._ops import HigherOrderOperator
+-from torch._prims_common import clone_preserve_strides
++from torch._prims_common import (
++    clone_preserve_strides,
++    is_non_overlapping_and_dense_or_false,
++)
+ from torch.fx.experimental.proxy_tensor import (
+     disable_proxy_modes_tracing,
+     ProxyTorchDispatchMode,
+     track_tensor_tree,
+ )
+-from torch.fx.experimental.symbolic_shapes import guard_scalar
++from torch.fx.experimental.symbolic_shapes import guard_or_false, guard_scalar
+ from torch.types import IntLikeType
+ from torch.utils._ordered_set import OrderedSet
+ from torch.utils.checkpoint import _CachedTorchDispatchMode, _CachingTorchDispatchMode
+@@ -1329,13 +1332,14 @@ def _get_overloaded_args(
+         self, args: tuple[Any, ...], kwargs: dict[str, Any]
+     ) -> tuple[Tensor, ...]:
+         overloaded_args = list(super()._get_overloaded_args(args, kwargs))
+-        triton_kwargs = kwargs.get("kwargs")
+-        if isinstance(triton_kwargs, dict):
+-            overloaded_args.extend(
+-                arg
+-                for arg in triton_kwargs.values()
+-                if isinstance(arg, Tensor) and _dispatch_keys(arg).has("Python")
+-            )
++        for tensor_dict_name in ("kwargs", "tensor_bases"):
++            tensor_dict = kwargs.get(tensor_dict_name)
++            if isinstance(tensor_dict, dict):
++                overloaded_args.extend(
++                    arg
++                    for arg in tensor_dict.values()
++                    if isinstance(arg, Tensor) and _dispatch_keys(arg).has("Python")
++                )
+         return tuple(overloaded_args)
+ 
+ 
+@@ -1384,6 +1388,7 @@ def __call__(
+         kwargs: dict[str, Any],
+         tensors_to_clone: list[str],
+         launch_kwargs: tuple[str, ...] | None = None,
++        tensor_bases: dict[str, Tensor] | None = None,
+     ) -> dict[str, Any]:
+         hop_kwargs: dict[str, Any] = {
+             "kernel_idx": kernel_idx,
+@@ -1393,6 +1398,8 @@ def __call__(
+             "kwargs": kwargs,
+             "tensors_to_clone": tensors_to_clone,
+         }
++        if tensor_bases:
++            hop_kwargs["tensor_bases"] = tensor_bases
+         if launch_kwargs:
+             hop_kwargs["launch_kwargs"] = launch_kwargs
+ 
+@@ -1629,6 +1636,16 @@ def triton_kernel_wrapper_mutation_functionalize(
+     tensors_to_clone = get_mutated_tensors(
+         kernel_idx, constant_args_idx, unwrapped_kwargs, tma_descriptor_metadata
+     )
++    # A mutated arg that is a view has to be cloned through its base, and the base is
++    # only a tracked value out here -- reading _base inside the functional impl yields
++    # an untracked tensor that the tracer would lift to a constant. See
++    # clone_preserve_strides for why cloning the view itself is not graph-safe.
++    tensor_bases = {}
++    for key in tensors_to_clone:
++        tensor = kwargs[key]
++        base = tensor._base if isinstance(tensor, Tensor) else None
++        if base is not None:
++            tensor_bases[key] = ctx.unwrap_tensors(base)
+     with ctx.redispatch_to_next():
+         functional_kwargs: dict[str, Any] = {
+             "kernel_idx": kernel_idx,
+@@ -1638,6 +1655,8 @@ def triton_kernel_wrapper_mutation_functionalize(
+             "kwargs": unwrapped_kwargs,
+             "tensors_to_clone": tensors_to_clone,
+         }
++        if tensor_bases:
++            functional_kwargs["tensor_bases"] = tensor_bases
+         if launch_kwargs:
+             functional_kwargs["launch_kwargs"] = launch_kwargs
+         unwrapped_outputs = triton_kernel_wrapper_functional(**functional_kwargs)
+@@ -1663,6 +1682,31 @@ def triton_kernel_wrapper_mutation_functionalize(
+     return None
+ 
+ 
++def _clone_mutated_arg(
++    key: str, val: Tensor, tensor_bases: dict[str, Tensor] | None
++) -> Tensor:
++    """Clone a mutated pointer arg.
++
++    clone_preserve_strides allocates storage_offset + span elements and reads them
++    out of val's storage. Whenever that is more than val's own numel -- a non-zero
++    storage_offset, or gaps between val's elements -- part of the read lies outside
++    val, which a backend that realizes val as a buffer sized to val cannot supply.
++    """
++    if is_non_overlapping_and_dense_or_false(val):
++        if guard_or_false(val.storage_offset() == 0):
++            # storage_offset + span is exactly val's numel, so nothing outside val
++            # is read and this stays the cheapest thing that works.
++            return clone_preserve_strides(val)
++        # clone() reproduces the strides of a dense tensor and lands it at offset 0,
++        # so the clone spans exactly val's own elements. That is all a triton.jit
++        # kernel needs: it only ever sees a data pointer plus the strides passed to it.
++        return val.clone()
++    # Gaps have to be materialized as well, so the storage val sits in gets copied.
++    return clone_preserve_strides(
++        val, base=tensor_bases.get(key) if tensor_bases else None
++    )
++
++
+ @triton_kernel_wrapper_functional.py_impl(DispatchKey.CompositeExplicitAutograd)
+ def triton_kernel_wrapper_functional_dense(
+     *,
+@@ -1673,13 +1717,18 @@ def triton_kernel_wrapper_functional_dense(
+     kwargs: dict[str, Any],
+     tensors_to_clone: list[str],
+     launch_kwargs: tuple[str, ...] | None = None,
++    tensor_bases: dict[str, Tensor] | None = None,
+ ) -> dict[str, Any]:
+     # TODO(oulgen): For performance reasons, we want to ensure that these
+     # `clone_preserve_strides` calls are never executed at runtime
+     # (inductor should always optimize them away).
+     # Requires https://github.com/pytorch/pytorch/issues/109240
+     kwargs = {
+-        key: (clone_preserve_strides(val) if key in tensors_to_clone else val)
++        key: (
++            _clone_mutated_arg(key, val, tensor_bases)
++            if key in tensors_to_clone
++            else val
++        )
+         for key, val in kwargs.items()
+     }
+     mutation_kwargs: dict[str, Any] = {
+@@ -1705,13 +1754,14 @@ def triton_kernel_wrapper_functional_fake_tensor_mode(
+     kwargs: dict[str, Any],
+     tensors_to_clone: list[str],
+     launch_kwargs: tuple[str, ...] | None = None,
++    tensor_bases: dict[str, Tensor] | None = None,
+ ) -> dict[str, Any]:
+     # TODO(oulgen): For performance reasons, we want to ensure that these
+     # `clone_preserve_strides` calls are never executed at runtime
+     # (inductor should always optimize them away).
+     # Requires https://github.com/pytorch/pytorch/issues/109240
+     return {
+-        key: clone_preserve_strides(val)
++        key: _clone_mutated_arg(key, val, tensor_bases)
+         for key, val in kwargs.items()
+         if key in tensors_to_clone
+     }
+@@ -1728,6 +1778,7 @@ def triton_kernel_wrapper_functional_proxy_torch_dispatch_mode(
+     kwargs: dict[str, Any],
+     tensors_to_clone: list[str],
+     launch_kwargs: tuple[str, ...] | None = None,
++    tensor_bases: dict[str, Tensor] | None = None,
+ ) -> dict[str, Any]:
+     node_args: dict[str, Any] = {
+         "kernel_idx": kernel_idx,
+@@ -1737,6 +1788,8 @@ def triton_kernel_wrapper_functional_proxy_torch_dispatch_mode(
+         "kwargs": kwargs,
+         "tensors_to_clone": tensors_to_clone,
+     }
++    if tensor_bases:
++        node_args["tensor_bases"] = tensor_bases
+     if launch_kwargs:
+         node_args["launch_kwargs"] = launch_kwargs
+ 
+@@ -1760,8 +1813,10 @@ def triton_kernel_wrapper_functional_functionalize(
+     kwargs: dict[str, Any],
+     tensors_to_clone: list[str],
+     launch_kwargs: tuple[str, ...] | None = None,
++    tensor_bases: dict[str, Tensor] | None = None,
+ ) -> dict[str, Any]:
+     unwrapped_kwargs = ctx.unwrap_tensors(kwargs)  # type: ignore[arg-type]
++    unwrapped_tensor_bases = ctx.unwrap_tensors(tensor_bases)  # type: ignore[arg-type]
+     with ctx.redispatch_to_next():
+         functional_kwargs: dict[str, Any] = {
+             "kernel_idx": kernel_idx,
+@@ -1771,6 +1826,8 @@ def triton_kernel_wrapper_functional_functionalize(
+             "kwargs": unwrapped_kwargs,
+             "tensors_to_clone": tensors_to_clone,
+         }
++        if unwrapped_tensor_bases:
++            functional_kwargs["tensor_bases"] = unwrapped_tensor_bases
+         if launch_kwargs:
+             functional_kwargs["launch_kwargs"] = launch_kwargs
+         outputs = triton_kernel_wrapper_functional(**functional_kwargs)
+diff --git a/torch/_inductor/fx_passes/post_grad.py b/torch/_inductor/fx_passes/post_grad.py
+index aa75fe07978fd..e23c95cb1ea76 100644
+--- a/torch/_inductor/fx_passes/post_grad.py
++++ b/torch/_inductor/fx_passes/post_grad.py
+@@ -1448,8 +1448,9 @@ def _propagate_triton_eager_input_vals(
+         return
+ 
+     _, eager_kwargs = eager_input_vals
++    dropped = ("tensors_to_clone", "tensor_bases")
+     mutation_eager_kwargs = {
+-        key: value for key, value in eager_kwargs.items() if key != "tensors_to_clone"
++        key: value for key, value in eager_kwargs.items() if key not in dropped
+     }
+     # The dense decomposition introduces clones plus the mutation HOP, but only
+     # the mutation HOP should receive the eager-mode tensor metadata.
+diff --git a/torch/_inductor/lowering.py b/torch/_inductor/lowering.py
+index 421e5dd41f69f..35f46077ae779 100644
+--- a/torch/_inductor/lowering.py
++++ b/torch/_inductor/lowering.py
+@@ -1796,6 +1796,24 @@ def as_strided(
+         [sympy.expand(s) for s in stride],
+         sympy.expand(storage_offset),
+     )
++    # aten.as_strided offsets are storage-relative, but a realized buffer is
++    # allocated to exactly its own layout: whatever else the original tensor aliased
++    # is simply not there, so reinterpreting past the buffer would codegen an
++    # unmasked out-of-bounds read. InputBuffers are exempt -- their real storage may
++    # legitimately extend past the layout, and the adjustment above has already
++    # rebased the offset onto the incoming pointer.
++    needed, allocated = new_layout.storage_size(), old_layout.storage_size()
++    if not isinstance(storage_data, ir.InputBuffer):
++        if V.graph.sizevars.statically_known_gt(needed, allocated):
++            raise NotImplementedError(
++                f"as_strided({size}, {stride}, {storage_offset}) requires {needed} "
++                f"elements but {storage_data.get_name()} holds only {allocated}. This "
++                f"happens when a tensor aliasing a larger storage is realized as its own "
++                f"buffer; clone the base and re-derive the view instead."
++            )
++        # Symbolic extents are not always statically comparable, so guard rather
++        # than assume: an unprovable case must fail loudly, not silently read OOB.
++        V.graph.sizevars.check_leq(needed, allocated)
+     return TensorBox(ir.ReinterpretView(data=storage, layout=new_layout))
+ 
+ 
+diff --git a/torch/_prims_common/__init__.py b/torch/_prims_common/__init__.py
+index 9d0505b816e05..dfdc134a2cd93 100644
+--- a/torch/_prims_common/__init__.py
++++ b/torch/_prims_common/__init__.py
+@@ -2174,9 +2174,21 @@ def layout_or_default(layout: torch.layout | None) -> torch.layout:
+     return layout if layout is not None else torch.strided
+ 
+ 
+-def clone_preserve_strides(x):
++def clone_preserve_strides(x, *, base=None):
++    """Clone x, preserving its size, stride and storage_offset.
++
++    The clone spans storage_offset + span elements and is copied out of x's storage,
++    so it is only meaningful while all of that storage is addressable. That holds in
++    eager, but a tracing backend may materialize an intermediate view as a buffer
++    sized to the view alone, leaving the leading storage_offset elements outside any
++    allocation. Callers tracing a view with a non-zero storage_offset must therefore
++    pass its ``base``, so the clone is taken from the base and x's view re-derived
++    from it -- every access then stays inside one real buffer. See how
++    auto_functionalize clones mutable custom-op args via their bases.
++    """
++    src = x if base is None else base
+     needed_size = compute_required_storage_length(
+-        x.size(), x.stride(), x.storage_offset()
++        src.size(), src.stride(), src.storage_offset()
+     )
+     # Our eager implementations for *_scatter ops are all primitives w.r.t autograd,
+     # so these as_strided() calls are not seen by autograd.
+@@ -2191,7 +2203,7 @@ def clone_preserve_strides(x):
+         torch._C._dispatch_tls_set_dispatch_key_excluded(
+             torch._C.DispatchKey.ADInplaceOrView, True
+         )
+-        buffer = torch.as_strided(x, (needed_size,), (1,), 0).clone()
++        buffer = torch.as_strided(src, (needed_size,), (1,), 0).clone()
+         return torch.as_strided(buffer, x.size(), x.stride(), x.storage_offset())
+     finally:
+         torch._C._dispatch_tls_set_dispatch_key_excluded(
+
+From 8859e1c4d4323af6c0eb2c79af805d337cfbc765 Mon Sep 17 00:00:00 2001
+From: Kyle Mylonakis <kyle@protopia.ai>
+Date: Thu, 6 Aug 2026 03:41:21 -0500
+Subject: [PATCH 2/6] test: add regression test demonstrating that non-dense
+ non-zero offest tensors without a base can actually reach the introduced
+ kernel as a mutated triton kernel arg
+
+---
+ test/inductor/test_triton_kernels.py | 54 ++++++++++++++++++++++++++++
+ 1 file changed, 54 insertions(+)
+
+diff --git a/test/inductor/test_triton_kernels.py b/test/inductor/test_triton_kernels.py
+index 00419c9bb33b6..05e2796debeea 100644
+--- a/test/inductor/test_triton_kernels.py
++++ b/test/inductor/test_triton_kernels.py
+@@ -1699,6 +1699,60 @@ def f():
+         self.assertEqual(f(), expected)
+         self.assertEqual(torch.compile(f, fullgraph=True)(), expected)
+ 
++    @requires_gpu
++    @common_utils.parametrize("bind", ["slice", "set_"])
++    def test_triton_kernel_mutated_no_base_arg(self, bind):
++        # The other test's views are built inside the graph, so they always have a
++        # _base. A mutated arg reaches _clone_mutated_arg's base=None fallback when
++        # it is a graph input instead: a placeholder is rebuilt from metadata, which
++        # drops whatever _base the caller's tensor had. Tensor.set_() gets there too,
++        # but only from the caller -- inside a compiled region it graph breaks.
++        # base=None is right here, because such an arg lowers to an InputBuffer,
++        # whose storage-relative offset Inductor rebases onto the incoming pointer.
++        @triton.jit
++        def half_fill_kernel(out_ptr, n_cols, GAP: tl.constexpr, BLOCK: tl.constexpr):
++            # Skips the upper half, so a clone that read outside the arg shows up as
++            # garbage in elements the kernel never wrote.
++            offs = tl.arange(0, BLOCK)
++            tl.store(out_ptr + offs * GAP, 1.0, mask=offs < n_cols // 2)
++
++        n_cols, gap = 256, 2
++        width = n_cols * gap
++
++        def make_arg():
++            base = torch.arange(
++                2 * width, device=GPU_TYPE, dtype=torch.float32
++            ).reshape(2, width)
++            if bind == "slice":
++                return base[1:2, ::gap]
++            return torch.empty(0, device=GPU_TYPE).set_(
++                base.untyped_storage(), width, (n_cols,), (gap,)
++            )
++
++        def f(x):
++            half_fill_kernel[(1,)](x, n_cols, GAP=gap, BLOCK=n_cols)
++            return x.clone()
++
++        expected = make_arg().clone()
++        expected[..., : n_cols // 2] = 1.0
++        self.assertEqual(f(make_arg()), expected)
++
++        from torch._higher_order_ops import triton_kernel_wrap as tkw
++        from torch._prims_common import is_non_overlapping_and_dense_or_false
++
++        with mock.patch.object(
++            tkw, "_clone_mutated_arg", wraps=tkw._clone_mutated_arg
++        ) as clone_mock:
++            self.assertEqual(torch.compile(f, fullgraph=True)(make_arg()), expected)
++        # A dense arg, or one at offset 0, would take a different branch and leave
++        # this test covering nothing, so pin all three at the call site.
++        self.assertTrue(clone_mock.call_args_list)
++        for call in clone_mock.call_args_list:
++            _, val, tensor_bases = call.args
++            self.assertFalse(is_non_overlapping_and_dense_or_false(val))
++            self.assertNotEqual(val.storage_offset(), 0)
++            self.assertFalse(tensor_bases)
++
+     @requires_gpu
+     @largeTensorTest("6GB", device=GPU_TYPE)
+     def test_triton_kernel_mutated_offset_view_large_tensor(self):
+
+From 6f326bc268602dc9204c6855914291519746640e Mon Sep 17 00:00:00 2001
+From: Kyle Mylonakis <kyle@protopia.ai>
+Date: Fri, 7 Aug 2026 02:52:41 -0500
+Subject: [PATCH 3/6] fix: prevent tensor from having less size than the base
+ its storage is derived from
+
+---
+ test/inductor/test_triton_kernels.py | 31 +++++++++++++++++++++-------
+ torch/_prims_common/__init__.py      | 16 ++++++++++++++
+ 2 files changed, 39 insertions(+), 8 deletions(-)
+
+diff --git a/test/inductor/test_triton_kernels.py b/test/inductor/test_triton_kernels.py
+index 05e2796debeea..c9652bfd973d5 100644
+--- a/test/inductor/test_triton_kernels.py
++++ b/test/inductor/test_triton_kernels.py
+@@ -1677,11 +1677,24 @@ def maybe_fill_kernel(
+                 offs = tl.arange(0, BLOCK)
+                 tl.store(out_ptr + offs * GAP, 1.0, mask=offs < n_cols)
+ 
+-        n_cols, n_rows, skipped_row = 256, 2, 1
++        # The skipped row is the detector, and two things decide whether it detects
++        # anything. Its contents must be something stale memory cannot return by luck:
++        # a zeros base caught nothing at gap=1 because the over-extent read came back
++        # zeroed as well, and a uniform fill is matched whenever the read lands in
++        # another copy of that fill, so use one distinct value per element. And the
++        # row has to sit far enough from offset 0 that the read overshoots by several
++        # rows -- at skipped_row=1 it lands one row short and finds the same values it
++        # was supposed to read, which is a pass for the wrong reason.
++        n_cols, n_rows, skipped_row = 256, 8, 7
+         width = n_cols * gap
+ 
++        def make_base():
++            return torch.arange(
++                1, n_rows * width + 1, dtype=torch.float32, device=GPU_TYPE
++            ).reshape(n_rows, width)
++
+         def f():
+-            base = torch.zeros(n_rows, width, device=GPU_TYPE)
++            base = make_base()
+             for i in range(n_rows):
+                 row = base[i : i + 1, ::gap]  # storage_offset = i * width
+                 maybe_fill_kernel[(1,)](
+@@ -1692,7 +1705,7 @@ def f():
+                 base[i : i + 1, ::gap] = row
+             return base
+ 
+-        expected = torch.zeros(n_rows, width, device=GPU_TYPE)
++        expected = make_base()
+         for i in range(n_rows):
+             if i != skipped_row:
+                 expected[i, ::gap] = 1.0
+@@ -1756,9 +1769,10 @@ def f(x):
+     @requires_gpu
+     @largeTensorTest("6GB", device=GPU_TYPE)
+     def test_triton_kernel_mutated_offset_view_large_tensor(self):
+-        # Same shape as above, but the base holds more than 2**31 elements, so
+-        # Inductor has to index its own generated kernels with int64. An int32 index
+-        # would wrap and corrupt the row the kernel leaves alone.
++        # The bug itself is shape-independent -- the same over-extent read is emitted
++        # at any size. What only a base past 2**31 elements covers is index width:
++        # Inductor has to promote its own generated kernels to int64, and an int32
++        # index would wrap and corrupt the row the kernel leaves alone.
+         @triton.jit
+         def maybe_fill_kernel(out_ptr, do_write, n_elements, BLOCK: tl.constexpr):
+             if do_write != 0:
+@@ -1766,10 +1780,11 @@ def maybe_fill_kernel(out_ptr, do_write, n_elements, BLOCK: tl.constexpr):
+                 tl.store(out_ptr + offs, 1, mask=offs < n_elements)
+ 
+         n_cols, n_rows, skipped_row, block = 2**30 + 1024, 2, 1, 1024
++        fill = 7  # not zero, so stale memory reading back zeroed is still a failure
+         self.assertGreater(n_rows * n_cols, torch.iinfo(torch.int32).max)
+ 
+         def f():
+-            base = torch.zeros(n_rows, n_cols, device=GPU_TYPE, dtype=torch.int8)
++            base = torch.full((n_rows, n_cols), fill, device=GPU_TYPE, dtype=torch.int8)
+             for i in range(n_rows):
+                 row = base[i : i + 1]
+                 maybe_fill_kernel[(triton.cdiv(n_cols, block),)](
+@@ -1782,7 +1797,7 @@ def f():
+         # min/max per row rather than a full compare, which would need another copy
+         # of a multi-gigabyte tensor.
+         for i in range(n_rows):
+-            want = 0 if i == skipped_row else 1
++            want = fill if i == skipped_row else 1
+             self.assertEqual(out[i].min().item(), want)
+             self.assertEqual(out[i].max().item(), want)
+ 
+diff --git a/torch/_prims_common/__init__.py b/torch/_prims_common/__init__.py
+index dfdc134a2cd93..e2c24477bc84c 100644
+--- a/torch/_prims_common/__init__.py
++++ b/torch/_prims_common/__init__.py
+@@ -2185,11 +2185,27 @@ def clone_preserve_strides(x, *, base=None):
+     pass its ``base``, so the clone is taken from the base and x's view re-derived
+     from it -- every access then stays inside one real buffer. See how
+     auto_functionalize clones mutable custom-op args via their bases.
++
++    A ``base`` must span all of x: the buffer is sized to the base's required
++    extent, and x is then re-derived from it at x's own storage_offset. Anything
++    x addresses beyond that extent is not in the clone. Eager catches this when
++    setStorage bounds-checks the re-derive, but under fake tensors it passes and
++    codegens an out-of-bounds read, so the contract is checked explicitly.
+     """
+     src = x if base is None else base
+     needed_size = compute_required_storage_length(
+         src.size(), src.stride(), src.storage_offset()
+     )
++    if base is not None:
++        x_size = compute_required_storage_length(
++            x.size(), x.stride(), x.storage_offset()
++        )
++        torch._check(
++            x_size <= needed_size,
++            lambda: f"clone_preserve_strides: base spans {needed_size} elements but x "
++            f"addresses {x_size}, so cloning through the base would drop what x needs. "
++            f"Pass a base that spans x, or omit base to clone x's own storage.",
++        )
+     # Our eager implementations for *_scatter ops are all primitives w.r.t autograd,
+     # so these as_strided() calls are not seen by autograd.
+     # We need to mimic this behavior in our ref/prim implementations.
+
+From bf07041e04a0707824222cab1245b5d9f015393c Mon Sep 17 00:00:00 2001
+From: Kyle Mylonakis <kyle@protopia.ai>
+Date: Mon, 17 Aug 2026 14:05:34 -0500
+Subject: [PATCH 4/6] Bound the as_strided extent guard by the allocation, not
+ the layout
+
+The extent check this PR added to the as_strided lowering compared the
+requested extent against `old_layout.storage_size()`, the buffer's logical
+layout. That is not what a buffer holds. `inplace_constant_pad_nd()`
+deliberately allocates a buffer larger than its layout so a later pad can be
+written in place, records the enlarged size in `V.graph.buffer_to_padded_size`,
+and codegen sizes the allocation through `V.graph.get_allocation_storage_size()`.
+Bounding by the layout therefore rejected that intentional over-allocation as if
+it were a view reaching past its buffer, breaking `test_linear_and_cel`,
+`test_pad_non_zero_memory_leak` and `test_donated_buffer_inplace_gpt` with
+errors of the form "requires 51511256 elements but buf1 holds only 51511249",
+where the difference is exactly the pad width.
+
+The guard now takes its bound from `get_allocation_storage_size()`, which is the
+same number codegen allocates by, so a deliberate over-allocation is accepted
+while a genuinely undersized buffer is still rejected. The registration in
+`buffer_to_padded_size` happens before the `as_strided` call it feeds, so the
+padded size is already visible when the guard runs. The alternative was to
+special-case buffers appearing in `buffer_to_padded_size`; asking the allocation
+directly was preferred because it is the single source of truth codegen already
+uses and stays correct for any future pass that inflates an allocation.
+
+Two comments were overstated and are corrected here. A realized buffer is not
+"allocated to exactly its own layout" -- that is the assumption this fix
+removes. And an unprovable symbolic extent does not "fail loudly": `check_leq`
+raises only when the shape env can refute the inequality, and otherwise defers a
+runtime assertion.
+
+The new tests cover two review questions. The inference-mode test answers
+whether `tensor._base` survives `torch.inference_mode()`, since if it did not,
+the mutated-view clone would fall back to spanning the base extent of a buffer
+sized to the view; it does survive, because AOTAutograd re-enables view tracking
+for tracing, and forcing `base = None` makes the test fail. The two unbacked
+tests pin what the deferred half of the guard actually does: an over-extent that
+can only be refuted at runtime is caught on a cold cache but not on a warm FX
+graph cache, because a cache hit replays the artifact without re-running this
+lowering, so the deferred assertion is never registered. They disable caches to
+pin the covered half, and the comment now states the uncovered half rather than
+implying the guard is total.
+
+Review `torch/_inductor/lowering.py` first, then the tests.
+
+Test Plan:
+
+The three tests that the layout-bound guard broke, each confirmed failing before
+this change and passing after:
+
+```
+python test/inductor/test_inplace_padding.py
+python test/inductor/test_torchinductor.py -k test_donated_buffer_inplace_gpt
+python test/inductor/test_aot_inductor.py -k test_pad_non_zero_memory_leak
+```
+
+The extent-check and mutated-view regressions, on CPU and CUDA:
+
+```
+python test/inductor/test_torchinductor.py -k as_strided
+python test/inductor/test_triton_kernels.py -k mutated
+```
+
+Results: inplace padding 9/9, donated buffer 1/1, AOTI pad 2/2 (2 skipped for
+MPS/CPU-only), as_strided 20/20, mutated 7/7. Lint via `spin lint` and
+`lintrunner -a` is clean. Run on an NVIDIA GB10 (sm_121, aarch64).
+
+This change was authored with the assistance of an AI coding agent (Claude).
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ test/inductor/test_torchinductor.py  | 28 +++++++++++++++
+ test/inductor/test_triton_kernels.py | 51 ++++++++++++++++++++++++++++
+ torch/_inductor/lowering.py          | 29 ++++++++++------
+ 3 files changed, 97 insertions(+), 11 deletions(-)
+
+diff --git a/test/inductor/test_torchinductor.py b/test/inductor/test_torchinductor.py
+index 886cf3d57a898..03d7c205d9079 100644
+--- a/test/inductor/test_torchinductor.py
++++ b/test/inductor/test_torchinductor.py
+@@ -7418,6 +7418,34 @@ def fn(x):
+         with self.assertRaisesRegex(torch._inductor.exc.InductorError, "holds only"):
+             torch.compile(fn, fullgraph=True)(torch.randn(64, device=self.device))
+ 
++    @torch._inductor.config.patch(force_disable_caches=True)
++    def test_as_strided_past_unbacked_buffer_extent(self):
++        # Same over-extent, but with an unbacked size the comparison cannot be
++        # decided while compiling: statically_known_gt is false and check_leq only
++        # defers a runtime assertion. That assertion is registered by the as_strided
++        # lowering, so it exists only while that lowering runs -- a warm FX graph
++        # cache replays the artifact without it and the read goes through unchecked.
++        # Caches are disabled here so this pins the half that is covered.
++        def fn(x):
++            y = x * 2
++            return torch.as_strided_copy(y, (128,), (1,), 0)
++
++        inp = torch.randn(64, device=self.device)
++        torch._dynamo.decorators.mark_unbacked(inp, 0)
++        with self.assertRaises((RuntimeError, AssertionError)):
++            torch.compile(fn, fullgraph=True)(inp)
++
++    def test_as_strided_within_unbacked_buffer_extent(self):
++        # The complement: an unbacked buffer that does turn out to be large enough
++        # must still compile and run, so the guard cannot reject on unprovable alone.
++        def fn(x):
++            y = x * 2
++            return torch.as_strided_copy(y, (128,), (1,), 0)
++
++        inp = torch.randn(256, device=self.device)
++        torch._dynamo.decorators.mark_unbacked(inp, 0)
++        self.assertEqual(torch.compile(fn, fullgraph=True)(inp), fn(inp))
++
+     def test_repeat_interleave(self):
+         def fn(x):
+             return (
+diff --git a/test/inductor/test_triton_kernels.py b/test/inductor/test_triton_kernels.py
+index c9652bfd973d5..f2a4da25da489 100644
+--- a/test/inductor/test_triton_kernels.py
++++ b/test/inductor/test_triton_kernels.py
+@@ -1766,6 +1766,57 @@ def f(x):
+             self.assertNotEqual(val.storage_offset(), 0)
+             self.assertFalse(tensor_bases)
+ 
++    @requires_gpu
++    def test_triton_kernel_mutated_offset_view_inference_mode(self):
++        # The gapped regression above traces with view tracking on, so the mutated
++        # arg always carries a _base. inference_mode disables ADInplaceOrView;
++        # FunctionalTensor records ancestry in _inference_mode_base instead, but only
++        # under the export configs that populate it. If the base is lost here the
++        # clone goes back to spanning storage_offset + span of a buffer sized to the
++        # view alone -- either the original silent miscompile, or the InductorError
++        # the as_strided extent check now raises for it. Both fail this test.
++        @triton.jit
++        def maybe_fill_kernel(
++            out_ptr, do_write, n_cols, GAP: tl.constexpr, BLOCK: tl.constexpr
++        ):
++            if do_write != 0:
++                offs = tl.arange(0, BLOCK)
++                tl.store(out_ptr + offs * GAP, 1.0, mask=offs < n_cols)
++
++        n_cols, n_rows, skipped_row, gap = 256, 8, 7, 2
++        width = n_cols * gap
++
++        def make_base():
++            return torch.arange(
++                1, n_rows * width + 1, dtype=torch.float32, device=GPU_TYPE
++            ).reshape(n_rows, width)
++
++        def f():
++            base = make_base()
++            for i in range(n_rows):
++                row = base[i : i + 1, ::gap]
++                maybe_fill_kernel[(1,)](
++                    row, 0 if i == skipped_row else 1, n_cols, GAP=gap, BLOCK=n_cols
++                )
++                base[i : i + 1, ::gap] = row
++            return base
++
++        from torch._higher_order_ops import triton_kernel_wrap as tkw
++
++        with torch.inference_mode():
++            expected = make_base()
++            for i in range(n_rows):
++                if i != skipped_row:
++                    expected[i, ::gap] = 1.0
++            with mock.patch.object(
++                tkw, "_clone_mutated_arg", wraps=tkw._clone_mutated_arg
++            ) as clone_mock:
++                self.assertEqual(torch.compile(f, fullgraph=True)(), expected)
++        # Numerics are the contract; this pins the mechanism, so a change that stops
++        # threading the base fails here instead of passing on whatever memory holds.
++        self.assertTrue(clone_mock.call_args_list)
++        self.assertTrue(any(call.args[2] for call in clone_mock.call_args_list))
++
+     @requires_gpu
+     @largeTensorTest("6GB", device=GPU_TYPE)
+     def test_triton_kernel_mutated_offset_view_large_tensor(self):
+diff --git a/torch/_inductor/lowering.py b/torch/_inductor/lowering.py
+index 22a62004669be..e866f188b98a9 100644
+--- a/torch/_inductor/lowering.py
++++ b/torch/_inductor/lowering.py
+@@ -1802,23 +1802,30 @@ def as_strided(
+         [sympy.expand(s) for s in stride],
+         sympy.expand(storage_offset),
+     )
+-    # aten.as_strided offsets are storage-relative, but a realized buffer is
+-    # allocated to exactly its own layout: whatever else the original tensor aliased
+-    # is simply not there, so reinterpreting past the buffer would codegen an
+-    # unmasked out-of-bounds read. InputBuffers are exempt -- their real storage may
+-    # legitimately extend past the layout, and the adjustment above has already
+-    # rebased the offset onto the incoming pointer.
+-    needed, allocated = new_layout.storage_size(), old_layout.storage_size()
+-    if not isinstance(storage_data, ir.InputBuffer):
++    # aten.as_strided offsets are storage-relative, but a realized buffer holds only
++    # what was allocated for it: whatever else the original tensor aliased is simply
++    # not there, so reinterpreting past the buffer would codegen an unmasked
++    # out-of-bounds read. The bound is the allocation and not the layout, because
++    # inplace padding deliberately over-allocates and records that in
++    # buffer_to_padded_size, which is what codegen sizes the buffer by. InputBuffers
++    # are exempt -- their real storage may legitimately extend past the layout, and
++    # the adjustment above has already rebased the offset onto the incoming pointer.
++    needed = new_layout.storage_size()
++    buffer = storage_data if isinstance(storage_data, ir.Buffer) else None
++    if buffer is not None and not isinstance(buffer, ir.InputBuffer):
++        allocated = V.graph.get_allocation_storage_size(buffer)
+         if V.graph.sizevars.statically_known_gt(needed, allocated):
+             raise NotImplementedError(
+                 f"as_strided({size}, {stride}, {storage_offset}) requires {needed} "
+-                f"elements but {storage_data.get_name()} holds only {allocated}. This "
++                f"elements but {buffer.get_name()} holds only {allocated}. This "
+                 f"happens when a tensor aliasing a larger storage is realized as its own "
+                 f"buffer; clone the base and re-derive the view instead."
+             )
+-        # Symbolic extents are not always statically comparable, so guard rather
+-        # than assume: an unprovable case must fail loudly, not silently read OOB.
++        # Symbolic extents are not always statically comparable: check_leq raises
++        # when the shape env can refute this, and otherwise defers a runtime
++        # assertion. A warm FX graph cache replays the artifact without re-running
++        # this lowering, so the deferred half does not survive a cache hit -- backed
++        # shapes fail loudly either way, an unbacked over-extent may not.
+         V.graph.sizevars.check_leq(needed, allocated)
+     return TensorBox(ir.ReinterpretView(data=storage, layout=new_layout))
+ 
+
+From 2c01073d8f0f121c10c5c06166157602ce4e2575 Mon Sep 17 00:00:00 2001
+From: Kyle Mylonakis <kyle@protopia.ai>
+Date: Mon, 17 Aug 2026 14:18:37 -0500
+Subject: [PATCH 5/6] Cover the column-slice-of-an-intermediate geometry from
+ #161115
+
+The existing regressions here slice rows out of a freshly created base with a
+strided `::gap` view. The shape that reaches this bug from real workloads looks
+different: a contiguous column prefix of an intermediate, non-dense because the
+row stride is much larger than the slice, at a zero storage_offset. That is what
+the minimal repro for #161115 does, and it exercises a different realization path
+-- the base is a computed buffer rather than an input -- so the existing
+parametrization did not reach it.
+
+n_rows is load-bearing and the value is not arbitrary. Measured against the
+pre-fix code with this same kernel and slicing: at 8 rows Inductor keeps the view
+inside the workspace buffer, so there is no undersized allocation and nothing to
+detect; at 64 rows the clone is filled from past the end of the buffer and 3584
+of 32768 elements come back wrong; at 512 rows the read leaves the allocation
+entirely and raises a CUDA illegal memory access, which would poison the context
+for every test that followed it in the same process. 64 is the smallest of those
+that reproduces the corruption without faulting.
+
+This also confirms the fix covers #161115. Reverting the four torch/ files this
+PR touches to the merge base makes the new test fail, and restoring them makes it
+pass; the issue's own minimal repro behaves the same way, miscompiling 2092990 of
+2097152 elements before the fix and passing three cold-cache runs after it. The
+manifestation differs from the issue report -- it was filed as a hard CUDA
+illegal memory access and reproduces here as silent NaNs -- because whether an
+out-of-bounds read faults depends on whether the address happens to be mapped.
+No `Fixes` keyword is claimed: what was verified is the minimal repro rather than
+the original vLLM workload, so closing that issue is left to its assignee.
+
+Test Plan:
+
+```
+python test/inductor/test_triton_kernels.py -k mutated
+```
+
+8/8 pass. The new test was confirmed to fail before the fix and pass after it, by
+checking the touched files out at the merge base and back:
+
+```
+git checkout $(git merge-base HEAD upstream/main) -- torch/_higher_order_ops/triton_kernel_wrap.py torch/_prims_common/__init__.py torch/_inductor/lowering.py torch/_inductor/fx_passes/post_grad.py
+python test/inductor/test_triton_kernels.py -k test_triton_kernel_mutated_column_slice_of_intermediate
+git checkout HEAD -- torch/_higher_order_ops/triton_kernel_wrap.py torch/_prims_common/__init__.py torch/_inductor/lowering.py torch/_inductor/fx_passes/post_grad.py
+python test/inductor/test_triton_kernels.py -k test_triton_kernel_mutated_column_slice_of_intermediate
+```
+
+Pre-fix: FAILED, 3584/32768 elements mismatched. Post-fix: OK. `lintrunner -a` is
+clean. Run on an NVIDIA GB10 (sm_121, aarch64).
+
+This change was authored with the assistance of an AI coding agent (Claude).
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ test/inductor/test_triton_kernels.py | 33 ++++++++++++++++++++++++++++
+ 1 file changed, 33 insertions(+)
+
+diff --git a/test/inductor/test_triton_kernels.py b/test/inductor/test_triton_kernels.py
+index f2a4da25da489..d8f67c377ba3a 100644
+--- a/test/inductor/test_triton_kernels.py
++++ b/test/inductor/test_triton_kernels.py
+@@ -1817,6 +1817,39 @@ def f():
+         self.assertTrue(clone_mock.call_args_list)
+         self.assertTrue(any(call.args[2] for call in clone_mock.call_args_list))
+ 
++    @requires_gpu
++    def test_triton_kernel_mutated_column_slice_of_intermediate(self):
++        # Regression for the minimal repro in #161115, the shape that reaches this
++        # from real workloads: the mutated arg is a contiguous column prefix of an
++        # intermediate, so it is non-dense with a large row stride but a zero
++        # storage_offset. Cloning it through as_strided spans
++        # row_stride * (rows - 1) + cols elements of a buffer allocated for
++        # rows * cols, so the clone is filled from past the end of that buffer and
++        # every value the kernel reads back is whatever the memory held.
++        # n_rows matters: below about 64 Inductor keeps the view inside the
++        # workspace buffer and there is nothing out of bounds to catch, and far
++        # above it the read runs off the allocation into a hard CUDA fault that
++        # would take the rest of the suite with it.
++        @triton.jit
++        def scale_inplace_kernel(x_ptr, row_stride, n_cols, BLOCK: tl.constexpr):
++            row = tl.program_id(0)
++            offs = tl.arange(0, BLOCK)
++            mask = offs < n_cols
++            vals = tl.load(x_ptr + row * row_stride + offs, mask=mask)
++            tl.store(x_ptr + row * row_stride + offs, vals * 2.0, mask=mask)
++
++        n_rows, width, n_cols = 64, 4096, 512
++
++        def f(base):
++            workspace = torch.tanh(base)
++            x = workspace[:, :n_cols]
++            scale_inplace_kernel[(n_rows,)](x, x.stride(0), n_cols, BLOCK=n_cols)
++            return x
++
++        base = torch.randn(n_rows, width, device=GPU_TYPE)
++        expected = torch.tanh(base)[:, :n_cols] * 2.0
++        self.assertEqual(torch.compile(f, fullgraph=True)(base), expected)
++
+     @requires_gpu
+     @largeTensorTest("6GB", device=GPU_TYPE)
+     def test_triton_kernel_mutated_offset_view_large_tensor(self):
+
+From fe09e293fc137dc47bf0593db8b7d3a8c80d02a3 Mon Sep 17 00:00:00 2001
+From: Kyle Mylonakis <kyle@protopia.ai>
+Date: Thu, 3 Sep 2026 03:06:07 -0500
+Subject: [PATCH 6/6] Skip test_as_strided_past_input_extent on ROCm
+
+The test compiles as_strided(x, (12,), (1,), 0) + 1.0 for x = base[6:9].
+Inductor rebases the storage-relative offset onto the input's data pointer
+(#184232), so the generated kernel loads in_ptr0 + (-6 + x0). On CUDA that
+is plain pointer arithmetic and the result matches eager. On the ROCm MI350
+CI runners the six loads at negative offsets read back 0, so indices 1-5
+come out as 1.0 instead of 2.0-6.0 ("Mismatched elements: 5 / 12").
+
+This is pre-existing on main rather than caused by this PR: the lowering
+change here exempts InputBuffers, so it plays no part in this kernel, and
+the rebasing test added with #184232 only runs on CPU, so nothing had
+exercised a negative rebased offset on a ROCm GPU before. The likely cause
+is Triton's AMD backend enabling buffer ops by default; buffer loads take an
+unsigned 32-bit offset and return 0 when it is out of range. That has not
+been verified on hardware.
+
+Rewriting the test to over-read forward (x = base[0:3]) would pass on ROCm
+but would stop exercising the negative rebase, which is the realistic shape
+from #139628, so the test is kept and skipped on ROCm instead. The skip sits
+on the CommonTemplate method, so it also covers test_compile_subprocess.py.
+A ROCm issue is being filed separately and the skip message can point at it
+once it exists.
+
+Test Plan:
+
+Lint on the changed file:
+
+```
+spin quicklint
+lintrunner -a test/inductor/test_torchinductor.py
+```
+
+Not run locally: the local build is stale against the merged source. CI
+evidence from the previous PR commit (819614e28c8): the test passed on the
+CUDA inductor jobs and failed only on
+
+- https://github.com/pytorch/pytorch/actions/runs/33675357509/job/100405054717
+- https://github.com/pytorch/pytorch/actions/runs/33675357509/job/100405054641
+- https://github.com/pytorch/pytorch/actions/runs/33675357509/job/100405054556
+
+Authored with the help of an AI assistant (Claude Code).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ test/inductor/test_torchinductor.py | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/test/inductor/test_torchinductor.py b/test/inductor/test_torchinductor.py
+index 17ed6904144de..ddadc62c8202b 100644
+--- a/test/inductor/test_torchinductor.py
++++ b/test/inductor/test_torchinductor.py
+@@ -7480,6 +7480,7 @@ def fn(x):
+ 
+         self.common(fn, (torch.arange(6, dtype=torch.float32),))
+ 
++    @skipIfRocm(msg="loads before the graph input pointer read back 0 on ROCm")
+     def test_as_strided_past_input_extent(self):
+         # A graph input aliasing a larger storage may legitimately be
+         # as_strided'd past its own extent: Inductor rebases the storage-relative

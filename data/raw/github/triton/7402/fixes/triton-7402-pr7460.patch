@@ -1,0 +1,3212 @@
+From bb38b4e1d0214d4c6960acf2f79693efc994f28d Mon Sep 17 00:00:00 2001
+From: Wenqin Yang <wenqin.yang1@gmail.com>
+Date: Thu, 10 Jul 2025 22:45:05 +0800
+Subject: [PATCH 01/53] try to broadcast the result for atomic rmw op
+
+---
+ .../nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp  | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
+index 17c5dbbb6650..260f2572a53f 100644
+--- a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
++++ b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
+@@ -1080,6 +1080,7 @@ struct AtomicRMWOpConversion
+       atom.o(semStr).o(rmwOp).v(vec).o(sTy);
+       if (tensorTy) {
+         atom(dstOpr, ptrOpr, valOpr).maybePredicate(pred);
++        // atom(dstOpr, ptrOpr, valOpr);
+         Type retType;
+         if (vec > 1) {
+           SmallVector<Type> retTys(vec, valueElemTy);
+@@ -1092,6 +1093,11 @@ struct AtomicRMWOpConversion
+ 
+         auto ret = ptxBuilderAtomicRMW.launch(rewriter, loc, retType);
+ 
++        // Just implement warp level broadcasting, if elements > 32, we should
++        // do block level broadcasting.
++        auto inline_asm = ptxBuilderAtomicRMW.launch(rewriter, loc, retType);
++        auto ret = targetInfo.shuffleIdx(rewriter, loc, inline_asm, 0);
++
+         if (vec > 1) {
+           for (unsigned ii = 0; ii < vec; ++ii) {
+             resultVals[i + ii] = b.extract_val(valueElemTy, ret, ii);
+
+From 597a2037467c496816a646f58173e98b2e7e1902 Mon Sep 17 00:00:00 2001
+From: Wenqin Yang <wenqin.yang1@gmail.com>
+Date: Sun, 13 Jul 2025 21:22:04 +0800
+Subject: [PATCH 02/53] implement atomic_rmw result broadcasting
+
+---
+ lib/Analysis/Allocation.cpp                   |  9 ++-
+ test/Conversion/tritongpu_to_llvm.mlir        |  8 +--
+ .../LoadStoreOpToLLVM.cpp                     | 58 ++++++++++++++++---
+ 3 files changed, 61 insertions(+), 14 deletions(-)
+
+diff --git a/lib/Analysis/Allocation.cpp b/lib/Analysis/Allocation.cpp
+index b1e7f87e4f3d..d81ba33549f1 100644
+--- a/lib/Analysis/Allocation.cpp
++++ b/lib/Analysis/Allocation.cpp
+@@ -213,8 +213,13 @@ unsigned defaultAllocationAnalysisScratchSizeFn(Operation *op) {
+     auto value = op->getOperand(0);
+     // only scalar requires scratch memory
+     // make it explicit for readability
+-    if (dyn_cast<RankedTensorType>(value.getType())) {
+-      return 0;
++    if (auto tensorTy = dyn_cast<RankedTensorType>(value.getType())) {
++      auto shape = tensorTy.getShape();
++      int elems = 1;
++      for (auto dim_size : shape) {
++        elems *= dim_size;
++      }
++      return (getBitwidth(tensorTy) / 8) * elems;
+     }
+     auto smemShape = getRepShapeForAtomic(op->getResult(0));
+     auto elems = getNumScratchElements(smemShape);
+diff --git a/test/Conversion/tritongpu_to_llvm.mlir b/test/Conversion/tritongpu_to_llvm.mlir
+index daa9ce4fdb7e..178eb08809ea 100644
+--- a/test/Conversion/tritongpu_to_llvm.mlir
++++ b/test/Conversion/tritongpu_to_llvm.mlir
+@@ -1457,9 +1457,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "cuda:80"} {
+   // CHECK-LABEL: atomic_add_f32
+   tt.func @atomic_add_f32(%arg0 : tensor<256x!tt.ptr<f32>, #blocked0>, %arg1 : tensor<256xi1, #blocked0>, %arg2 : tensor<256xf32, #blocked0>) {
+-    // CHECK: llvm.inline_asm
++    // CHECK: llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "mov.u32 $0, 0x0;
+     // CHECK-SAME: @$3 atom.global.gpu.relaxed.add.f32
+-    // CHECK: llvm.inline_asm
++    // CHECK: llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "mov.u32 $0, 0x0;
+     // CHECK-SAME: @$3 atom.global.gpu.relaxed.add.f32
+     %0 = tt.atomic_rmw fadd, relaxed, gpu, %arg0, %arg2, %arg1 : (tensor<256x!tt.ptr<f32>, #blocked0>, tensor<256xf32, #blocked0>, tensor<256xi1, #blocked0>) -> tensor<256xf32, #blocked0>
+     tt.return
+@@ -1485,9 +1485,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.tar
+ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "cuda:80"} {
+   // CHECK-LABEL: atomic_add_f32
+   tt.func @atomic_add_f32_sys_scope(%arg0 : tensor<256x!tt.ptr<f32>, #blocked0>, %arg1 : tensor<256xi1, #blocked0>, %arg2 : tensor<256xf32, #blocked0>) {
+-    // CHECK: llvm.inline_asm
++    // CHECK: llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "mov.u32 $0, 0x0;
+     // CHECK-SAME: @$3 atom.global.sys.relaxed.add.f32
+-    // CHECK: llvm.inline_asm
++    // CHECK: llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "mov.u32 $0, 0x0;
+     // CHECK-SAME: @$3 atom.global.sys.relaxed.add.f32
+     %0 = tt.atomic_rmw fadd, relaxed, sys, %arg0, %arg2, %arg1 : (tensor<256x!tt.ptr<f32>, #blocked0>, tensor<256xf32, #blocked0>, tensor<256xi1, #blocked0>) -> tensor<256xf32, #blocked0>
+     tt.return
+diff --git a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
+index 260f2572a53f..ea9ec825f0a5 100644
+--- a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
++++ b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
+@@ -17,6 +17,7 @@
+ #include "triton/Dialect/TritonGPU/IR/Attributes.h"
+ #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+ #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
++#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
+ #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+ #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
+ #include "triton/Tools/LayoutUtils.h"
+@@ -1080,7 +1081,6 @@ struct AtomicRMWOpConversion
+       atom.o(semStr).o(rmwOp).v(vec).o(sTy);
+       if (tensorTy) {
+         atom(dstOpr, ptrOpr, valOpr).maybePredicate(pred);
+-        // atom(dstOpr, ptrOpr, valOpr);
+         Type retType;
+         if (vec > 1) {
+           SmallVector<Type> retTys(vec, valueElemTy);
+@@ -1091,26 +1091,68 @@ struct AtomicRMWOpConversion
+           retType = valueElemTy;
+         }
+ 
+-        auto ret = ptxBuilderAtomicRMW.launch(rewriter, loc, retType);
++        auto after_add = ptxBuilderAtomicRMW.launch(rewriter, loc, retType);
++        LinearLayout dstLayout =
++            ttg::toLinearLayout(tensorTy.getShape(), tensorTy.getEncoding());
+ 
+-        // Just implement warp level broadcasting, if elements > 32, we should
+-        // do block level broadcasting.
+-        auto inline_asm = ptxBuilderAtomicRMW.launch(rewriter, loc, retType);
+-        auto ret = targetInfo.shuffleIdx(rewriter, loc, inline_asm, 0);
++        Value smemBase = LLVM::getSharedMemoryBase(loc, rewriter, targetInfo,
++                                                   op.getOperation());
++        auto smemPtrTy = ptr_ty(ctx, 3);
++
++        StringAttr kRegister = str_attr("register");
++        StringAttr kLane = str_attr("lane");
++        StringAttr kWarp = str_attr("warp");
++        StringAttr kBlock = str_attr("block");
++        auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
++
++        auto smemOffset = applyLinearLayout(loc, rewriter, dstLayout,
++                                            {{kRegister, b.i32_val(0)},
++                                             {kLane, laneId},
++                                             {kWarp, warpId},
++                                             {kBlock, b.i32_val(0)}})[0]
++                              .second;
+ 
+         if (vec > 1) {
++          // TODO(Wenqin): try to use packLLVector for pack umpacked_elems and
++          // load it through vectorization.
++          auto umpacked_elems = unpackLLElements(loc, after_add, rewriter);
++          auto vecAddr = b.gep(smemPtrTy, valueElemTy, smemBase, smemOffset,
++                               LLVM::GEPNoWrapFlags::inbounds);
+           for (unsigned ii = 0; ii < vec; ++ii) {
+-            resultVals[i + ii] = b.extract_val(valueElemTy, ret, ii);
++            targetInfo.storeDShared(rewriter, loc, vecAddr, std::nullopt,
++                                    umpacked_elems[ii],
++                                    pred ? pred : b.true_val());
++            b.barrier();
++            Value ret =
++                targetInfo.loadDShared(rewriter, loc, vecAddr, std::nullopt,
++                                       valueElemTy, b.true_val());
++            resultVals[i + ii] = ret;
+           }
++          auto umpacked_elems = unpackLLElements(loc, after_add, rewriter);
+         } else if (packed > 1) {
++          auto vecAddr = b.gep(smemPtrTy, packedTy, smemBase, smemOffset,
++                               LLVM::GEPNoWrapFlags::inbounds);
++          targetInfo.storeDShared(rewriter, loc, vecAddr, std::nullopt,
++                                  after_add, pred ? pred : b.true_val());
++          b.barrier();
++          Value ret = targetInfo.loadDShared(
++              rewriter, loc, vecAddr, std::nullopt, packedTy, b.true_val());
+           for (unsigned ii = 0; ii < packed; ++ii) {
+             resultVals[i + ii] =
+                 b.extract_element(valueElemTy, ret, b.i32_val(ii));
+           }
+         } else {
++          auto vecAddr = b.gep(smemPtrTy, valueElemTy, smemBase, smemOffset,
++                               LLVM::GEPNoWrapFlags::inbounds);
++          Value valsVec =
++              packLLVector(loc, ArrayRef<Value>(after_add), rewriter);
++          targetInfo.storeDShared(rewriter, loc, vecAddr, std::nullopt, valsVec,
++                                  pred ? pred : b.true_val());
++          b.barrier();
++          Value ret = targetInfo.loadDShared(
++              rewriter, loc, vecAddr, std::nullopt, valueElemTy, b.true_val());
+           resultVals[i] = ret;
+         }
+-
+       } else {
+         auto ASMReturnTy = void_ty(ctx);
+         atom(dstOpr, ptrOpr, valOpr).maybePredicate(pred);
+
+From 31febe7fb5f98bf7d7c7d43c689239665234ab29 Mon Sep 17 00:00:00 2001
+From: Wenqin Yang <wenqin.yang1@gmail.com>
+Date: Mon, 14 Jul 2025 21:26:05 +0800
+Subject: [PATCH 03/53] try to avoid broadcasting when there is no user
+
+---
+ lib/Analysis/Allocation.cpp                   |  7 ++
+ python/test/unit/language/test_core.py        | 17 ++++
+ test/Conversion/tritongpu_to_llvm.mlir        | 16 +++-
+ .../LoadStoreOpToLLVM.cpp                     | 96 +++++++++----------
+ 4 files changed, 84 insertions(+), 52 deletions(-)
+
+diff --git a/lib/Analysis/Allocation.cpp b/lib/Analysis/Allocation.cpp
+index d81ba33549f1..7bb4e05688fe 100644
+--- a/lib/Analysis/Allocation.cpp
++++ b/lib/Analysis/Allocation.cpp
+@@ -214,6 +214,13 @@ unsigned defaultAllocationAnalysisScratchSizeFn(Operation *op) {
+     // only scalar requires scratch memory
+     // make it explicit for readability
+     if (auto tensorTy = dyn_cast<RankedTensorType>(value.getType())) {
++      Value result = op->getResult(0);
++      int numUsers = std::distance(result.use_begin(), result.use_end());
++      if (numUsers == 0) {
++        // we didn't need shared memory to broadcast result of AtomicRMW op if
++        // there is no user for it.
++        return 0;
++      }
+       auto shape = tensorTy.getShape();
+       int elems = 1;
+       for (auto dim_size : shape) {
+diff --git a/python/test/unit/language/test_core.py b/python/test/unit/language/test_core.py
+index c9b4a6a93705..dc2c8da7f7be 100644
+--- a/python/test/unit/language/test_core.py
++++ b/python/test/unit/language/test_core.py
+@@ -2003,6 +2003,23 @@ def kernel(I, O):
+         kernel[(1, )](I, O)
+ 
+ 
++@pytest.mark.parametrize("dtype_str", ["int32", "uint32"])
++@pytest.mark.parametrize("dim_size", [8, 128, 256])
++def test_atomic_result_broadcast(dtype_str, dim_size, device):
++
++    @triton.jit
++    def kernel(index_ptr, out_ptr, dim: tl.constexpr):
++        write_index = tl.atomic_add(index_ptr + tl.arange(0, 1), val=1, sem="relaxed")
++        tl.store(out_ptr + write_index[:, None] * dim + tl.arange(0, dim)[None, :], tl.full([1, dim], 5,
++                                                                                            dtype=tl.int64))
++
++    index = torch.zeros([200], device=device, dtype=getattr(torch, dtype_str))
++    index[0] = 1
++    out = torch.zeros([3, dim_size], device=device, dtype=torch.int64)
++    kernel[(1, )](index, out, dim_size)
++    assert (out[1] == 5).all()
++
++
+ # ---------------
+ # test cast
+ # ---------------
+diff --git a/test/Conversion/tritongpu_to_llvm.mlir b/test/Conversion/tritongpu_to_llvm.mlir
+index 178eb08809ea..8a7563daf2d9 100644
+--- a/test/Conversion/tritongpu_to_llvm.mlir
++++ b/test/Conversion/tritongpu_to_llvm.mlir
+@@ -1485,9 +1485,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.tar
+ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "cuda:80"} {
+   // CHECK-LABEL: atomic_add_f32
+   tt.func @atomic_add_f32_sys_scope(%arg0 : tensor<256x!tt.ptr<f32>, #blocked0>, %arg1 : tensor<256xi1, #blocked0>, %arg2 : tensor<256xf32, #blocked0>) {
+-    // CHECK: llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "mov.u32 $0, 0x0;
++    // CHECK: llvm.inline_asm
+     // CHECK-SAME: @$3 atom.global.sys.relaxed.add.f32
+-    // CHECK: llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "mov.u32 $0, 0x0;
++    // CHECK: llvm.inline_asm
+     // CHECK-SAME: @$3 atom.global.sys.relaxed.add.f32
+     %0 = tt.atomic_rmw fadd, relaxed, sys, %arg0, %arg2, %arg1 : (tensor<256x!tt.ptr<f32>, #blocked0>, tensor<256xf32, #blocked0>, tensor<256xi1, #blocked0>) -> tensor<256xf32, #blocked0>
+     tt.return
+@@ -1496,6 +1496,18 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.tar
+ 
+ // -----
+ 
++#blocked0 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0], CTAsPerCGA = [1], CTASplitNum = [1], CTAOrder = [0]}>
++module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "cuda:80"} {
++  // CHECK-LABEL: atomic_add_no_broadcasting
++  tt.func @atomic_add_no_broadcasting(%arg0 : tensor<16x!tt.ptr<f32>, #blocked0>, %arg1 : tensor<16xi1, #blocked0>, %arg2 : tensor<16xf32, #blocked0>) {
++    // CHECK-NOT: @$2 st.shared.
++    %0 = tt.atomic_rmw fadd, relaxed, sys, %arg0, %arg2, %arg1 : (tensor<16x!tt.ptr<f32>, #blocked0>, tensor<16xf32, #blocked0>, tensor<16xi1, #blocked0>) -> tensor<16xf32, #blocked0>
++    tt.return
++  }
++}
++
++// -----
++
+ #blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [2], order = [0], CTAsPerCGA = [1], CTASplitNum = [1], CTAOrder = [0]}>
+ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+   tt.func public @atomic_add_f16_nomask(%dest_ptrs: tensor<256x!tt.ptr<f16>, #blocked> {tt.divisibility = 16 : i32, tt.contiguity = 16 : i32}, %data: tensor<256xf16, #blocked>) attributes {noinline = false} {
+diff --git a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
+index ea9ec825f0a5..2110c550c522 100644
+--- a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
++++ b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
+@@ -1091,66 +1091,62 @@ struct AtomicRMWOpConversion
+           retType = valueElemTy;
+         }
+ 
+-        auto after_add = ptxBuilderAtomicRMW.launch(rewriter, loc, retType);
+-        LinearLayout dstLayout =
+-            ttg::toLinearLayout(tensorTy.getShape(), tensorTy.getEncoding());
+-
+-        Value smemBase = LLVM::getSharedMemoryBase(loc, rewriter, targetInfo,
+-                                                   op.getOperation());
+-        auto smemPtrTy = ptr_ty(ctx, 3);
+-
+-        StringAttr kRegister = str_attr("register");
+-        StringAttr kLane = str_attr("lane");
+-        StringAttr kWarp = str_attr("warp");
+-        StringAttr kBlock = str_attr("block");
+-        auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
+-
+-        auto smemOffset = applyLinearLayout(loc, rewriter, dstLayout,
+-                                            {{kRegister, b.i32_val(0)},
+-                                             {kLane, laneId},
+-                                             {kWarp, warpId},
+-                                             {kBlock, b.i32_val(0)}})[0]
+-                              .second;
++        auto after_rmw = ptxBuilderAtomicRMW.launch(rewriter, loc, retType);
++        Value ret = after_rmw;
++        if (op->hasAttr("allocation.offset")) {
++          // If the AtomicRMW has the "allocation.offset", we suppose its
++          // results will be used in later, so we will broadcasting it.
++          LinearLayout dstLayout =
++              ttg::toLinearLayout(tensorTy.getShape(), tensorTy.getEncoding());
++
++          Value smemBase = LLVM::getSharedMemoryBase(loc, rewriter, targetInfo,
++                                                     op.getOperation());
++          auto smemPtrTy = ptr_ty(ctx, 3);
++
++          StringAttr kRegister = str_attr("register");
++          StringAttr kLane = str_attr("lane");
++          StringAttr kWarp = str_attr("warp");
++          StringAttr kBlock = str_attr("block");
++          auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
++
++          auto smemOffset = applyLinearLayout(loc, rewriter, dstLayout,
++                                              {{kRegister, b.i32_val(0)},
++                                               {kLane, laneId},
++                                               {kWarp, warpId},
++                                               {kBlock, b.i32_val(0)}})[0]
++                                .second;
++
++          auto smemAddr = b.gep(smemPtrTy, retType, smemBase, smemOffset,
++                                LLVM::GEPNoWrapFlags::inbounds);
++          Value vals;
++
++          if (vec > 1) {
++            SmallVector<Value> umpacked_elems =
++                unpackLLElements(loc, after_rmw, rewriter);
++            vals = packLLVector(loc, umpacked_elems, rewriter);
++          } else if (packed > 1) {
++            vals = after_rmw;
++          } else {
++            vals = packLLVector(loc, ArrayRef<Value>(after_rmw), rewriter);
++          }
++
++          targetInfo.storeDShared(rewriter, loc, smemAddr, std::nullopt, vals,
++                                  pred ? pred : b.true_val());
++          b.barrier();
++          ret = targetInfo.loadDShared(rewriter, loc, smemAddr, std::nullopt,
++                                       retType, b.true_val());
++        }
+ 
+         if (vec > 1) {
+-          // TODO(Wenqin): try to use packLLVector for pack umpacked_elems and
+-          // load it through vectorization.
+-          auto umpacked_elems = unpackLLElements(loc, after_add, rewriter);
+-          auto vecAddr = b.gep(smemPtrTy, valueElemTy, smemBase, smemOffset,
+-                               LLVM::GEPNoWrapFlags::inbounds);
+           for (unsigned ii = 0; ii < vec; ++ii) {
+-            targetInfo.storeDShared(rewriter, loc, vecAddr, std::nullopt,
+-                                    umpacked_elems[ii],
+-                                    pred ? pred : b.true_val());
+-            b.barrier();
+-            Value ret =
+-                targetInfo.loadDShared(rewriter, loc, vecAddr, std::nullopt,
+-                                       valueElemTy, b.true_val());
+-            resultVals[i + ii] = ret;
++            resultVals[i + ii] = b.extract_val(valueElemTy, ret, ii);
+           }
+-          auto umpacked_elems = unpackLLElements(loc, after_add, rewriter);
+         } else if (packed > 1) {
+-          auto vecAddr = b.gep(smemPtrTy, packedTy, smemBase, smemOffset,
+-                               LLVM::GEPNoWrapFlags::inbounds);
+-          targetInfo.storeDShared(rewriter, loc, vecAddr, std::nullopt,
+-                                  after_add, pred ? pred : b.true_val());
+-          b.barrier();
+-          Value ret = targetInfo.loadDShared(
+-              rewriter, loc, vecAddr, std::nullopt, packedTy, b.true_val());
+           for (unsigned ii = 0; ii < packed; ++ii) {
+             resultVals[i + ii] =
+                 b.extract_element(valueElemTy, ret, b.i32_val(ii));
+           }
+         } else {
+-          auto vecAddr = b.gep(smemPtrTy, valueElemTy, smemBase, smemOffset,
+-                               LLVM::GEPNoWrapFlags::inbounds);
+-          Value valsVec =
+-              packLLVector(loc, ArrayRef<Value>(after_add), rewriter);
+-          targetInfo.storeDShared(rewriter, loc, vecAddr, std::nullopt, valsVec,
+-                                  pred ? pred : b.true_val());
+-          b.barrier();
+-          Value ret = targetInfo.loadDShared(
+-              rewriter, loc, vecAddr, std::nullopt, valueElemTy, b.true_val());
+           resultVals[i] = ret;
+         }
+       } else {
+
+From ec0ce4cf1923f944305d02a1421a45e8cb943237 Mon Sep 17 00:00:00 2001
+From: Wenqin Yang <wenqin.yang1@gmail.com>
+Date: Wed, 16 Jul 2025 20:20:18 +0800
+Subject: [PATCH 04/53] address comments
+
+---
+ lib/Analysis/Allocation.cpp                   |  8 +-
+ .../LoadStoreOpToLLVM.cpp                     | 76 +++++++++++++++----
+ 2 files changed, 64 insertions(+), 20 deletions(-)
+
+diff --git a/lib/Analysis/Allocation.cpp b/lib/Analysis/Allocation.cpp
+index 7bb4e05688fe..fb97ce009e3c 100644
+--- a/lib/Analysis/Allocation.cpp
++++ b/lib/Analysis/Allocation.cpp
+@@ -214,17 +214,15 @@ unsigned defaultAllocationAnalysisScratchSizeFn(Operation *op) {
+     // only scalar requires scratch memory
+     // make it explicit for readability
+     if (auto tensorTy = dyn_cast<RankedTensorType>(value.getType())) {
+-      Value result = op->getResult(0);
+-      int numUsers = std::distance(result.use_begin(), result.use_end());
+-      if (numUsers == 0) {
++      if (op->getResult(0).use_empty()) {
+         // we didn't need shared memory to broadcast result of AtomicRMW op if
+         // there is no user for it.
+         return 0;
+       }
+       auto shape = tensorTy.getShape();
+       int elems = 1;
+-      for (auto dim_size : shape) {
+-        elems *= dim_size;
++      for (auto dimSize : shape) {
++        elems *= dimSize;
+       }
+       return (getBitwidth(tensorTy) / 8) * elems;
+     }
+diff --git a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
+index 2110c550c522..d22fbc6b6ec6 100644
+--- a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
++++ b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
+@@ -1091,13 +1091,13 @@ struct AtomicRMWOpConversion
+           retType = valueElemTy;
+         }
+ 
+-        auto after_rmw = ptxBuilderAtomicRMW.launch(rewriter, loc, retType);
+-        Value ret = after_rmw;
++        auto afterRMW = ptxBuilderAtomicRMW.launch(rewriter, loc, retType);
++        Value ret = afterRMW;
+         if (op->hasAttr("allocation.offset")) {
+           // If the AtomicRMW has the "allocation.offset", we suppose its
+-          // results will be used in later, so we will broadcasting it.
+-          LinearLayout dstLayout =
+-              ttg::toLinearLayout(tensorTy.getShape(), tensorTy.getEncoding());
++          // value before atomic RMW will be used in later, so we will
++          // broadcasting it.
++          LinearLayout smemLayout = ttg::toLinearLayout(tensorTy);
+ 
+           Value smemBase = LLVM::getSharedMemoryBase(loc, rewriter, targetInfo,
+                                                      op.getOperation());
+@@ -1107,9 +1107,10 @@ struct AtomicRMWOpConversion
+           StringAttr kLane = str_attr("lane");
+           StringAttr kWarp = str_attr("warp");
+           StringAttr kBlock = str_attr("block");
++          StringAttr kOffset = str_attr("offset");
+           auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
+ 
+-          auto smemOffset = applyLinearLayout(loc, rewriter, dstLayout,
++          auto smemOffset = applyLinearLayout(loc, rewriter, smemLayout,
+                                               {{kRegister, b.i32_val(0)},
+                                                {kLane, laneId},
+                                                {kWarp, warpId},
+@@ -1121,20 +1122,65 @@ struct AtomicRMWOpConversion
+           Value vals;
+ 
+           if (vec > 1) {
+-            SmallVector<Value> umpacked_elems =
+-                unpackLLElements(loc, after_rmw, rewriter);
+-            vals = packLLVector(loc, umpacked_elems, rewriter);
++            SmallVector<Value> unpackedElems =
++                unpackLLElements(loc, afterRMW, rewriter);
++            vals = packLLVector(loc, unpackedElems, rewriter);
+           } else if (packed > 1) {
+-            vals = after_rmw;
++            vals = afterRMW;
+           } else {
+-            vals = packLLVector(loc, ArrayRef<Value>(after_rmw), rewriter);
++            vals = packLLVector(loc, ArrayRef<Value>(afterRMW), rewriter);
+           }
+ 
+-          targetInfo.storeDShared(rewriter, loc, smemAddr, std::nullopt, vals,
+-                                  pred ? pred : b.true_val());
++          auto emitSt = [&](ConversionPatternRewriter &rewriter, Location loc,
++                            ArrayRef<Value> vals, Value shmemAddr, int idx,
++                            VectorType vecTy) -> SmallVector<Value> {
++            auto length = vecTy.getNumElements();
++            Value valsVec = packLLVector(
++                loc, ArrayRef<Value>(vals).slice(idx, length), rewriter);
++            targetInfo.storeDShared(rewriter, loc, shmemAddr, std::nullopt,
++                                    valsVec,
++                                    /*pred=*/pred ? pred : b.true_val());
++            return {};
++          };
++
++          auto emitLd = [&](ConversionPatternRewriter &rewriter, Location loc,
++                            ArrayRef<Value> vals, Value shmemAddr, int idx,
++                            VectorType vecTy) -> SmallVector<Value> {
++            auto length = vecTy.getNumElements();
++            assert(vals.empty());
++            Value valsVec =
++                targetInfo.loadDShared(rewriter, loc, shmemAddr, std::nullopt,
++                                       vecTy, /*pred=*/b.true_val());
++            return unpackLLVector(loc, valsVec, rewriter);
++          };
++
++          // TODO(Wenqin): we may not use smemLayout.getTotalOutDimSize(),
++          // because we use a loop to traversal, so we didn't map all offset in
++          // one iteration, but there is no correctness issue, and could save
++          // SMEM usage.
++          auto cvt = smemLayout.reshapeOuts(
++              {{kOffset, smemLayout.getTotalOutDimSize()}});
++          cvt = cvt.sublayout({kLane, kWarp}, {kOffset});
++          // we only process vec*packed elements in one iteration, so we have to
++          // modify the LL for reigister input dim.
++          cvt =
++              LinearLayout::identity1D(vec * packed, kRegister, kOffset) * cvt;
++
++          SmallVector<Value> valsArray = unpackLLVector(loc, vals, rewriter);
++          lowerLdSt(loc, ctx, cvt, valsArray, valueElemTy, smemBase, rewriter,
++                    targetInfo, {}, emitSt);
+           b.barrier();
+-          ret = targetInfo.loadDShared(rewriter, loc, smemAddr, std::nullopt,
+-                                       retType, b.true_val());
++          auto unpackedRet =
++              lowerLdSt(loc, ctx, cvt, std::nullopt, valueElemTy, smemBase,
++                        rewriter, targetInfo, {}, emitLd);
++          if (vec > 1) {
++            ret = packLLVector(loc, unpackedRet, rewriter);
++          } else if (packed > 1) {
++            ret = packLLElements(loc, getTypeConverter(), unpackedRet, rewriter,
++                                 retType);
++          } else {
++            ret = unpackedRet[0];
++          }
+         }
+ 
+         if (vec > 1) {
+
+From b6f35163d18fb0de9547f71040c22c2b378f2fd0 Mon Sep 17 00:00:00 2001
+From: Wenqin Yang <wenqin.yang1@gmail.com>
+Date: Thu, 17 Jul 2025 18:55:11 +0800
+Subject: [PATCH 05/53] address comments
+
+---
+ .../LoadStoreOpToLLVM.cpp                     | 54 ++-----------------
+ 1 file changed, 4 insertions(+), 50 deletions(-)
+
+diff --git a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
+index d22fbc6b6ec6..75334f6745a5 100644
+--- a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
++++ b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
+@@ -1107,7 +1107,6 @@ struct AtomicRMWOpConversion
+           StringAttr kLane = str_attr("lane");
+           StringAttr kWarp = str_attr("warp");
+           StringAttr kBlock = str_attr("block");
+-          StringAttr kOffset = str_attr("offset");
+           auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
+ 
+           auto smemOffset = applyLinearLayout(loc, rewriter, smemLayout,
+@@ -1131,56 +1130,11 @@ struct AtomicRMWOpConversion
+             vals = packLLVector(loc, ArrayRef<Value>(afterRMW), rewriter);
+           }
+ 
+-          auto emitSt = [&](ConversionPatternRewriter &rewriter, Location loc,
+-                            ArrayRef<Value> vals, Value shmemAddr, int idx,
+-                            VectorType vecTy) -> SmallVector<Value> {
+-            auto length = vecTy.getNumElements();
+-            Value valsVec = packLLVector(
+-                loc, ArrayRef<Value>(vals).slice(idx, length), rewriter);
+-            targetInfo.storeDShared(rewriter, loc, shmemAddr, std::nullopt,
+-                                    valsVec,
+-                                    /*pred=*/pred ? pred : b.true_val());
+-            return {};
+-          };
+-
+-          auto emitLd = [&](ConversionPatternRewriter &rewriter, Location loc,
+-                            ArrayRef<Value> vals, Value shmemAddr, int idx,
+-                            VectorType vecTy) -> SmallVector<Value> {
+-            auto length = vecTy.getNumElements();
+-            assert(vals.empty());
+-            Value valsVec =
+-                targetInfo.loadDShared(rewriter, loc, shmemAddr, std::nullopt,
+-                                       vecTy, /*pred=*/b.true_val());
+-            return unpackLLVector(loc, valsVec, rewriter);
+-          };
+-
+-          // TODO(Wenqin): we may not use smemLayout.getTotalOutDimSize(),
+-          // because we use a loop to traversal, so we didn't map all offset in
+-          // one iteration, but there is no correctness issue, and could save
+-          // SMEM usage.
+-          auto cvt = smemLayout.reshapeOuts(
+-              {{kOffset, smemLayout.getTotalOutDimSize()}});
+-          cvt = cvt.sublayout({kLane, kWarp}, {kOffset});
+-          // we only process vec*packed elements in one iteration, so we have to
+-          // modify the LL for reigister input dim.
+-          cvt =
+-              LinearLayout::identity1D(vec * packed, kRegister, kOffset) * cvt;
+-
+-          SmallVector<Value> valsArray = unpackLLVector(loc, vals, rewriter);
+-          lowerLdSt(loc, ctx, cvt, valsArray, valueElemTy, smemBase, rewriter,
+-                    targetInfo, {}, emitSt);
++          targetInfo.storeDShared(rewriter, loc, smemAddr, std::nullopt, vals,
++                                  pred ? pred : b.true_val());
+           b.barrier();
+-          auto unpackedRet =
+-              lowerLdSt(loc, ctx, cvt, std::nullopt, valueElemTy, smemBase,
+-                        rewriter, targetInfo, {}, emitLd);
+-          if (vec > 1) {
+-            ret = packLLVector(loc, unpackedRet, rewriter);
+-          } else if (packed > 1) {
+-            ret = packLLElements(loc, getTypeConverter(), unpackedRet, rewriter,
+-                                 retType);
+-          } else {
+-            ret = unpackedRet[0];
+-          }
++          ret = targetInfo.loadDShared(rewriter, loc, smemAddr, std::nullopt,
++                                       retType, b.true_val());
+         }
+ 
+         if (vec > 1) {
+
+From a924f9ff6a6d9e9621e7fa81b3b55fee086b1d50 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Fri, 18 Jul 2025 12:25:09 -0400
+Subject: [PATCH 06/53] Init ld/st
+
+---
+ lib/Analysis/Allocation.cpp                   |  39 +++---
+ .../LoadStoreOpToLLVM.cpp                     | 119 +++++++++++-------
+ 2 files changed, 93 insertions(+), 65 deletions(-)
+
+diff --git a/lib/Analysis/Allocation.cpp b/lib/Analysis/Allocation.cpp
+index fb97ce009e3c..daa6f1ceb50c 100644
+--- a/lib/Analysis/Allocation.cpp
++++ b/lib/Analysis/Allocation.cpp
+@@ -92,14 +92,26 @@ static SmallVector<unsigned> getRepShapeForCvt(RankedTensorType srcTy,
+   return repShape;
+ }
+ 
+-// Both `atomic_cas` and `atomic_rmw need a single scratch element if returning
+-// a scalar value because Triton's block-based programming model ensures that
+-// all threads in each block see the same return value, even those threads that
+-// do not participate in the atomic operation
++// Both `atomic_cas` and `atomic_rmw` may need scratch memory to store values
++// because Triton's block-based programming model ensures that
++// all threads sharing the same partition of the tensor see the same values,
++// even for threads that do not participate in the atomic operation
+ static SmallVector<unsigned> getRepShapeForAtomic(Value result) {
+   SmallVector<unsigned> smemShape;
+   if (atomicNeedsSharedMemory(result)) {
+-    smemShape.push_back(1);
++    if (auto tensorTy = dyn_cast<RankedTensorType>(result.getType())) {
++      // If the result is a tensor, we need to allocate a scratch memory of size
++      // equal to the number of unique elements in the tensor shape.
++      // gpu::ShapePerCTATile removes the broadcasted elements
++      auto shapePerCTA = gpu::getShapePerCTATile(tensorTy);
++      auto tensorShape = tensorTy.getShape();
++      if (product(shapePerCTA) < product(tensorShape)) {
++        smemShape = shapePerCTA;
++      }
++    } else {
++      // If the result is a scalar, we need to allocate a single element.
++      smemShape.push_back(1);
++    }
+   }
+   return smemShape;
+ }
+@@ -211,23 +223,10 @@ unsigned defaultAllocationAnalysisScratchSizeFn(Operation *op) {
+   }
+   if (isa<AtomicRMWOp, AtomicCASOp>(op)) {
+     auto value = op->getOperand(0);
+-    // only scalar requires scratch memory
+-    // make it explicit for readability
+-    if (auto tensorTy = dyn_cast<RankedTensorType>(value.getType())) {
+-      if (op->getResult(0).use_empty()) {
+-        // we didn't need shared memory to broadcast result of AtomicRMW op if
+-        // there is no user for it.
+-        return 0;
+-      }
+-      auto shape = tensorTy.getShape();
+-      int elems = 1;
+-      for (auto dimSize : shape) {
+-        elems *= dimSize;
+-      }
+-      return (getBitwidth(tensorTy) / 8) * elems;
+-    }
+     auto smemShape = getRepShapeForAtomic(op->getResult(0));
+     auto elems = getNumScratchElements(smemShape);
++    if (elems == 0)
++      return 0;
+     auto elemTy = cast<PointerType>(value.getType()).getPointeeType();
+     assert(!isa<PointerType>(elemTy) && "unexpected pointer type");
+     return elems * std::max<int>(8, elemTy.getIntOrFloatBitWidth()) / 8;
+diff --git a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
+index 75334f6745a5..8c00bc4d4835 100644
+--- a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
++++ b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
+@@ -704,6 +704,41 @@ struct AtomicCASOpConversion
+     }
+ 
+     if (tensorTy) {
++      if (op->hasAttr("allocation.offset")) {
++        auto dstLayout = ttg::toLinearLayout(tensorTy);
++        auto smemBase = LLVM::getSharedMemoryBase(loc, rewriter, targetInfo,
++                                                  op.getOperation());
++
++        auto emitLdStCommon = [&](auto &&func, SmallVector<Value> &vals) {
++          return lowerLdSt(loc, ctx, dstLayout, vals, valueElemTy, smemBase,
++                           /*affineOffset=*/b.i32_val(0),
++                           /*maskSpanAffineOffset=*/0, rewriter, targetInfo, {},
++                           func);
++        };
++
++        auto emitSt = [&](ConversionPatternRewriter &rewriter, Location loc,
++                          ArrayRef<Value> vals, Value shmemAddr, int idx,
++                          VectorType vecTy) -> SmallVector<Value> {
++          auto length = vecTy.getNumElements();
++          Value valsVec = packLLVector(
++              loc, ArrayRef<Value>(vals).slice(idx, length), rewriter);
++          targetInfo.storeDShared(rewriter, loc, shmemAddr, std::nullopt,
++                                  valsVec, threadPred);
++          return {};
++        };
++
++        auto emitLd = [&](ConversionPatternRewriter &rewriter, Location loc,
++                          ArrayRef<Value> vals, Value shmemAddr, int idx,
++                          VectorType vecTy) -> SmallVector<Value> {
++          Value loadedVec = targetInfo.loadDShared(
++              rewriter, loc, shmemAddr, std::nullopt, vecTy, b.true_val());
++          return unpackLLElements(loc, loadedVec, rewriter);
++        };
++
++        emitLdStCommon(emitSt, resultVals);
++        b.barrier();
++        resultVals = emitLdStCommon(emitLd, resultVals);
++      }
+       Type structTy = getTypeConverter()->convertType(tensorTy);
+       Value resultStruct = packLLElements(loc, getTypeConverter(), resultVals,
+                                           rewriter, structTy);
+@@ -1091,51 +1126,7 @@ struct AtomicRMWOpConversion
+           retType = valueElemTy;
+         }
+ 
+-        auto afterRMW = ptxBuilderAtomicRMW.launch(rewriter, loc, retType);
+-        Value ret = afterRMW;
+-        if (op->hasAttr("allocation.offset")) {
+-          // If the AtomicRMW has the "allocation.offset", we suppose its
+-          // value before atomic RMW will be used in later, so we will
+-          // broadcasting it.
+-          LinearLayout smemLayout = ttg::toLinearLayout(tensorTy);
+-
+-          Value smemBase = LLVM::getSharedMemoryBase(loc, rewriter, targetInfo,
+-                                                     op.getOperation());
+-          auto smemPtrTy = ptr_ty(ctx, 3);
+-
+-          StringAttr kRegister = str_attr("register");
+-          StringAttr kLane = str_attr("lane");
+-          StringAttr kWarp = str_attr("warp");
+-          StringAttr kBlock = str_attr("block");
+-          auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
+-
+-          auto smemOffset = applyLinearLayout(loc, rewriter, smemLayout,
+-                                              {{kRegister, b.i32_val(0)},
+-                                               {kLane, laneId},
+-                                               {kWarp, warpId},
+-                                               {kBlock, b.i32_val(0)}})[0]
+-                                .second;
+-
+-          auto smemAddr = b.gep(smemPtrTy, retType, smemBase, smemOffset,
+-                                LLVM::GEPNoWrapFlags::inbounds);
+-          Value vals;
+-
+-          if (vec > 1) {
+-            SmallVector<Value> unpackedElems =
+-                unpackLLElements(loc, afterRMW, rewriter);
+-            vals = packLLVector(loc, unpackedElems, rewriter);
+-          } else if (packed > 1) {
+-            vals = afterRMW;
+-          } else {
+-            vals = packLLVector(loc, ArrayRef<Value>(afterRMW), rewriter);
+-          }
+-
+-          targetInfo.storeDShared(rewriter, loc, smemAddr, std::nullopt, vals,
+-                                  pred ? pred : b.true_val());
+-          b.barrier();
+-          ret = targetInfo.loadDShared(rewriter, loc, smemAddr, std::nullopt,
+-                                       retType, b.true_val());
+-        }
++        Value ret = ptxBuilderAtomicRMW.launch(rewriter, loc, retType);
+ 
+         if (vec > 1) {
+           for (unsigned ii = 0; ii < vec; ++ii) {
+@@ -1168,6 +1159,44 @@ struct AtomicRMWOpConversion
+       }
+     }
+     if (tensorTy) {
++      if (op->hasAttr("allocation.offset")) {
++        auto dstLayout = ttg::toLinearLayout(tensorTy);
++        auto smemBase = LLVM::getSharedMemoryBase(loc, rewriter, targetInfo,
++                                                  op.getOperation());
++
++        auto emitLdStCommon = [&](auto &&func, SmallVector<Value> &vals) {
++          return lowerLdSt(loc, ctx, dstLayout, vals, valueElemTy, smemBase,
++                           /*affineOffset=*/b.i32_val(0),
++                           /*maskSpanAffineOffset=*/0, rewriter, targetInfo, {},
++                           func);
++        };
++
++        auto emitSt = [&](ConversionPatternRewriter &rewriter, Location loc,
++                          ArrayRef<Value> vals, Value shmemAddr, int idx,
++                          VectorType vecTy) -> SmallVector<Value> {
++          Value pred =
++              llMask ? maybeAnd(rewriter, loc, threadPred, maskElements[idx])
++                     : threadPred;
++          auto length = vecTy.getNumElements();
++          Value valsVec = packLLVector(
++              loc, ArrayRef<Value>(vals).slice(idx, length), rewriter);
++          targetInfo.storeDShared(rewriter, loc, shmemAddr, std::nullopt,
++                                  valsVec, pred);
++          return {};
++        };
++
++        auto emitLd = [&](ConversionPatternRewriter &rewriter, Location loc,
++                          ArrayRef<Value> vals, Value shmemAddr, int idx,
++                          VectorType vecTy) -> SmallVector<Value> {
++          Value loadedVec = targetInfo.loadDShared(
++              rewriter, loc, shmemAddr, std::nullopt, vecTy, b.true_val());
++          return unpackLLElements(loc, loadedVec, rewriter);
++        };
++
++        emitLdStCommon(emitSt, resultVals);
++        b.barrier();
++        resultVals = emitLdStCommon(emitLd, resultVals);
++      }
+       Type structTy = getTypeConverter()->convertType(tensorTy);
+       Value resultStruct = packLLElements(loc, getTypeConverter(), resultVals,
+                                           rewriter, structTy);
+
+From d61a1652d4e8d06ad3c79a3ae98740c81f2ab031 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Fri, 18 Jul 2025 12:35:56 -0400
+Subject: [PATCH 07/53] Fix shape
+
+---
+ lib/Analysis/Allocation.cpp | 6 +-----
+ 1 file changed, 1 insertion(+), 5 deletions(-)
+
+diff --git a/lib/Analysis/Allocation.cpp b/lib/Analysis/Allocation.cpp
+index daa6f1ceb50c..05ce983004d7 100644
+--- a/lib/Analysis/Allocation.cpp
++++ b/lib/Analysis/Allocation.cpp
+@@ -103,11 +103,7 @@ static SmallVector<unsigned> getRepShapeForAtomic(Value result) {
+       // If the result is a tensor, we need to allocate a scratch memory of size
+       // equal to the number of unique elements in the tensor shape.
+       // gpu::ShapePerCTATile removes the broadcasted elements
+-      auto shapePerCTA = gpu::getShapePerCTATile(tensorTy);
+-      auto tensorShape = tensorTy.getShape();
+-      if (product(shapePerCTA) < product(tensorShape)) {
+-        smemShape = shapePerCTA;
+-      }
++      smemShape = gpu::getShapePerCTATile(tensorTy);
+     } else {
+       // If the result is a scalar, we need to allocate a single element.
+       smemShape.push_back(1);
+
+From 4aab8e32b9f6a36465680ebff53e4bc7f9a649c2 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Fri, 18 Jul 2025 12:42:02 -0400
+Subject: [PATCH 08/53] Fix use_empty
+
+---
+ lib/Analysis/Allocation.cpp                               | 2 +-
+ .../lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp       | 8 ++++----
+ 2 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/lib/Analysis/Allocation.cpp b/lib/Analysis/Allocation.cpp
+index 05ce983004d7..4502bd60230e 100644
+--- a/lib/Analysis/Allocation.cpp
++++ b/lib/Analysis/Allocation.cpp
+@@ -98,7 +98,7 @@ static SmallVector<unsigned> getRepShapeForCvt(RankedTensorType srcTy,
+ // even for threads that do not participate in the atomic operation
+ static SmallVector<unsigned> getRepShapeForAtomic(Value result) {
+   SmallVector<unsigned> smemShape;
+-  if (atomicNeedsSharedMemory(result)) {
++  if (!result.use_empty()) {
+     if (auto tensorTy = dyn_cast<RankedTensorType>(result.getType())) {
+       // If the result is a tensor, we need to allocate a scratch memory of size
+       // equal to the number of unique elements in the tensor shape.
+diff --git a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
+index 8c00bc4d4835..ff55d7c98fd4 100644
+--- a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
++++ b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
+@@ -681,7 +681,7 @@ struct AtomicCASOpConversion
+         }
+       } else {
+         auto old = ptxBuilderAtomicCAS.launch(rewriter, loc, valueElemTy);
+-        if (!atomicNeedsSharedMemory(op.getResult())) {
++        if (op.getResult().use_empty()) {
+           rewriter.eraseOp(op);
+           return success();
+         }
+@@ -920,7 +920,7 @@ struct AtomicRMWOpConversion
+             ScopeMap[op.getScope()]);
+ 
+         auto ASMReturnTy = void_ty(ctx);
+-        if (!atomicNeedsSharedMemory(op.getResult())) {
++        if (op.getResult().use_empty()) {
+           rewriter.eraseOp(op);
+           return success();
+         }
+@@ -955,7 +955,7 @@ struct AtomicRMWOpConversion
+ 
+         // Enter into predicate block
+         rewriter.setInsertionPointToEnd(curBlock);
+-        bool doesAtomicNeedMEM = atomicNeedsSharedMemory(op.getResult());
++        bool doesAtomicNeedMEM = !op.getResult().use_empty();
+ 
+         // Setup for SMEM Sync case
+         Value atomPtr = tensorTy || !doesAtomicNeedMEM
+@@ -1144,7 +1144,7 @@ struct AtomicRMWOpConversion
+         auto ASMReturnTy = void_ty(ctx);
+         atom(dstOpr, ptrOpr, valOpr).maybePredicate(pred);
+         auto old = ptxBuilderAtomicRMW.launch(rewriter, loc, valueElemTy);
+-        if (!atomicNeedsSharedMemory(op.getResult())) {
++        if (op.getResult().use_empty()) {
+           rewriter.eraseOp(op);
+           return success();
+         }
+
+From ff2b92a71ad8829da852e6bd124959193c555af7 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Fri, 18 Jul 2025 12:49:00 -0400
+Subject: [PATCH 09/53] Fix data types
+
+---
+ lib/Analysis/Allocation.cpp | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/lib/Analysis/Allocation.cpp b/lib/Analysis/Allocation.cpp
+index 4502bd60230e..6a9867fee481 100644
+--- a/lib/Analysis/Allocation.cpp
++++ b/lib/Analysis/Allocation.cpp
+@@ -223,8 +223,7 @@ unsigned defaultAllocationAnalysisScratchSizeFn(Operation *op) {
+     auto elems = getNumScratchElements(smemShape);
+     if (elems == 0)
+       return 0;
+-    auto elemTy = cast<PointerType>(value.getType()).getPointeeType();
+-    assert(!isa<PointerType>(elemTy) && "unexpected pointer type");
++    auto elemTy = value.getType().getPointeeType();
+     return elems * std::max<int>(8, elemTy.getIntOrFloatBitWidth()) / 8;
+   }
+   if (isa<ttng::TensormapCreateOp>(op)) {
+
+From 2762536cb7f183a7cebc22f4615d189581321d02 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Fri, 18 Jul 2025 12:51:16 -0400
+Subject: [PATCH 10/53] Fix type
+
+---
+ lib/Analysis/Allocation.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/lib/Analysis/Allocation.cpp b/lib/Analysis/Allocation.cpp
+index 6a9867fee481..5672a2cd2608 100644
+--- a/lib/Analysis/Allocation.cpp
++++ b/lib/Analysis/Allocation.cpp
+@@ -223,7 +223,7 @@ unsigned defaultAllocationAnalysisScratchSizeFn(Operation *op) {
+     auto elems = getNumScratchElements(smemShape);
+     if (elems == 0)
+       return 0;
+-    auto elemTy = value.getType().getPointeeType();
++    auto elemTy = getPointeeType(value.getType());
+     return elems * std::max<int>(8, elemTy.getIntOrFloatBitWidth()) / 8;
+   }
+   if (isa<ttng::TensormapCreateOp>(op)) {
+
+From bb551adbf7d20c752803e5fa24c6c5fcad7b3659 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Fri, 18 Jul 2025 19:47:07 -0400
+Subject: [PATCH 11/53] Simplify test case
+
+---
+ python/test/unit/language/test_core.py | 14 ++++++--------
+ 1 file changed, 6 insertions(+), 8 deletions(-)
+
+diff --git a/python/test/unit/language/test_core.py b/python/test/unit/language/test_core.py
+index dc2c8da7f7be..7f5e59768e22 100644
+--- a/python/test/unit/language/test_core.py
++++ b/python/test/unit/language/test_core.py
+@@ -2003,19 +2003,17 @@ def kernel(I, O):
+         kernel[(1, )](I, O)
+ 
+ 
+-@pytest.mark.parametrize("dtype_str", ["int32", "uint32"])
+-@pytest.mark.parametrize("dim_size", [8, 128, 256])
++@pytest.mark.parametrize("dtype_str", ["int32", "float16"])
++@pytest.mark.parametrize("dim_size", [1, 4])
+ def test_atomic_result_broadcast(dtype_str, dim_size, device):
+ 
+     @triton.jit
+     def kernel(index_ptr, out_ptr, dim: tl.constexpr):
+-        write_index = tl.atomic_add(index_ptr + tl.arange(0, 1), val=1, sem="relaxed")
+-        tl.store(out_ptr + write_index[:, None] * dim + tl.arange(0, dim)[None, :], tl.full([1, dim], 5,
+-                                                                                            dtype=tl.int64))
++        write_index = tl.atomic_add(index_ptr + tl.arange(0, dim), val=tl.arange(0, dim), sem="relaxed")
++        tl.store(out_ptr + write_index, 5)
+ 
+-    index = torch.zeros([200], device=device, dtype=getattr(torch, dtype_str))
+-    index[0] = 1
+-    out = torch.zeros([3, dim_size], device=device, dtype=torch.int64)
++    index = torch.arange(0, dim_size, device=device).to(dtype=getattr(torch, dtype_str))
++    out = torch.zeros((dim_size, ), device=device, dtype=getattr(torch, dtype_str))
+     kernel[(1, )](index, out, dim_size)
+     assert (out[1] == 5).all()
+ 
+
+From b20cc1b139c4e51a6b480ddbf8b428530f044eda Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Fri, 18 Jul 2025 17:21:22 -0400
+Subject: [PATCH 12/53] Commit temporary working version without cleaning up
+
+---
+ lib/Analysis/Allocation.cpp                              | 2 +-
+ lib/Conversion/TritonGPUToLLVM/Utility.cpp               | 2 +-
+ .../lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp      | 9 ++++++++-
+ 3 files changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/lib/Analysis/Allocation.cpp b/lib/Analysis/Allocation.cpp
+index 5672a2cd2608..c2784a5f4335 100644
+--- a/lib/Analysis/Allocation.cpp
++++ b/lib/Analysis/Allocation.cpp
+@@ -223,7 +223,7 @@ unsigned defaultAllocationAnalysisScratchSizeFn(Operation *op) {
+     auto elems = getNumScratchElements(smemShape);
+     if (elems == 0)
+       return 0;
+-    auto elemTy = getPointeeType(value.getType());
++    auto elemTy = getElementTypeOrSelf(getPointeeType(value.getType()));
+     return elems * std::max<int>(8, elemTy.getIntOrFloatBitWidth()) / 8;
+   }
+   if (isa<ttng::TensormapCreateOp>(op)) {
+diff --git a/lib/Conversion/TritonGPUToLLVM/Utility.cpp b/lib/Conversion/TritonGPUToLLVM/Utility.cpp
+index 41e5b6e4f6d6..3a0409fa6de5 100644
+--- a/lib/Conversion/TritonGPUToLLVM/Utility.cpp
++++ b/lib/Conversion/TritonGPUToLLVM/Utility.cpp
+@@ -469,7 +469,7 @@ largestVectorisation(MLIRContext *ctx, const LinearLayout &cvt, int bitwidth,
+     }
+     return {v, permutation};
+   }
+-  llvm_unreachable("No vectorisation found");
++  return {1, permutation};
+ }
+ } // namespace
+ 
+diff --git a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
+index ff55d7c98fd4..3eae9c4df853 100644
+--- a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
++++ b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
+@@ -1161,6 +1161,13 @@ struct AtomicRMWOpConversion
+     if (tensorTy) {
+       if (op->hasAttr("allocation.offset")) {
+         auto dstLayout = ttg::toLinearLayout(tensorTy);
++        auto kReg = str_attr("register");
++        auto kLane = str_attr("lane");
++        auto kWarp = str_attr("warp");
++        dstLayout = dstLayout.sublayout({kReg, kLane, kWarp},
++                                        to_vector(dstLayout.getOutDimNames()));
++        dstLayout = dstLayout.reshapeOuts(
++            {{str_attr("offset"), dstLayout.getTotalOutDimSize()}});
+         auto smemBase = LLVM::getSharedMemoryBase(loc, rewriter, targetInfo,
+                                                   op.getOperation());
+ 
+@@ -1190,7 +1197,7 @@ struct AtomicRMWOpConversion
+                           VectorType vecTy) -> SmallVector<Value> {
+           Value loadedVec = targetInfo.loadDShared(
+               rewriter, loc, shmemAddr, std::nullopt, vecTy, b.true_val());
+-          return unpackLLElements(loc, loadedVec, rewriter);
++          return unpackLLVector(loc, loadedVec, rewriter);
+         };
+ 
+         emitLdStCommon(emitSt, resultVals);
+
+From d51147f88fa0fd2f07da7f4d1874d6755e0a056a Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Fri, 18 Jul 2025 19:54:15 -0400
+Subject: [PATCH 13/53] Update test
+
+---
+ python/test/unit/language/test_core.py | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/python/test/unit/language/test_core.py b/python/test/unit/language/test_core.py
+index 7f5e59768e22..f35526889ae4 100644
+--- a/python/test/unit/language/test_core.py
++++ b/python/test/unit/language/test_core.py
+@@ -2010,12 +2010,12 @@ def test_atomic_result_broadcast(dtype_str, dim_size, device):
+     @triton.jit
+     def kernel(index_ptr, out_ptr, dim: tl.constexpr):
+         write_index = tl.atomic_add(index_ptr + tl.arange(0, dim), val=tl.arange(0, dim), sem="relaxed")
+-        tl.store(out_ptr + write_index, 5)
++        tl.store(out_ptr + write_index.to(tl.uint32), 5)
+ 
+     index = torch.arange(0, dim_size, device=device).to(dtype=getattr(torch, dtype_str))
+     out = torch.zeros((dim_size, ), device=device, dtype=getattr(torch, dtype_str))
+     kernel[(1, )](index, out, dim_size)
+-    assert (out[1] == 5).all()
++    assert (out[0] == 5).all()
+ 
+ 
+ # ---------------
+
+From 4b7e603446a3b534a84bcf2ac5ddc42be49afed5 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Fri, 18 Jul 2025 20:07:30 -0400
+Subject: [PATCH 14/53] Update tests
+
+---
+ python/test/unit/language/test_core.py | 13 +++++++------
+ test/Conversion/tritongpu_to_llvm.mlir |  7 +++++--
+ test/TritonGPU/atomic-cas.mlir         |  3 +++
+ 3 files changed, 15 insertions(+), 8 deletions(-)
+
+diff --git a/python/test/unit/language/test_core.py b/python/test/unit/language/test_core.py
+index f35526889ae4..827172675768 100644
+--- a/python/test/unit/language/test_core.py
++++ b/python/test/unit/language/test_core.py
+@@ -2004,17 +2004,18 @@ def kernel(I, O):
+ 
+ 
+ @pytest.mark.parametrize("dtype_str", ["int32", "float16"])
+-@pytest.mark.parametrize("dim_size", [1, 4])
+-def test_atomic_result_broadcast(dtype_str, dim_size, device):
++@pytest.mark.parametrize("dim_size", [1, 4, 128])
++def test_tensor_atomic_use_result(dtype_str, size, device):
++    # size 1 and 4 should trigger value broadcasting, while 128 should not
+ 
+     @triton.jit
+     def kernel(index_ptr, out_ptr, dim: tl.constexpr):
+         write_index = tl.atomic_add(index_ptr + tl.arange(0, dim), val=tl.arange(0, dim), sem="relaxed")
+         tl.store(out_ptr + write_index.to(tl.uint32), 5)
+ 
+-    index = torch.arange(0, dim_size, device=device).to(dtype=getattr(torch, dtype_str))
+-    out = torch.zeros((dim_size, ), device=device, dtype=getattr(torch, dtype_str))
+-    kernel[(1, )](index, out, dim_size)
++    index = torch.arange(0, size, device=device).to(dtype=getattr(torch, dtype_str))
++    out = torch.zeros((size, ), device=device, dtype=getattr(torch, dtype_str))
++    kernel[(1, )](index, out, size)
+     assert (out[0] == 5).all()
+ 
+ 
+@@ -7483,7 +7484,7 @@ def check_loop_unroll_count(ir, opStr, loop_unroll_factor):
+ 
+     # Try for all different loop unroll factors:
+     for unroll_factor in [1, 2, 4, 5, 8]:
+-        h = _kernel[(1, )](torch.empty(1, device=device), unroll_factor)
++        h = _kernel[(1, )](torch.empty(1, device=device), unroll_factor).warmup()
+         check_loop_unroll_count(h.asm["ttir"], 'tt.atomic_rmw', unroll_factor)
+ 
+ 
+diff --git a/test/Conversion/tritongpu_to_llvm.mlir b/test/Conversion/tritongpu_to_llvm.mlir
+index 8a7563daf2d9..1ef6a11350ca 100644
+--- a/test/Conversion/tritongpu_to_llvm.mlir
++++ b/test/Conversion/tritongpu_to_llvm.mlir
+@@ -1499,9 +1499,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.tar
+ #blocked0 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0], CTAsPerCGA = [1], CTASplitNum = [1], CTAOrder = [0]}>
+ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "cuda:80"} {
+   // CHECK-LABEL: atomic_add_no_broadcasting
+-  tt.func @atomic_add_no_broadcasting(%arg0 : tensor<16x!tt.ptr<f32>, #blocked0>, %arg1 : tensor<16xi1, #blocked0>, %arg2 : tensor<16xf32, #blocked0>) {
+-    // CHECK-NOT: @$2 st.shared.
++  tt.func @atomic_add_use_result(%arg0 : tensor<16x!tt.ptr<f32>, #blocked0>, %arg1 : tensor<16xi1, #blocked0>, %arg2 : tensor<16xf32, #blocked0>) {
+     %0 = tt.atomic_rmw fadd, relaxed, sys, %arg0, %arg2, %arg1 : (tensor<16x!tt.ptr<f32>, #blocked0>, tensor<16xf32, #blocked0>, tensor<16xi1, #blocked0>) -> tensor<16xf32, #blocked0>
++    // CHECK: st.shared
++    // CHECK: barrier.sync
++    // CHECK: ld.shared
++    tt.store %arg0, %0 : tensor<16x!tt.ptr<f32>, #blocked0>
+     tt.return
+   }
+ }
+diff --git a/test/TritonGPU/atomic-cas.mlir b/test/TritonGPU/atomic-cas.mlir
+index 4f756bf29739..53f5ed6dde5d 100644
+--- a/test/TritonGPU/atomic-cas.mlir
++++ b/test/TritonGPU/atomic-cas.mlir
+@@ -3,6 +3,9 @@
+ 
+ // GPU: %9 = tt.atomic_cas acq_rel, cta, %8, %cst_0, %cst : (tensor<2x!tt.ptr<i64>, #blocked>, tensor<2xi64, #blocked>, tensor<2xi64, #blocked>) -> tensor<2xi64, #blocked>
+ // LLVM: llvm.inline_asm {{.*}} "mov.u64 $0, 0x0;\0A\09@$4 atom.global.acq_rel.cta.cas.b64 $0, [ $1 + 0 ], $2, $3;", "=l,l,l,l,b"
++// LLVM: st.shared
++// LLVM: barrier.sync
++// LLVM: ld.shared
+ 
+ module {
+   tt.func public @atomic_cas_kernel_0d1d2e(%arg0: !tt.ptr<i64> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<i64> {tt.divisibility = 16 : i32}, %arg2: i32 {tt.max_divisibility = 8 : i32}) attributes {noinline = false} {
+
+From 5e8ab9261369cd174f826d680ea63fcc10582b1d Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Fri, 18 Jul 2025 20:29:45 -0400
+Subject: [PATCH 15/53] Update test
+
+---
+ python/test/unit/language/test_core.py | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/python/test/unit/language/test_core.py b/python/test/unit/language/test_core.py
+index 827172675768..51dc48ff9037 100644
+--- a/python/test/unit/language/test_core.py
++++ b/python/test/unit/language/test_core.py
+@@ -2005,17 +2005,21 @@ def kernel(I, O):
+ 
+ @pytest.mark.parametrize("dtype_str", ["int32", "float16"])
+ @pytest.mark.parametrize("dim_size", [1, 4, 128])
+-def test_tensor_atomic_use_result(dtype_str, size, device):
++@pytest.mark.parametrize("op", ["add", "cas"])
++def test_tensor_atomic_use_result(dtype_str, size, op, device):
+     # size 1 and 4 should trigger value broadcasting, while 128 should not
+ 
+     @triton.jit
+-    def kernel(index_ptr, out_ptr, dim: tl.constexpr):
+-        write_index = tl.atomic_add(index_ptr + tl.arange(0, dim), val=tl.arange(0, dim), sem="relaxed")
++    def kernel(index_ptr, out_ptr, dim: tl.constexpr, op: tl.constexpr):
++        if op == "add":
++            write_index = tl.atomic_add(index_ptr + tl.arange(0, dim), val=tl.arange(0, dim), sem="relaxed")
++        elif op == "cas":
++            write_index = tl.atomic_cas(index_ptr + tl.arange(0, dim), old=0, new=tl.arange(0, dim), sem="relaxed")
+         tl.store(out_ptr + write_index.to(tl.uint32), 5)
+ 
+     index = torch.arange(0, size, device=device).to(dtype=getattr(torch, dtype_str))
+     out = torch.zeros((size, ), device=device, dtype=getattr(torch, dtype_str))
+-    kernel[(1, )](index, out, size)
++    kernel[(1, )](index, out, size, op)
+     assert (out[0] == 5).all()
+ 
+ 
+
+From 4071ea42ddbc355a20b3620cdfc02297b1df0606 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Fri, 18 Jul 2025 20:30:50 -0400
+Subject: [PATCH 16/53] Fix test
+
+---
+ python/test/unit/language/test_core.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/python/test/unit/language/test_core.py b/python/test/unit/language/test_core.py
+index 51dc48ff9037..622b1abbd487 100644
+--- a/python/test/unit/language/test_core.py
++++ b/python/test/unit/language/test_core.py
+@@ -2004,7 +2004,7 @@ def kernel(I, O):
+ 
+ 
+ @pytest.mark.parametrize("dtype_str", ["int32", "float16"])
+-@pytest.mark.parametrize("dim_size", [1, 4, 128])
++@pytest.mark.parametrize("dim", [1, 4, 128])
+ @pytest.mark.parametrize("op", ["add", "cas"])
+ def test_tensor_atomic_use_result(dtype_str, size, op, device):
+     # size 1 and 4 should trigger value broadcasting, while 128 should not
+
+From 3e33c660b9e2eff0c2022cce19f5620cb9250439 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Fri, 18 Jul 2025 20:31:30 -0400
+Subject: [PATCH 17/53] Fix test
+
+---
+ python/test/unit/language/test_core.py | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/python/test/unit/language/test_core.py b/python/test/unit/language/test_core.py
+index 622b1abbd487..2b51c0565274 100644
+--- a/python/test/unit/language/test_core.py
++++ b/python/test/unit/language/test_core.py
+@@ -2004,17 +2004,17 @@ def kernel(I, O):
+ 
+ 
+ @pytest.mark.parametrize("dtype_str", ["int32", "float16"])
+-@pytest.mark.parametrize("dim", [1, 4, 128])
++@pytest.mark.parametrize("size", [1, 4, 128])
+ @pytest.mark.parametrize("op", ["add", "cas"])
+ def test_tensor_atomic_use_result(dtype_str, size, op, device):
+     # size 1 and 4 should trigger value broadcasting, while 128 should not
+ 
+     @triton.jit
+-    def kernel(index_ptr, out_ptr, dim: tl.constexpr, op: tl.constexpr):
++    def kernel(index_ptr, out_ptr, size: tl.constexpr, op: tl.constexpr):
+         if op == "add":
+-            write_index = tl.atomic_add(index_ptr + tl.arange(0, dim), val=tl.arange(0, dim), sem="relaxed")
++            write_index = tl.atomic_add(index_ptr + tl.arange(0, size), val=tl.arange(0, size), sem="relaxed")
+         elif op == "cas":
+-            write_index = tl.atomic_cas(index_ptr + tl.arange(0, dim), old=0, new=tl.arange(0, dim), sem="relaxed")
++            write_index = tl.atomic_cas(index_ptr + tl.arange(0, size), old=0, new=tl.arange(0, size), sem="relaxed")
+         tl.store(out_ptr + write_index.to(tl.uint32), 5)
+ 
+     index = torch.arange(0, size, device=device).to(dtype=getattr(torch, dtype_str))
+
+From 72223f0a6203c0e0c3b88f9e11ee2958a9acb2b5 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Fri, 18 Jul 2025 20:32:11 -0400
+Subject: [PATCH 18/53] Fix test
+
+---
+ python/test/unit/language/test_core.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/python/test/unit/language/test_core.py b/python/test/unit/language/test_core.py
+index 2b51c0565274..ab805b593413 100644
+--- a/python/test/unit/language/test_core.py
++++ b/python/test/unit/language/test_core.py
+@@ -2014,7 +2014,7 @@ def kernel(index_ptr, out_ptr, size: tl.constexpr, op: tl.constexpr):
+         if op == "add":
+             write_index = tl.atomic_add(index_ptr + tl.arange(0, size), val=tl.arange(0, size), sem="relaxed")
+         elif op == "cas":
+-            write_index = tl.atomic_cas(index_ptr + tl.arange(0, size), old=0, new=tl.arange(0, size), sem="relaxed")
++            write_index = tl.atomic_cas(index_ptr + tl.arange(0, size), cmp=0, val=tl.arange(0, size), sem="relaxed")
+         tl.store(out_ptr + write_index.to(tl.uint32), 5)
+ 
+     index = torch.arange(0, size, device=device).to(dtype=getattr(torch, dtype_str))
+
+From e1c8b4874ec181134c2a32ed32fe9e8a9c6ea4ea Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Fri, 18 Jul 2025 20:58:07 -0400
+Subject: [PATCH 19/53] Consolidate code
+
+---
+ lib/Analysis/Allocation.cpp                   |   3 +-
+ .../LoadStoreOpToLLVM.cpp                     | 154 +++++++-----------
+ 2 files changed, 64 insertions(+), 93 deletions(-)
+
+diff --git a/lib/Analysis/Allocation.cpp b/lib/Analysis/Allocation.cpp
+index c2784a5f4335..ca7158694f9b 100644
+--- a/lib/Analysis/Allocation.cpp
++++ b/lib/Analysis/Allocation.cpp
+@@ -103,7 +103,8 @@ static SmallVector<unsigned> getRepShapeForAtomic(Value result) {
+       // If the result is a tensor, we need to allocate a scratch memory of size
+       // equal to the number of unique elements in the tensor shape.
+       // gpu::ShapePerCTATile removes the broadcasted elements
+-      smemShape = gpu::getShapePerCTATile(tensorTy);
++      if (product(gpu::getShapePerCTA(tensorTy)) < product(tensorTy.getShape()))
++        smemShape = gpu::getShapePerCTATile(tensorTy);
+     } else {
+       // If the result is a scalar, we need to allocate a single element.
+       smemShape.push_back(1);
+diff --git a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
+index 3eae9c4df853..aa8915aefdac 100644
+--- a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
++++ b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
+@@ -137,6 +137,61 @@ Value createCachePolicy(triton::EvictionPolicy opEvict,
+   return policyRet;
+ }
+ 
++void broadcastTensorValues(Operation *op, RankedTensorType tensorTy,
++                           Location loc, MLIRContext *ctx,
++                           ConversionPatternRewriter &rewriter,
++                           SmallVector<Value> &resultVals, Type valueElemTy,
++                           TritonLLVMOpBuilder &b, Value threadPred,
++                           const NVIDIA::TargetInfo &targetInfo,
++                           const LLVMTypeConverter *typeConverter) {
++  if (!op->hasAttr("allocation.offset"))
++    return;
++
++  auto dstLayout = ttg::toLinearLayout(tensorTy);
++  auto kReg = str_attr("register");
++  auto kLane = str_attr("lane");
++  auto kWarp = str_attr("warp");
++  dstLayout = dstLayout.sublayout({kReg, kLane, kWarp},
++                                  to_vector(dstLayout.getOutDimNames()));
++  dstLayout = dstLayout.reshapeOuts(
++      {{str_attr("offset"), dstLayout.getTotalOutDimSize()}});
++  auto smemBase = LLVM::getSharedMemoryBase(loc, rewriter, targetInfo, op);
++
++  auto emitSt = [&](ConversionPatternRewriter &rewriter, Location loc,
++                    ArrayRef<Value> vals, Value shmemAddr, int idx,
++                    VectorType vecTy) -> SmallVector<Value> {
++    auto length = vecTy.getNumElements();
++    Value valsVec =
++        packLLVector(loc, ArrayRef<Value>(vals).slice(idx, length), rewriter);
++    targetInfo.storeDShared(rewriter, loc, shmemAddr, std::nullopt, valsVec,
++                            threadPred);
++    return {};
++  };
++
++  auto emitLd = [&](ConversionPatternRewriter &rewriter, Location loc,
++                    ArrayRef<Value> vals, Value shmemAddr, int idx,
++                    VectorType vecTy) -> SmallVector<Value> {
++    Value loadedVec = targetInfo.loadDShared(rewriter, loc, shmemAddr,
++                                             std::nullopt, vecTy, b.true_val());
++    return unpackLLVector(loc, loadedVec, rewriter);
++  };
++
++  lowerLdSt(loc, ctx, dstLayout, resultVals, valueElemTy, smemBase,
++            /*affineOffset=*/b.i32_val(0),
++            /*maskSpanAffineOffset=*/0, rewriter, targetInfo, {}, emitSt);
++  b.barrier();
++  resultVals =
++      lowerLdSt(loc, ctx, dstLayout, resultVals, valueElemTy, smemBase,
++                /*affineOffset=*/b.i32_val(0),
++                /*maskSpanAffineOffset=*/0, rewriter, targetInfo, {}, emitLd);
++
++  // Create the result struct and replace the operation
++  Type structTy = typeConverter->convertType(tensorTy);
++  Value resultStruct =
++      packLLElements(loc, typeConverter, resultVals, rewriter, structTy);
++  rewriter.replaceOp(op, {resultStruct});
++}
++
+ // Contains some helper functions for both Load and Store conversions.
+ struct LoadStoreConversionBase {
+   explicit LoadStoreConversionBase(const NVIDIA::TargetInfo &targetInfo,
+@@ -703,47 +758,9 @@ struct AtomicCASOpConversion
+       }
+     }
+ 
+-    if (tensorTy) {
+-      if (op->hasAttr("allocation.offset")) {
+-        auto dstLayout = ttg::toLinearLayout(tensorTy);
+-        auto smemBase = LLVM::getSharedMemoryBase(loc, rewriter, targetInfo,
+-                                                  op.getOperation());
+-
+-        auto emitLdStCommon = [&](auto &&func, SmallVector<Value> &vals) {
+-          return lowerLdSt(loc, ctx, dstLayout, vals, valueElemTy, smemBase,
+-                           /*affineOffset=*/b.i32_val(0),
+-                           /*maskSpanAffineOffset=*/0, rewriter, targetInfo, {},
+-                           func);
+-        };
+-
+-        auto emitSt = [&](ConversionPatternRewriter &rewriter, Location loc,
+-                          ArrayRef<Value> vals, Value shmemAddr, int idx,
+-                          VectorType vecTy) -> SmallVector<Value> {
+-          auto length = vecTy.getNumElements();
+-          Value valsVec = packLLVector(
+-              loc, ArrayRef<Value>(vals).slice(idx, length), rewriter);
+-          targetInfo.storeDShared(rewriter, loc, shmemAddr, std::nullopt,
+-                                  valsVec, threadPred);
+-          return {};
+-        };
+-
+-        auto emitLd = [&](ConversionPatternRewriter &rewriter, Location loc,
+-                          ArrayRef<Value> vals, Value shmemAddr, int idx,
+-                          VectorType vecTy) -> SmallVector<Value> {
+-          Value loadedVec = targetInfo.loadDShared(
+-              rewriter, loc, shmemAddr, std::nullopt, vecTy, b.true_val());
+-          return unpackLLElements(loc, loadedVec, rewriter);
+-        };
+-
+-        emitLdStCommon(emitSt, resultVals);
+-        b.barrier();
+-        resultVals = emitLdStCommon(emitLd, resultVals);
+-      }
+-      Type structTy = getTypeConverter()->convertType(tensorTy);
+-      Value resultStruct = packLLElements(loc, getTypeConverter(), resultVals,
+-                                          rewriter, structTy);
+-      rewriter.replaceOp(op, {resultStruct});
+-    }
++    broadcastTensorValues(op, tensorTy, loc, ctx, rewriter, resultVals,
++                          valueElemTy, b, threadPred, targetInfo,
++                          getTypeConverter());
+     return success();
+   }
+ };
+@@ -812,6 +829,7 @@ struct AtomicRMWOpConversion
+     return true;
+   }
+ 
++public:
+   LogicalResult
+   matchAndRewrite(triton::AtomicRMWOp op, OpAdaptor adaptor,
+                   ConversionPatternRewriter &rewriter) const override {
+@@ -1158,57 +1176,9 @@ struct AtomicRMWOpConversion
+         rewriter.replaceOp(op, {ret});
+       }
+     }
+-    if (tensorTy) {
+-      if (op->hasAttr("allocation.offset")) {
+-        auto dstLayout = ttg::toLinearLayout(tensorTy);
+-        auto kReg = str_attr("register");
+-        auto kLane = str_attr("lane");
+-        auto kWarp = str_attr("warp");
+-        dstLayout = dstLayout.sublayout({kReg, kLane, kWarp},
+-                                        to_vector(dstLayout.getOutDimNames()));
+-        dstLayout = dstLayout.reshapeOuts(
+-            {{str_attr("offset"), dstLayout.getTotalOutDimSize()}});
+-        auto smemBase = LLVM::getSharedMemoryBase(loc, rewriter, targetInfo,
+-                                                  op.getOperation());
+-
+-        auto emitLdStCommon = [&](auto &&func, SmallVector<Value> &vals) {
+-          return lowerLdSt(loc, ctx, dstLayout, vals, valueElemTy, smemBase,
+-                           /*affineOffset=*/b.i32_val(0),
+-                           /*maskSpanAffineOffset=*/0, rewriter, targetInfo, {},
+-                           func);
+-        };
+-
+-        auto emitSt = [&](ConversionPatternRewriter &rewriter, Location loc,
+-                          ArrayRef<Value> vals, Value shmemAddr, int idx,
+-                          VectorType vecTy) -> SmallVector<Value> {
+-          Value pred =
+-              llMask ? maybeAnd(rewriter, loc, threadPred, maskElements[idx])
+-                     : threadPred;
+-          auto length = vecTy.getNumElements();
+-          Value valsVec = packLLVector(
+-              loc, ArrayRef<Value>(vals).slice(idx, length), rewriter);
+-          targetInfo.storeDShared(rewriter, loc, shmemAddr, std::nullopt,
+-                                  valsVec, pred);
+-          return {};
+-        };
+-
+-        auto emitLd = [&](ConversionPatternRewriter &rewriter, Location loc,
+-                          ArrayRef<Value> vals, Value shmemAddr, int idx,
+-                          VectorType vecTy) -> SmallVector<Value> {
+-          Value loadedVec = targetInfo.loadDShared(
+-              rewriter, loc, shmemAddr, std::nullopt, vecTy, b.true_val());
+-          return unpackLLVector(loc, loadedVec, rewriter);
+-        };
+-
+-        emitLdStCommon(emitSt, resultVals);
+-        b.barrier();
+-        resultVals = emitLdStCommon(emitLd, resultVals);
+-      }
+-      Type structTy = getTypeConverter()->convertType(tensorTy);
+-      Value resultStruct = packLLElements(loc, getTypeConverter(), resultVals,
+-                                          rewriter, structTy);
+-      rewriter.replaceOp(op, {resultStruct});
+-    }
++    broadcastTensorValues(op, tensorTy, loc, ctx, rewriter, resultVals,
++                          valueElemTy, b, threadPred, targetInfo,
++                          getTypeConverter());
+     return success();
+   }
+ };
+
+From df3c5020e3de124ff931c8caca4063320cb174a9 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Fri, 18 Jul 2025 21:23:57 -0400
+Subject: [PATCH 20/53] Fix test
+
+---
+ python/test/unit/language/test_core.py | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/python/test/unit/language/test_core.py b/python/test/unit/language/test_core.py
+index ab805b593413..7104e3daf8b4 100644
+--- a/python/test/unit/language/test_core.py
++++ b/python/test/unit/language/test_core.py
+@@ -2014,7 +2014,12 @@ def kernel(index_ptr, out_ptr, size: tl.constexpr, op: tl.constexpr):
+         if op == "add":
+             write_index = tl.atomic_add(index_ptr + tl.arange(0, size), val=tl.arange(0, size), sem="relaxed")
+         elif op == "cas":
+-            write_index = tl.atomic_cas(index_ptr + tl.arange(0, size), cmp=0, val=tl.arange(0, size), sem="relaxed")
++            write_index = tl.atomic_cas(
++                index_ptr + tl.arange(0, size),
++                cmp=tl.zeros((size, ), dtype=index_ptr.dtype.element_ty),
++                val=tl.arange(0, size),
++                sem="relaxed",
++            )
+         tl.store(out_ptr + write_index.to(tl.uint32), 5)
+ 
+     index = torch.arange(0, size, device=device).to(dtype=getattr(torch, dtype_str))
+
+From fd37d6febb2f56dafb8c5fb831d3e1018bacc6b2 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Sat, 19 Jul 2025 07:41:26 -0400
+Subject: [PATCH 21/53] Move create barrier
+
+---
+ .../LoadStoreOpToLLVM.cpp                     | 25 ++++++++++---------
+ 1 file changed, 13 insertions(+), 12 deletions(-)
+
+diff --git a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
+index aa8915aefdac..eda5350d506d 100644
+--- a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
++++ b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
+@@ -50,6 +50,17 @@ Value maybeAnd(RewriterBase &rewriter, Location loc, Value a, Value b) {
+   return a ? a : b;
+ }
+ 
++void createBarrier(ConversionPatternRewriter &rewriter, Location loc,
++                   int numCTAs) {
++  auto b = TritonLLVMOpBuilder(loc, rewriter);
++  if (numCTAs == 1) {
++    b.barrier();
++  } else {
++    rewriter.create<triton::nvidia_gpu::ClusterArriveOp>(loc, false);
++    rewriter.create<triton::nvidia_gpu::ClusterWaitOp>(loc);
++  }
++}
++
+ // Return a predicate that is true only if the current thread holds unique data,
+ // according to freeVarsMask. The predicate may be null to indicate no
+ // predication is required.
+@@ -179,7 +190,8 @@ void broadcastTensorValues(Operation *op, RankedTensorType tensorTy,
+   lowerLdSt(loc, ctx, dstLayout, resultVals, valueElemTy, smemBase,
+             /*affineOffset=*/b.i32_val(0),
+             /*maskSpanAffineOffset=*/0, rewriter, targetInfo, {}, emitSt);
+-  b.barrier();
++  int numCTAs = triton::gpu::getNumCTAs(tensorTy.getEncoding());
++  createBarrier(rewriter, loc, numCTAs);
+   resultVals =
+       lowerLdSt(loc, ctx, dstLayout, resultVals, valueElemTy, smemBase,
+                 /*affineOffset=*/b.i32_val(0),
+@@ -620,17 +632,6 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
+   int computeCapability;
+ };
+ 
+-void createBarrier(ConversionPatternRewriter &rewriter, Location loc,
+-                   int numCTAs) {
+-  auto b = TritonLLVMOpBuilder(loc, rewriter);
+-  if (numCTAs == 1) {
+-    b.barrier();
+-  } else {
+-    rewriter.create<triton::nvidia_gpu::ClusterArriveOp>(loc, false);
+-    rewriter.create<triton::nvidia_gpu::ClusterWaitOp>(loc);
+-  }
+-}
+-
+ struct AtomicCASOpConversion
+     : public ConvertOpToLLVMPattern<triton::AtomicCASOp>,
+       public LoadStoreConversionBase {
+
+From d2da076dd6081338ca548f2799cbf3b928c8a9bd Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Sat, 19 Jul 2025 07:50:37 -0400
+Subject: [PATCH 22/53] Check if tensorTy
+
+---
+ .../nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp      | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
+index eda5350d506d..8c92830f1325 100644
+--- a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
++++ b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
+@@ -155,7 +155,7 @@ void broadcastTensorValues(Operation *op, RankedTensorType tensorTy,
+                            TritonLLVMOpBuilder &b, Value threadPred,
+                            const NVIDIA::TargetInfo &targetInfo,
+                            const LLVMTypeConverter *typeConverter) {
+-  if (!op->hasAttr("allocation.offset"))
++  if (!op->hasAttr("allocation.offset") && tensorTy)
+     return;
+ 
+   auto dstLayout = ttg::toLinearLayout(tensorTy);
+
+From af199107f5193b9e35354e09217c8ab1eac196b0 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Sat, 19 Jul 2025 08:04:47 -0400
+Subject: [PATCH 23/53] Consolidate implementation
+
+---
+ .../LoadStoreOpToLLVM.cpp                     | 36 +++++++++++--------
+ 1 file changed, 21 insertions(+), 15 deletions(-)
+
+diff --git a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
+index 8c92830f1325..bea80e52a363 100644
+--- a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
++++ b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
+@@ -148,15 +148,22 @@ Value createCachePolicy(triton::EvictionPolicy opEvict,
+   return policyRet;
+ }
+ 
+-void broadcastTensorValues(Operation *op, RankedTensorType tensorTy,
+-                           Location loc, MLIRContext *ctx,
+-                           ConversionPatternRewriter &rewriter,
+-                           SmallVector<Value> &resultVals, Type valueElemTy,
+-                           TritonLLVMOpBuilder &b, Value threadPred,
+-                           const NVIDIA::TargetInfo &targetInfo,
+-                           const LLVMTypeConverter *typeConverter) {
+-  if (!op->hasAttr("allocation.offset") && tensorTy)
++void finalizeTensorAtomicResults(Operation *op, RankedTensorType tensorTy,
++                                 Location loc, MLIRContext *ctx,
++                                 ConversionPatternRewriter &rewriter,
++                                 SmallVector<Value> &resultVals,
++                                 Type valueElemTy, TritonLLVMOpBuilder &b,
++                                 Value threadPred,
++                                 const NVIDIA::TargetInfo &targetInfo,
++                                 const LLVMTypeConverter *typeConverter) {
++  Type structTy = typeConverter->convertType(tensorTy);
++  if (!op->hasAttr("allocation.offset")) {
++    // No broadcasting, just pack the values into a struct
++    Value resultStruct =
++        packLLElements(loc, typeConverter, resultVals, rewriter, structTy);
++    rewriter.replaceOp(op, {resultStruct});
+     return;
++  }
+ 
+   auto dstLayout = ttg::toLinearLayout(tensorTy);
+   auto kReg = str_attr("register");
+@@ -198,7 +205,6 @@ void broadcastTensorValues(Operation *op, RankedTensorType tensorTy,
+                 /*maskSpanAffineOffset=*/0, rewriter, targetInfo, {}, emitLd);
+ 
+   // Create the result struct and replace the operation
+-  Type structTy = typeConverter->convertType(tensorTy);
+   Value resultStruct =
+       packLLElements(loc, typeConverter, resultVals, rewriter, structTy);
+   rewriter.replaceOp(op, {resultStruct});
+@@ -759,9 +765,9 @@ struct AtomicCASOpConversion
+       }
+     }
+ 
+-    broadcastTensorValues(op, tensorTy, loc, ctx, rewriter, resultVals,
+-                          valueElemTy, b, threadPred, targetInfo,
+-                          getTypeConverter());
++    finalizeTensorAtomicResults(op, tensorTy, loc, ctx, rewriter, resultVals,
++                                valueElemTy, b, threadPred, targetInfo,
++                                getTypeConverter());
+     return success();
+   }
+ };
+@@ -1177,9 +1183,9 @@ struct AtomicRMWOpConversion
+         rewriter.replaceOp(op, {ret});
+       }
+     }
+-    broadcastTensorValues(op, tensorTy, loc, ctx, rewriter, resultVals,
+-                          valueElemTy, b, threadPred, targetInfo,
+-                          getTypeConverter());
++    finalizeTensorAtomicResults(op, tensorTy, loc, ctx, rewriter, resultVals,
++                                valueElemTy, b, threadPred, targetInfo,
++                                getTypeConverter());
+     return success();
+   }
+ };
+
+From af12ee1dff5175db13fb5fb8aa05dc766f0546db Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Sat, 19 Jul 2025 08:09:35 -0400
+Subject: [PATCH 24/53] Update test
+
+---
+ python/test/unit/language/test_core.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/python/test/unit/language/test_core.py b/python/test/unit/language/test_core.py
+index 7104e3daf8b4..d0c78ac6404e 100644
+--- a/python/test/unit/language/test_core.py
++++ b/python/test/unit/language/test_core.py
+@@ -2025,7 +2025,7 @@ def kernel(index_ptr, out_ptr, size: tl.constexpr, op: tl.constexpr):
+     index = torch.arange(0, size, device=device).to(dtype=getattr(torch, dtype_str))
+     out = torch.zeros((size, ), device=device, dtype=getattr(torch, dtype_str))
+     kernel[(1, )](index, out, size, op)
+-    assert (out[0] == 5).all()
++    assert (out == 5).all()
+ 
+ 
+ # ---------------
+
+From 0202662b0c1e73fb499aba5bffb2208a168f7aa8 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Sat, 19 Jul 2025 08:52:26 -0400
+Subject: [PATCH 25/53] Fix type
+
+---
+ python/test/unit/language/test_core.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/python/test/unit/language/test_core.py b/python/test/unit/language/test_core.py
+index d0c78ac6404e..bc5fd3418c66 100644
+--- a/python/test/unit/language/test_core.py
++++ b/python/test/unit/language/test_core.py
+@@ -2017,7 +2017,7 @@ def kernel(index_ptr, out_ptr, size: tl.constexpr, op: tl.constexpr):
+             write_index = tl.atomic_cas(
+                 index_ptr + tl.arange(0, size),
+                 cmp=tl.zeros((size, ), dtype=index_ptr.dtype.element_ty),
+-                val=tl.arange(0, size),
++                val=tl.arange(0, size).to(index_ptr.dtype.element_ty),
+                 sem="relaxed",
+             )
+         tl.store(out_ptr + write_index.to(tl.uint32), 5)
+
+From c9eb928543e6e285cbcf7e2666bb5e974a8cfefb Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Sat, 19 Jul 2025 13:46:33 -0400
+Subject: [PATCH 26/53] Revert
+
+---
+ lib/Analysis/Allocation.cpp                | 13 ++++++----
+ lib/Conversion/TritonGPUToLLVM/Utility.cpp | 30 +++-------------------
+ 2 files changed, 11 insertions(+), 32 deletions(-)
+
+diff --git a/lib/Analysis/Allocation.cpp b/lib/Analysis/Allocation.cpp
+index ca7158694f9b..8d6dff46edea 100644
+--- a/lib/Analysis/Allocation.cpp
++++ b/lib/Analysis/Allocation.cpp
+@@ -100,11 +100,14 @@ static SmallVector<unsigned> getRepShapeForAtomic(Value result) {
+   SmallVector<unsigned> smemShape;
+   if (!result.use_empty()) {
+     if (auto tensorTy = dyn_cast<RankedTensorType>(result.getType())) {
+-      // If the result is a tensor, we need to allocate a scratch memory of size
+-      // equal to the number of unique elements in the tensor shape.
+-      // gpu::ShapePerCTATile removes the broadcasted elements
+-      if (product(gpu::getShapePerCTA(tensorTy)) < product(tensorTy.getShape()))
+-        smemShape = gpu::getShapePerCTATile(tensorTy);
++      auto freeVariableMasks =
++          gpu::toLinearLayout(tensorTy).getFreeVariableMasks();
++      for (auto [freeVar, mask] : freeVariableMasks) {
++        if (mask != 0) {
++          smemShape = gpu::getShapePerCTATile(tensorTy);
++          break;
++        }
++      }
+     } else {
+       // If the result is a scalar, we need to allocate a single element.
+       smemShape.push_back(1);
+diff --git a/lib/Conversion/TritonGPUToLLVM/Utility.cpp b/lib/Conversion/TritonGPUToLLVM/Utility.cpp
+index 3a0409fa6de5..05deae4aad88 100644
+--- a/lib/Conversion/TritonGPUToLLVM/Utility.cpp
++++ b/lib/Conversion/TritonGPUToLLVM/Utility.cpp
+@@ -537,8 +537,9 @@ SmallVector<Value> lowerLdSt(
+   }
+ 
+   auto tile = LinearLayout::identity1D(elemsPerVec, kReg, kOffset);
+-  auto quot = *divideLeft(cvt, tile);
+-  LinearLayout reps = zerosLike(tile) * quot;
++  auto quot = divideLeft(cvt, tile);
++  assert(quot.has_value() && "cvt must be divisible by tile");
++  LinearLayout reps = zerosLike(tile) * *quot;
+ 
+   auto [nAdditive, permStrides] =
+       actionAdditiveStrides(reps, maskSpanAffineOffset);
+@@ -882,31 +883,6 @@ bool isSimpleSharedMemoryAccess(ArrayRef<int64_t> shape,
+          (shape == allocShape.take_back(rank) && rank >= 2);
+ }
+ 
+-llvm::MapVector<StringAttr, int32_t> getAllFreeVarMasks(MLIRContext *ctx) {
+-  // Mask where all elements are redundant
+-  auto kReg = str_attr("reg");
+-  auto kLane = str_attr("lane");
+-  auto kWarp = str_attr("warp");
+-  auto kBlock = str_attr("block");
+-
+-  int32_t fullMask = -1;
+-  llvm::MapVector<StringAttr, int32_t> ret;
+-  for (auto dimName : {kReg, kLane, kWarp, kBlock}) {
+-    ret[dimName] = fullMask;
+-  }
+-  return ret;
+-}
+-
+-llvm::MapVector<StringAttr, int32_t> getFreeVariableMasks(Type type) {
+-  auto ctx = type.getContext();
+-  auto tensorTy = dyn_cast<RankedTensorType>(type);
+-  if (!tensorTy) {
+-    return getAllFreeVarMasks(ctx);
+-  }
+-  auto ll = triton::gpu::toLinearLayout(tensorTy);
+-  return ll.getFreeVariableMasks();
+-}
+-
+ SmallVector<SmallVector<unsigned>> emitOffsetForLayout(Attribute layout,
+                                                        RankedTensorType type) {
+   MLIRContext *ctx = layout.getContext();
+
+From 67f445e576e3e251f7539926a4777fe41b0bf710 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Sat, 19 Jul 2025 15:00:32 -0400
+Subject: [PATCH 27/53] Fix missing lines
+
+---
+ lib/Conversion/TritonGPUToLLVM/Utility.cpp | 25 ++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+diff --git a/lib/Conversion/TritonGPUToLLVM/Utility.cpp b/lib/Conversion/TritonGPUToLLVM/Utility.cpp
+index 05deae4aad88..729428af05d0 100644
+--- a/lib/Conversion/TritonGPUToLLVM/Utility.cpp
++++ b/lib/Conversion/TritonGPUToLLVM/Utility.cpp
+@@ -883,6 +883,31 @@ bool isSimpleSharedMemoryAccess(ArrayRef<int64_t> shape,
+          (shape == allocShape.take_back(rank) && rank >= 2);
+ }
+ 
++llvm::MapVector<StringAttr, int32_t> getAllFreeVarMasks(MLIRContext *ctx) {
++  // Mask where all elements are redundant
++  auto kReg = str_attr("reg");
++  auto kLane = str_attr("lane");
++  auto kWarp = str_attr("warp");
++  auto kBlock = str_attr("block");
++
++  int32_t fullMask = -1;
++  llvm::MapVector<StringAttr, int32_t> ret;
++  for (auto dimName : {kReg, kLane, kWarp, kBlock}) {
++    ret[dimName] = fullMask;
++  }
++  return ret;
++}
++
++llvm::MapVector<StringAttr, int32_t> getFreeVariableMasks(Type type) {
++  auto ctx = type.getContext();
++  auto tensorTy = dyn_cast<RankedTensorType>(type);
++  if (!tensorTy) {
++    return getAllFreeVarMasks(ctx);
++  }
++  auto ll = triton::gpu::toLinearLayout(tensorTy);
++  return ll.getFreeVariableMasks();
++}
++
+ SmallVector<SmallVector<unsigned>> emitOffsetForLayout(Attribute layout,
+                                                        RankedTensorType type) {
+   MLIRContext *ctx = layout.getContext();
+
+From 2dfe4d140f4424ec2ed810d72e146e8b75156d73 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Sat, 19 Jul 2025 15:39:14 -0400
+Subject: [PATCH 28/53] Update test
+
+---
+ python/test/unit/language/test_core.py |  2 +-
+ test/Conversion/tritongpu_to_llvm.mlir | 19 +++++++++++++++++--
+ 2 files changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/python/test/unit/language/test_core.py b/python/test/unit/language/test_core.py
+index bc5fd3418c66..6139777e5afd 100644
+--- a/python/test/unit/language/test_core.py
++++ b/python/test/unit/language/test_core.py
+@@ -7493,7 +7493,7 @@ def check_loop_unroll_count(ir, opStr, loop_unroll_factor):
+ 
+     # Try for all different loop unroll factors:
+     for unroll_factor in [1, 2, 4, 5, 8]:
+-        h = _kernel[(1, )](torch.empty(1, device=device), unroll_factor).warmup()
++        h = _kernel[(1, )](torch.empty(1, device=device), unroll_factor)
+         check_loop_unroll_count(h.asm["ttir"], 'tt.atomic_rmw', unroll_factor)
+ 
+ 
+diff --git a/test/Conversion/tritongpu_to_llvm.mlir b/test/Conversion/tritongpu_to_llvm.mlir
+index 1ef6a11350ca..8758bbf7d76e 100644
+--- a/test/Conversion/tritongpu_to_llvm.mlir
++++ b/test/Conversion/tritongpu_to_llvm.mlir
+@@ -1498,8 +1498,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.tar
+ 
+ #blocked0 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0], CTAsPerCGA = [1], CTASplitNum = [1], CTAOrder = [0]}>
+ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "cuda:80"} {
+-  // CHECK-LABEL: atomic_add_no_broadcasting
+-  tt.func @atomic_add_use_result(%arg0 : tensor<16x!tt.ptr<f32>, #blocked0>, %arg1 : tensor<16xi1, #blocked0>, %arg2 : tensor<16xf32, #blocked0>) {
++  // CHECK-LABEL: atomic_add_use_result_broadcasting
++  tt.func @atomic_add_use_result_broadcasting(%arg0 : tensor<16x!tt.ptr<f32>, #blocked0>, %arg1 : tensor<16xi1, #blocked0>, %arg2 : tensor<16xf32, #blocked0>) {
+     %0 = tt.atomic_rmw fadd, relaxed, sys, %arg0, %arg2, %arg1 : (tensor<16x!tt.ptr<f32>, #blocked0>, tensor<16xf32, #blocked0>, tensor<16xi1, #blocked0>) -> tensor<16xf32, #blocked0>
+     // CHECK: st.shared
+     // CHECK: barrier.sync
+@@ -1511,6 +1511,21 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.tar
+ 
+ // -----
+ 
++#blocked0 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0], CTAsPerCGA = [1], CTASplitNum = [1], CTAOrder = [0]}>
++module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "cuda:80"} {
++  // CHECK-LABEL: atomic_add_use_result_no_broadcasting
++  tt.func @atomic_add_use_result_no_broadcasting(%arg0 : tensor<128x!tt.ptr<f32>, #blocked0>, %arg1 : tensor<128xi1, #blocked0>, %arg2 : tensor<128xf32, #blocked0>) {
++    %0 = tt.atomic_rmw fadd, relaxed, sys, %arg0, %arg2, %arg1 : (tensor<128x!tt.ptr<f32>, #blocked0>, tensor<128xf32, #blocked0>, tensor<128xi1, #blocked0>) -> tensor<128xf32, #blocked0>
++    // CHECK-NOT: st.shared
++    // CHECK-NOT: barrier.sync
++    // CHECK-NOT: ld.shared
++    tt.store %arg0, %0 : tensor<128x!tt.ptr<f32>, #blocked0>
++    tt.return
++  }
++}
++
++// -----
++
+ #blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [2], order = [0], CTAsPerCGA = [1], CTASplitNum = [1], CTAOrder = [0]}>
+ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+   tt.func public @atomic_add_f16_nomask(%dest_ptrs: tensor<256x!tt.ptr<f16>, #blocked> {tt.divisibility = 16 : i32, tt.contiguity = 16 : i32}, %data: tensor<256xf16, #blocked>) attributes {noinline = false} {
+
+From 10524848b2309e9d3552cf89c1cfce0e9e6040df Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Sat, 19 Jul 2025 15:46:09 -0400
+Subject: [PATCH 29/53] HasBroadcasting
+
+---
+ .../nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp   | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
+index bea80e52a363..d4e1d8d94061 100644
+--- a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
++++ b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
+@@ -157,7 +157,10 @@ void finalizeTensorAtomicResults(Operation *op, RankedTensorType tensorTy,
+                                  const NVIDIA::TargetInfo &targetInfo,
+                                  const LLVMTypeConverter *typeConverter) {
+   Type structTy = typeConverter->convertType(tensorTy);
+-  if (!op->hasAttr("allocation.offset")) {
++  auto freeVarMasks = getFreeVariableMasks(tensorTy);
++  bool hasBroadcasting =
++      llvm::any_of(freeVarMasks, [](auto pair) { return pair.second != 0; });
++  if (hasBroadcasting) {
+     // No broadcasting, just pack the values into a struct
+     Value resultStruct =
+         packLLElements(loc, typeConverter, resultVals, rewriter, structTy);
+
+From 9ef41c65b8b7620fca26235c36daeb164c6fb84c Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Sat, 19 Jul 2025 15:46:22 -0400
+Subject: [PATCH 30/53] Not has
+
+---
+ .../nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp      | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
+index d4e1d8d94061..4534ae9dc8fb 100644
+--- a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
++++ b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
+@@ -160,7 +160,7 @@ void finalizeTensorAtomicResults(Operation *op, RankedTensorType tensorTy,
+   auto freeVarMasks = getFreeVariableMasks(tensorTy);
+   bool hasBroadcasting =
+       llvm::any_of(freeVarMasks, [](auto pair) { return pair.second != 0; });
+-  if (hasBroadcasting) {
++  if (!hasBroadcasting) {
+     // No broadcasting, just pack the values into a struct
+     Value resultStruct =
+         packLLElements(loc, typeConverter, resultVals, rewriter, structTy);
+
+From c0c3c99cc84b013a83d6041ed5014aa3457482e4 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Sat, 19 Jul 2025 15:51:56 -0400
+Subject: [PATCH 31/53] Early return
+
+---
+ .../nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp | 7 +++----
+ 1 file changed, 3 insertions(+), 4 deletions(-)
+
+diff --git a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
+index 4534ae9dc8fb..43b5ebb6f2da 100644
+--- a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
++++ b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
+@@ -157,10 +157,7 @@ void finalizeTensorAtomicResults(Operation *op, RankedTensorType tensorTy,
+                                  const NVIDIA::TargetInfo &targetInfo,
+                                  const LLVMTypeConverter *typeConverter) {
+   Type structTy = typeConverter->convertType(tensorTy);
+-  auto freeVarMasks = getFreeVariableMasks(tensorTy);
+-  bool hasBroadcasting =
+-      llvm::any_of(freeVarMasks, [](auto pair) { return pair.second != 0; });
+-  if (!hasBroadcasting) {
++  if (!op->hasAttr("allocation.offset")) {
+     // No broadcasting, just pack the values into a struct
+     Value resultStruct =
+         packLLElements(loc, typeConverter, resultVals, rewriter, structTy);
+@@ -765,6 +762,7 @@ struct AtomicCASOpConversion
+         createBarrier(rewriter, loc, numCTAs);
+         Value ret = b.load(valueElemTy, atomPtr);
+         rewriter.replaceOp(op, {ret});
++        return success();
+       }
+     }
+ 
+@@ -1184,6 +1182,7 @@ struct AtomicRMWOpConversion
+         createBarrier(rewriter, loc, numCTAs);
+         Value ret = b.load(valueElemTy, atomPtr);
+         rewriter.replaceOp(op, {ret});
++        return success();
+       }
+     }
+     finalizeTensorAtomicResults(op, tensorTy, loc, ctx, rewriter, resultVals,
+
+From 991735fa337f8312ab9e7732a93f2e8a485c6458 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Sat, 19 Jul 2025 16:16:10 -0400
+Subject: [PATCH 32/53] Update test
+
+---
+ test/Conversion/tritongpu_to_llvm.mlir                        | 4 ++--
+ .../nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp    | 3 ++-
+ 2 files changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/test/Conversion/tritongpu_to_llvm.mlir b/test/Conversion/tritongpu_to_llvm.mlir
+index 8758bbf7d76e..4ad70264ddfe 100644
+--- a/test/Conversion/tritongpu_to_llvm.mlir
++++ b/test/Conversion/tritongpu_to_llvm.mlir
+@@ -1502,7 +1502,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.tar
+   tt.func @atomic_add_use_result_broadcasting(%arg0 : tensor<16x!tt.ptr<f32>, #blocked0>, %arg1 : tensor<16xi1, #blocked0>, %arg2 : tensor<16xf32, #blocked0>) {
+     %0 = tt.atomic_rmw fadd, relaxed, sys, %arg0, %arg2, %arg1 : (tensor<16x!tt.ptr<f32>, #blocked0>, tensor<16xf32, #blocked0>, tensor<16xi1, #blocked0>) -> tensor<16xf32, #blocked0>
+     // CHECK: st.shared
+-    // CHECK: barrier.sync
++    // CHECK: nvvm.barrier0
+     // CHECK: ld.shared
+     tt.store %arg0, %0 : tensor<16x!tt.ptr<f32>, #blocked0>
+     tt.return
+@@ -1517,7 +1517,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.tar
+   tt.func @atomic_add_use_result_no_broadcasting(%arg0 : tensor<128x!tt.ptr<f32>, #blocked0>, %arg1 : tensor<128xi1, #blocked0>, %arg2 : tensor<128xf32, #blocked0>) {
+     %0 = tt.atomic_rmw fadd, relaxed, sys, %arg0, %arg2, %arg1 : (tensor<128x!tt.ptr<f32>, #blocked0>, tensor<128xf32, #blocked0>, tensor<128xi1, #blocked0>) -> tensor<128xf32, #blocked0>
+     // CHECK-NOT: st.shared
+-    // CHECK-NOT: barrier.sync
++    // CHECK-NOT: nvvm.barrier0
+     // CHECK-NOT: ld.shared
+     tt.store %arg0, %0 : tensor<128x!tt.ptr<f32>, #blocked0>
+     tt.return
+diff --git a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
+index 43b5ebb6f2da..0d5b6088406e 100644
+--- a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
++++ b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
+@@ -958,7 +958,7 @@ struct AtomicRMWOpConversion
+         createBarrier(rewriter, loc, numCTAs);
+         Value ret = b.load(valueElemTy, atomPtr);
+         rewriter.replaceOp(op, {ret});
+-        continue;
++        return success();
+       }
+ 
+       // Let LLVM handle compare+swap loop; branch-based pred should be fine
+@@ -1052,6 +1052,7 @@ struct AtomicRMWOpConversion
+           b.barrier();
+           Value ret = b.load(valueElemTy, atomPtr);
+           rewriter.replaceOp(op, {ret});
++          return success();
+         }
+         continue;
+       }
+
+From 7046161bcdfaf2695d65db9063624c7593b62a8f Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Sat, 19 Jul 2025 16:20:02 -0400
+Subject: [PATCH 33/53] Update test
+
+---
+ test/Conversion/tritongpu_to_llvm.mlir | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/test/Conversion/tritongpu_to_llvm.mlir b/test/Conversion/tritongpu_to_llvm.mlir
+index 4ad70264ddfe..54c0d60926b7 100644
+--- a/test/Conversion/tritongpu_to_llvm.mlir
++++ b/test/Conversion/tritongpu_to_llvm.mlir
+@@ -1503,7 +1503,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.tar
+     %0 = tt.atomic_rmw fadd, relaxed, sys, %arg0, %arg2, %arg1 : (tensor<16x!tt.ptr<f32>, #blocked0>, tensor<16xf32, #blocked0>, tensor<16xi1, #blocked0>) -> tensor<16xf32, #blocked0>
+     // CHECK: st.shared
+     // CHECK: nvvm.barrier0
+-    // CHECK: ld.shared
++    // CHECK: llvm.load
+     tt.store %arg0, %0 : tensor<16x!tt.ptr<f32>, #blocked0>
+     tt.return
+   }
+@@ -1518,7 +1518,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.tar
+     %0 = tt.atomic_rmw fadd, relaxed, sys, %arg0, %arg2, %arg1 : (tensor<128x!tt.ptr<f32>, #blocked0>, tensor<128xf32, #blocked0>, tensor<128xi1, #blocked0>) -> tensor<128xf32, #blocked0>
+     // CHECK-NOT: st.shared
+     // CHECK-NOT: nvvm.barrier0
+-    // CHECK-NOT: ld.shared
++    // CHECK-NOT: llvm.load
+     tt.store %arg0, %0 : tensor<128x!tt.ptr<f32>, #blocked0>
+     tt.return
+   }
+
+From 030061543590c99da4d735e230171c08cd4a7fb8 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Sat, 19 Jul 2025 16:26:01 -0400
+Subject: [PATCH 34/53] Update code
+
+---
+ lib/Analysis/Allocation.cpp                | 9 ++++-----
+ lib/Conversion/TritonGPUToLLVM/Utility.cpp | 2 +-
+ 2 files changed, 5 insertions(+), 6 deletions(-)
+
+diff --git a/lib/Analysis/Allocation.cpp b/lib/Analysis/Allocation.cpp
+index 8d6dff46edea..3ab16969da5d 100644
+--- a/lib/Analysis/Allocation.cpp
++++ b/lib/Analysis/Allocation.cpp
+@@ -102,11 +102,10 @@ static SmallVector<unsigned> getRepShapeForAtomic(Value result) {
+     if (auto tensorTy = dyn_cast<RankedTensorType>(result.getType())) {
+       auto freeVariableMasks =
+           gpu::toLinearLayout(tensorTy).getFreeVariableMasks();
+-      for (auto [freeVar, mask] : freeVariableMasks) {
+-        if (mask != 0) {
+-          smemShape = gpu::getShapePerCTATile(tensorTy);
+-          break;
+-        }
++      if (llvm::any_of(freeVariableMasks,
++                       [](auto mask) { return mask != 0; })) {
++        // The tensor has broadcasted dimensions
++        smemShape = gpu::getShapePerCTATile(tensorTy);
+       }
+     } else {
+       // If the result is a scalar, we need to allocate a single element.
+diff --git a/lib/Conversion/TritonGPUToLLVM/Utility.cpp b/lib/Conversion/TritonGPUToLLVM/Utility.cpp
+index 729428af05d0..976a35f6a2d8 100644
+--- a/lib/Conversion/TritonGPUToLLVM/Utility.cpp
++++ b/lib/Conversion/TritonGPUToLLVM/Utility.cpp
+@@ -469,7 +469,7 @@ largestVectorisation(MLIRContext *ctx, const LinearLayout &cvt, int bitwidth,
+     }
+     return {v, permutation};
+   }
+-  return {1, permutation};
++  llvm_unreachable("Vectorization < 1 is not valid");
+ }
+ } // namespace
+ 
+
+From 2b0973ed8dae0feb9d362ad1cc7812ae345a248e Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Sat, 19 Jul 2025 16:37:27 -0400
+Subject: [PATCH 35/53] Fix
+
+---
+ lib/Analysis/Allocation.cpp | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/lib/Analysis/Allocation.cpp b/lib/Analysis/Allocation.cpp
+index 3ab16969da5d..356e05556218 100644
+--- a/lib/Analysis/Allocation.cpp
++++ b/lib/Analysis/Allocation.cpp
+@@ -102,8 +102,9 @@ static SmallVector<unsigned> getRepShapeForAtomic(Value result) {
+     if (auto tensorTy = dyn_cast<RankedTensorType>(result.getType())) {
+       auto freeVariableMasks =
+           gpu::toLinearLayout(tensorTy).getFreeVariableMasks();
+-      if (llvm::any_of(freeVariableMasks,
+-                       [](auto mask) { return mask != 0; })) {
++      if (llvm::any_of(freeVariableMasks, [](auto variableMask) {
++            return variableMask.second != 0;
++          })) {
+         // The tensor has broadcasted dimensions
+         smemShape = gpu::getShapePerCTATile(tensorTy);
+       }
+
+From 961cec6a19dd34ce3625ebc8d412dc3782bfc0a9 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Sat, 19 Jul 2025 17:03:56 -0400
+Subject: [PATCH 36/53] Update test
+
+---
+ test/TritonGPU/atomic-cas.mlir | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/test/TritonGPU/atomic-cas.mlir b/test/TritonGPU/atomic-cas.mlir
+index 53f5ed6dde5d..9c25c5ba4d87 100644
+--- a/test/TritonGPU/atomic-cas.mlir
++++ b/test/TritonGPU/atomic-cas.mlir
+@@ -1,11 +1,11 @@
+-// RUN: triton-opt %s -convert-triton-to-tritongpu=target=cuda:80 2>&1 | FileCheck %s --check-prefix=GPU
+-// RUN: triton-opt %s -convert-triton-to-tritongpu=target=cuda:80 -convert-triton-gpu-to-llvm 2>&1 | FileCheck %s --check-prefix=LLVM
++// RUN: triton-opt %s -convert-triton-to-tritongpu=target=cuda:80 --allocate-shared-memory 2>&1 | FileCheck %s --check-prefix=GPU
++// RUN: triton-opt %s -convert-triton-to-tritongpu=target=cuda:80 --allocate-shared-memory -convert-triton-gpu-to-llvm 2>&1 | FileCheck %s --check-prefix=LLVM
+ 
+ // GPU: %9 = tt.atomic_cas acq_rel, cta, %8, %cst_0, %cst : (tensor<2x!tt.ptr<i64>, #blocked>, tensor<2xi64, #blocked>, tensor<2xi64, #blocked>) -> tensor<2xi64, #blocked>
+ // LLVM: llvm.inline_asm {{.*}} "mov.u64 $0, 0x0;\0A\09@$4 atom.global.acq_rel.cta.cas.b64 $0, [ $1 + 0 ], $2, $3;", "=l,l,l,l,b"
+ // LLVM: st.shared
+-// LLVM: barrier.sync
+-// LLVM: ld.shared
++// LLVM: nvvm.barrier0
++// LLVM: llvm.shared
+ 
+ module {
+   tt.func public @atomic_cas_kernel_0d1d2e(%arg0: !tt.ptr<i64> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<i64> {tt.divisibility = 16 : i32}, %arg2: i32 {tt.max_divisibility = 8 : i32}) attributes {noinline = false} {
+
+From 09cf03b588ade9ef8ab000fc2a291f452f6a162c Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Sat, 19 Jul 2025 21:57:32 -0400
+Subject: [PATCH 37/53] Refactor finalize tensor values for AMD
+
+---
+ .../Conversion/TritonGPUToLLVM/Utility.h      |  7 ++
+ lib/Conversion/TritonGPUToLLVM/Utility.cpp    | 62 ++++++++++++++++
+ .../TritonAMDGPUToLLVM/LoadStoreOpToLLVM.cpp  | 73 ++++++++-----------
+ .../LoadStoreOpToLLVM.cpp                     | 72 +-----------------
+ 4 files changed, 105 insertions(+), 109 deletions(-)
+
+diff --git a/include/triton/Conversion/TritonGPUToLLVM/Utility.h b/include/triton/Conversion/TritonGPUToLLVM/Utility.h
+index fa1d5fcdb02f..822acdd550d7 100644
+--- a/include/triton/Conversion/TritonGPUToLLVM/Utility.h
++++ b/include/triton/Conversion/TritonGPUToLLVM/Utility.h
+@@ -655,6 +655,13 @@ SmallVector<Value> inlineRegion(RewriterBase &rewriter, Region &region,
+                           mlir::TypeID::get<TerminatorOp>(), loc);
+ }
+ 
++void finalizeTensorAtomicResults(Operation *op, RankedTensorType tensorTy,
++                                 ConversionPatternRewriter &rewriter,
++                                 SmallVector<Value> &resultVals,
++                                 Type valueElemTy, TritonLLVMOpBuilder &b,
++                                 Value threadPred,
++                                 const TargetInfoBase &targetInfo,
++                                 const LLVMTypeConverter *typeConverter);
+ } // namespace mlir
+ 
+ #endif
+diff --git a/lib/Conversion/TritonGPUToLLVM/Utility.cpp b/lib/Conversion/TritonGPUToLLVM/Utility.cpp
+index 976a35f6a2d8..dd47f0fa38cf 100644
+--- a/lib/Conversion/TritonGPUToLLVM/Utility.cpp
++++ b/lib/Conversion/TritonGPUToLLVM/Utility.cpp
+@@ -1856,4 +1856,66 @@ SmallVector<Value> inlineRegionImpl(RewriterBase &rewriter, Region &region,
+   return vals;
+ }
+ 
++void finalizeTensorAtomicResults(Operation *op, RankedTensorType tensorTy,
++                                 ConversionPatternRewriter &rewriter,
++                                 SmallVector<Value> &resultVals,
++                                 Type valueElemTy, TritonLLVMOpBuilder &b,
++                                 Value threadPred,
++                                 const TargetInfoBase &targetInfo,
++                                 const LLVMTypeConverter *typeConverter) {
++  auto *ctx = rewriter.getContext();
++  auto loc = op->getLoc();
++  Type structTy = typeConverter->convertType(tensorTy);
++  if (!op->hasAttr("allocation.offset")) {
++    // No broadcasting, just pack the values into a struct
++    Value resultStruct =
++        packLLElements(loc, typeConverter, resultVals, rewriter, structTy);
++    rewriter.replaceOp(op, {resultStruct});
++    return;
++  }
++
++  auto dstLayout = triton::gpu::toLinearLayout(tensorTy);
++  auto kReg = str_attr("register");
++  auto kLane = str_attr("lane");
++  auto kWarp = str_attr("warp");
++  dstLayout = dstLayout.sublayout({kReg, kLane, kWarp},
++                                  llvm::to_vector(dstLayout.getOutDimNames()));
++  dstLayout = dstLayout.reshapeOuts(
++      {{str_attr("offset"), dstLayout.getTotalOutDimSize()}});
++  auto smemBase = LLVM::getSharedMemoryBase(loc, rewriter, targetInfo, op);
++
++  auto emitSt = [&](ConversionPatternRewriter &rewriter, Location loc,
++                    ArrayRef<Value> vals, Value shmemAddr, int idx,
++                    VectorType vecTy) -> SmallVector<Value> {
++    auto length = vecTy.getNumElements();
++    Value valsVec =
++        packLLVector(loc, ArrayRef<Value>(vals).slice(idx, length), rewriter);
++    targetInfo.storeDShared(rewriter, loc, shmemAddr, std::nullopt, valsVec,
++                            threadPred);
++    return {};
++  };
++
++  auto emitLd = [&](ConversionPatternRewriter &rewriter, Location loc,
++                    ArrayRef<Value> vals, Value shmemAddr, int idx,
++                    VectorType vecTy) -> SmallVector<Value> {
++    Value loadedVec = targetInfo.loadDShared(rewriter, loc, shmemAddr,
++                                             std::nullopt, vecTy, b.true_val());
++    return unpackLLVector(loc, loadedVec, rewriter);
++  };
++
++  lowerLdSt(loc, ctx, dstLayout, resultVals, valueElemTy, smemBase,
++            /*affineOffset=*/b.i32_val(0),
++            /*maskSpanAffineOffset=*/0, rewriter, targetInfo, {}, emitSt);
++  b.barrier();
++  resultVals =
++      lowerLdSt(loc, ctx, dstLayout, resultVals, valueElemTy, smemBase,
++                /*affineOffset=*/b.i32_val(0),
++                /*maskSpanAffineOffset=*/0, rewriter, targetInfo, {}, emitLd);
++
++  // Create the result struct and replace the operation
++  Value resultStruct =
++      packLLElements(loc, typeConverter, resultVals, rewriter, structTy);
++  rewriter.replaceOp(op, {resultStruct});
++}
++
+ } // namespace mlir
+diff --git a/third_party/amd/lib/TritonAMDGPUToLLVM/LoadStoreOpToLLVM.cpp b/third_party/amd/lib/TritonAMDGPUToLLVM/LoadStoreOpToLLVM.cpp
+index 85570e8103da..86e894130f8c 100644
+--- a/third_party/amd/lib/TritonAMDGPUToLLVM/LoadStoreOpToLLVM.cpp
++++ b/third_party/amd/lib/TritonAMDGPUToLLVM/LoadStoreOpToLLVM.cpp
+@@ -171,7 +171,7 @@ LogicalResult emitFence(Operation *op, ConversionPatternRewriter &rewriter,
+ // Return a predicate that is true only if the current thread holds unique data,
+ // according to freeVarsMask.
+ Value emitRedundantThreadPredicate(
+-    ModuleOp moduleOp, const llvm::MapVector<StringAttr, int32_t> &freeVarMasks,
++    const llvm::MapVector<StringAttr, int32_t> &freeVarMasks,
+     ConversionPatternRewriter &rewriter, Location loc,
+     const AMD::TargetInfo &targetInfo) {
+   auto b = TritonLLVMOpBuilder(loc, rewriter);
+@@ -999,8 +999,8 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
+     auto cacheMod = op.getCache();
+     const int numVecs = elemsPerThread / vec;
+     auto freeVarMasks = getFreeVariableMasks(valueTy);
+-    Value threadPred = emitRedundantThreadPredicate(moduleOp, freeVarMasks,
+-                                                    rewriter, loc, targetInfo);
++    Value threadPred =
++        emitRedundantThreadPredicate(freeVarMasks, rewriter, loc, targetInfo);
+     uint32_t regMask = freeVarMasks[str_attr("reg")];
+     for (size_t vecStart = 0; vecStart < elemsPerThread; vecStart += vec) {
+       if (!isCanonicalIndex(vecStart, regMask)) {
+@@ -1127,8 +1127,8 @@ struct BufferAtomicRMWOpConversion
+     auto moduleOp = op->getParentOfType<ModuleOp>();
+ 
+     auto freeVarMasks = getFreeVariableMasks(valueTy);
+-    Value threadPred = emitRedundantThreadPredicate(moduleOp, freeVarMasks,
+-                                                    rewriter, loc, targetInfo);
++    Value threadPred =
++        emitRedundantThreadPredicate(freeVarMasks, rewriter, loc, targetInfo);
+     uint32_t regMask = freeVarMasks[str_attr("reg")];
+     for (size_t vecStart = 0; vecStart < numElems; vecStart += vec) {
+       if (!isCanonicalIndex(vecStart, regMask)) {
+@@ -1166,11 +1166,9 @@ struct BufferAtomicRMWOpConversion
+       return failure();
+     }
+ 
+-    Type llvmResultStructTy = getTypeConverter()->convertType(valueTy);
+-    Value resultStruct = packLLElements(loc, getTypeConverter(), loadedVals,
+-                                        rewriter, llvmResultStructTy);
+-
+-    rewriter.replaceOp(op, {resultStruct});
++    finalizeTensorAtomicResults(op, cast<RankedTensorType>(data), rewriter,
++                                loadedVals, valueElemTy, b, threadPred,
++                                targetInfo, getTypeConverter());
+     return success();
+   }
+ };
+@@ -1247,8 +1245,8 @@ struct BufferAtomicCASOpConversion
+     auto hasUsers = !op.getResult().getUsers().empty();
+     auto moduleOp = op->getParentOfType<ModuleOp>();
+     auto freeVarMasks = getFreeVariableMasks(valueTy);
+-    Value threadPred = emitRedundantThreadPredicate(moduleOp, freeVarMasks,
+-                                                    rewriter, loc, targetInfo);
++    Value threadPred =
++        emitRedundantThreadPredicate(freeVarMasks, rewriter, loc, targetInfo);
+ 
+     for (size_t vecStart = 0; vecStart < numElems; vecStart += vec) {
+       Type vecTy = LLVM::getVectorType(valueElemTy, vec);
+@@ -1282,11 +1280,9 @@ struct BufferAtomicCASOpConversion
+       return failure();
+     }
+ 
+-    Type llvmResultStructTy = getTypeConverter()->convertType(valueTy);
+-    Value resultStruct = packLLElements(loc, getTypeConverter(), loadedVals,
+-                                        rewriter, llvmResultStructTy);
+-
+-    rewriter.replaceOp(op, {resultStruct});
++    finalizeTensorAtomicResults(op, cast<RankedTensorType>(val), rewriter,
++                                loadedVals, valueElemTy, b, threadPred,
++                                targetInfo, getTypeConverter());
+     return success();
+   }
+ };
+@@ -1346,8 +1342,8 @@ struct BufferStoreOpConversion
+     MLIRContext *ctx = rewriter.getContext();
+     auto moduleOp = op->getParentOfType<ModuleOp>();
+     auto freeVarMasks = getFreeVariableMasks(valueTy);
+-    Value threadPred = emitRedundantThreadPredicate(moduleOp, freeVarMasks,
+-                                                    rewriter, loc, targetInfo);
++    Value threadPred =
++        emitRedundantThreadPredicate(freeVarMasks, rewriter, loc, targetInfo);
+     uint32_t regMask = freeVarMasks[str_attr("reg")];
+     for (size_t vecStart = 0; vecStart < numElems; vecStart += vec) {
+       if (!isCanonicalIndex(vecStart, regMask)) {
+@@ -1413,16 +1409,16 @@ struct AtomicCASOpConversion
+ 
+     // deal with tensor or scalar
+     auto valueTy = op.getResult().getType();
+-    auto TensorTy = dyn_cast<RankedTensorType>(valueTy);
++    auto tensorTy = dyn_cast<RankedTensorType>(valueTy);
+     Type valueElemTy =
+-        TensorTy ? getTypeConverter()->convertType(TensorTy.getElementType())
++        tensorTy ? getTypeConverter()->convertType(tensorTy.getElementType())
+                  : valueTy;
+     auto valueElemNBits = valueElemTy.getIntOrFloatBitWidth();
+     auto elemsPerThread = getTotalElemsPerThread(op.getVal().getType());
+     // vec = 1 for scalar
+     auto vec = getVectorSize(op.getPtr(), axisAnalysisPass);
+     // tensor
+-    if (TensorTy) {
++    if (tensorTy) {
+       auto valTy = cast<RankedTensorType>(op.getVal().getType());
+       vec = std::min<unsigned>(vec, valTy.getElementType().isF16() ? 2 : 1);
+     }
+@@ -1444,7 +1440,7 @@ struct AtomicCASOpConversion
+       casVal = valElements[i];
+ 
+       // use op
+-      if (TensorTy) { // for tensor
++      if (tensorTy) { // for tensor
+         auto retType = vec == 1 ? valueElemTy : vecTy;
+         // TODO: USE ATOMIC CAS OP on Tensor
+         auto successOrdering = *atomicMemOrdering;
+@@ -1496,7 +1492,7 @@ struct AtomicCASOpConversion
+         // Build the last block: synced load from shared memory, exit.
+         rewriter.setInsertionPointToStart(endBlock);
+ 
+-        if (!atomicNeedsSharedMemory(op.getResult())) {
++        if (op.getResult().use_empty()) {
+           rewriter.eraseOp(op);
+           return success();
+         }
+@@ -1509,16 +1505,14 @@ struct AtomicCASOpConversion
+             getSharedMemoryBase(loc, rewriter, targetInfo, op.getOperation());
+         Value ret = b.load(valueElemTy, atomPtr);
+         rewriter.replaceOp(op, {ret});
++        return success();
+       }
+     }
+ 
+-    // replace op
+-    if (TensorTy) {
+-      Type structTy = getTypeConverter()->convertType(TensorTy);
+-      Value resultStruct = packLLElements(loc, getTypeConverter(), resultVals,
+-                                          rewriter, structTy);
+-      rewriter.replaceOp(op, {resultStruct});
+-    }
++    // FIXME: threadPred = b.true_val() is buggy
++    finalizeTensorAtomicResults(op, tensorTy, rewriter, resultVals, valueElemTy,
++                                b, b.true_val(), targetInfo,
++                                getTypeConverter());
+     return success();
+   }
+ };
+@@ -1641,10 +1635,10 @@ struct AtomicRMWOpConversion
+     auto vecTy = vec_ty(valueElemTy, vec);
+     auto elemsPerThread = getTotalElemsPerThread(val.getType());
+ 
+-    Value mask = b.true_val();
++    auto freeVarMasks = getFreeVariableMasks(op.getPtr().getType());
++    Value threadPred =
++        emitRedundantThreadPredicate(freeVarMasks, rewriter, loc, targetInfo);
+     auto tid = getThreadId(rewriter, loc);
+-    mask = b.and_(mask, b.icmp_slt(b.mul(tid, b.i32_val(elemsPerThread)),
+-                                   b.i32_val(numElems)));
+ 
+     std::optional<Value> atomicSharedMemBase =
+         atomicNeedsSharedMemory(opResult)
+@@ -1656,7 +1650,7 @@ struct AtomicRMWOpConversion
+     for (size_t i = 0; i < elemsPerThread; i += vec) {
+       // TODO: in case llMask is zero we can create only one branch for all
+       // elemsPerThread.
+-      Value rmwMask = llMask ? b.and_(mask, maskElements[i]) : mask;
++      Value rmwMask = llMask ? b.and_(threadPred, maskElements[i]) : threadPred;
+       if (applyPackingF16) {
+         resultVals[i] = emitter.emitPairedAtomicForEvenTID(
+             rewriter, ptrElements[i], valElements[i], rmwMask);
+@@ -1716,15 +1710,12 @@ struct AtomicRMWOpConversion
+           Value ret = b.load(valueElemTy, atomPtr);
+ 
+           rewriter.replaceOp(op, {ret});
++          return success();
+         }
+       }
+     }
+-    if (tensorTy) {
+-      Type structTy = getTypeConverter()->convertType(tensorTy);
+-      Value resultStruct = packLLElements(loc, getTypeConverter(), resultVals,
+-                                          rewriter, structTy);
+-      rewriter.replaceOp(op, {resultStruct});
+-    }
++    finalizeTensorAtomicResults(op, tensorTy, rewriter, resultVals, valueElemTy,
++                                b, threadPred, targetInfo, getTypeConverter());
+     return success();
+   }
+ };
+diff --git a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
+index 0d5b6088406e..22adc1b65916 100644
+--- a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
++++ b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
+@@ -148,68 +148,6 @@ Value createCachePolicy(triton::EvictionPolicy opEvict,
+   return policyRet;
+ }
+ 
+-void finalizeTensorAtomicResults(Operation *op, RankedTensorType tensorTy,
+-                                 Location loc, MLIRContext *ctx,
+-                                 ConversionPatternRewriter &rewriter,
+-                                 SmallVector<Value> &resultVals,
+-                                 Type valueElemTy, TritonLLVMOpBuilder &b,
+-                                 Value threadPred,
+-                                 const NVIDIA::TargetInfo &targetInfo,
+-                                 const LLVMTypeConverter *typeConverter) {
+-  Type structTy = typeConverter->convertType(tensorTy);
+-  if (!op->hasAttr("allocation.offset")) {
+-    // No broadcasting, just pack the values into a struct
+-    Value resultStruct =
+-        packLLElements(loc, typeConverter, resultVals, rewriter, structTy);
+-    rewriter.replaceOp(op, {resultStruct});
+-    return;
+-  }
+-
+-  auto dstLayout = ttg::toLinearLayout(tensorTy);
+-  auto kReg = str_attr("register");
+-  auto kLane = str_attr("lane");
+-  auto kWarp = str_attr("warp");
+-  dstLayout = dstLayout.sublayout({kReg, kLane, kWarp},
+-                                  to_vector(dstLayout.getOutDimNames()));
+-  dstLayout = dstLayout.reshapeOuts(
+-      {{str_attr("offset"), dstLayout.getTotalOutDimSize()}});
+-  auto smemBase = LLVM::getSharedMemoryBase(loc, rewriter, targetInfo, op);
+-
+-  auto emitSt = [&](ConversionPatternRewriter &rewriter, Location loc,
+-                    ArrayRef<Value> vals, Value shmemAddr, int idx,
+-                    VectorType vecTy) -> SmallVector<Value> {
+-    auto length = vecTy.getNumElements();
+-    Value valsVec =
+-        packLLVector(loc, ArrayRef<Value>(vals).slice(idx, length), rewriter);
+-    targetInfo.storeDShared(rewriter, loc, shmemAddr, std::nullopt, valsVec,
+-                            threadPred);
+-    return {};
+-  };
+-
+-  auto emitLd = [&](ConversionPatternRewriter &rewriter, Location loc,
+-                    ArrayRef<Value> vals, Value shmemAddr, int idx,
+-                    VectorType vecTy) -> SmallVector<Value> {
+-    Value loadedVec = targetInfo.loadDShared(rewriter, loc, shmemAddr,
+-                                             std::nullopt, vecTy, b.true_val());
+-    return unpackLLVector(loc, loadedVec, rewriter);
+-  };
+-
+-  lowerLdSt(loc, ctx, dstLayout, resultVals, valueElemTy, smemBase,
+-            /*affineOffset=*/b.i32_val(0),
+-            /*maskSpanAffineOffset=*/0, rewriter, targetInfo, {}, emitSt);
+-  int numCTAs = triton::gpu::getNumCTAs(tensorTy.getEncoding());
+-  createBarrier(rewriter, loc, numCTAs);
+-  resultVals =
+-      lowerLdSt(loc, ctx, dstLayout, resultVals, valueElemTy, smemBase,
+-                /*affineOffset=*/b.i32_val(0),
+-                /*maskSpanAffineOffset=*/0, rewriter, targetInfo, {}, emitLd);
+-
+-  // Create the result struct and replace the operation
+-  Value resultStruct =
+-      packLLElements(loc, typeConverter, resultVals, rewriter, structTy);
+-  rewriter.replaceOp(op, {resultStruct});
+-}
+-
+ // Contains some helper functions for both Load and Store conversions.
+ struct LoadStoreConversionBase {
+   explicit LoadStoreConversionBase(const NVIDIA::TargetInfo &targetInfo,
+@@ -766,9 +704,8 @@ struct AtomicCASOpConversion
+       }
+     }
+ 
+-    finalizeTensorAtomicResults(op, tensorTy, loc, ctx, rewriter, resultVals,
+-                                valueElemTy, b, threadPred, targetInfo,
+-                                getTypeConverter());
++    finalizeTensorAtomicResults(op, tensorTy, rewriter, resultVals, valueElemTy,
++                                b, threadPred, targetInfo, getTypeConverter());
+     return success();
+   }
+ };
+@@ -1186,9 +1123,8 @@ struct AtomicRMWOpConversion
+         return success();
+       }
+     }
+-    finalizeTensorAtomicResults(op, tensorTy, loc, ctx, rewriter, resultVals,
+-                                valueElemTy, b, threadPred, targetInfo,
+-                                getTypeConverter());
++    finalizeTensorAtomicResults(op, tensorTy, rewriter, resultVals, valueElemTy,
++                                b, threadPred, targetInfo, getTypeConverter());
+     return success();
+   }
+ };
+
+From 86abc239154f17c7956140396ce9913e43111279 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Sat, 19 Jul 2025 22:08:44 -0400
+Subject: [PATCH 38/53] Fix types
+
+---
+ third_party/amd/lib/TritonAMDGPUToLLVM/LoadStoreOpToLLVM.cpp | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/third_party/amd/lib/TritonAMDGPUToLLVM/LoadStoreOpToLLVM.cpp b/third_party/amd/lib/TritonAMDGPUToLLVM/LoadStoreOpToLLVM.cpp
+index 86e894130f8c..0e71a2767124 100644
+--- a/third_party/amd/lib/TritonAMDGPUToLLVM/LoadStoreOpToLLVM.cpp
++++ b/third_party/amd/lib/TritonAMDGPUToLLVM/LoadStoreOpToLLVM.cpp
+@@ -1166,7 +1166,7 @@ struct BufferAtomicRMWOpConversion
+       return failure();
+     }
+ 
+-    finalizeTensorAtomicResults(op, cast<RankedTensorType>(data), rewriter,
++    finalizeTensorAtomicResults(op, cast<RankedTensorType>(valueTy), rewriter,
+                                 loadedVals, valueElemTy, b, threadPred,
+                                 targetInfo, getTypeConverter());
+     return success();
+@@ -1280,7 +1280,7 @@ struct BufferAtomicCASOpConversion
+       return failure();
+     }
+ 
+-    finalizeTensorAtomicResults(op, cast<RankedTensorType>(val), rewriter,
++    finalizeTensorAtomicResults(op, cast<RankedTensorType>(valueTy), rewriter,
+                                 loadedVals, valueElemTy, b, threadPred,
+                                 targetInfo, getTypeConverter());
+     return success();
+
+From fdfa22bb04f060f986c1089b027a60a68cdf7721 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Sat, 19 Jul 2025 22:09:15 -0400
+Subject: [PATCH 39/53] Fix types
+
+---
+ .../amd/lib/TritonAMDGPUToLLVM/LoadStoreOpToLLVM.cpp | 12 ++++++------
+ 1 file changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/third_party/amd/lib/TritonAMDGPUToLLVM/LoadStoreOpToLLVM.cpp b/third_party/amd/lib/TritonAMDGPUToLLVM/LoadStoreOpToLLVM.cpp
+index 0e71a2767124..730d0f542cca 100644
+--- a/third_party/amd/lib/TritonAMDGPUToLLVM/LoadStoreOpToLLVM.cpp
++++ b/third_party/amd/lib/TritonAMDGPUToLLVM/LoadStoreOpToLLVM.cpp
+@@ -1166,9 +1166,9 @@ struct BufferAtomicRMWOpConversion
+       return failure();
+     }
+ 
+-    finalizeTensorAtomicResults(op, cast<RankedTensorType>(valueTy), rewriter,
+-                                loadedVals, valueElemTy, b, threadPred,
+-                                targetInfo, getTypeConverter());
++    finalizeTensorAtomicResults(op, dyn_cast<RankedTensorType>(valueTy),
++                                rewriter, loadedVals, valueElemTy, b,
++                                threadPred, targetInfo, getTypeConverter());
+     return success();
+   }
+ };
+@@ -1280,9 +1280,9 @@ struct BufferAtomicCASOpConversion
+       return failure();
+     }
+ 
+-    finalizeTensorAtomicResults(op, cast<RankedTensorType>(valueTy), rewriter,
+-                                loadedVals, valueElemTy, b, threadPred,
+-                                targetInfo, getTypeConverter());
++    finalizeTensorAtomicResults(op, dyn_cast<RankedTensorType>(valueTy),
++                                rewriter, loadedVals, valueElemTy, b,
++                                threadPred, targetInfo, getTypeConverter());
+     return success();
+   }
+ };
+
+From afeb8257e13c74c7fc5e323987554546c583c510 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Sat, 19 Jul 2025 22:13:03 -0400
+Subject: [PATCH 40/53] Fix test
+
+---
+ test/TritonGPU/atomic-cas.mlir | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/test/TritonGPU/atomic-cas.mlir b/test/TritonGPU/atomic-cas.mlir
+index 9c25c5ba4d87..f3cb64446881 100644
+--- a/test/TritonGPU/atomic-cas.mlir
++++ b/test/TritonGPU/atomic-cas.mlir
+@@ -1,7 +1,7 @@
+ // RUN: triton-opt %s -convert-triton-to-tritongpu=target=cuda:80 --allocate-shared-memory 2>&1 | FileCheck %s --check-prefix=GPU
+ // RUN: triton-opt %s -convert-triton-to-tritongpu=target=cuda:80 --allocate-shared-memory -convert-triton-gpu-to-llvm 2>&1 | FileCheck %s --check-prefix=LLVM
+ 
+-// GPU: %9 = tt.atomic_cas acq_rel, cta, %8, %cst_0, %cst : (tensor<2x!tt.ptr<i64>, #blocked>, tensor<2xi64, #blocked>, tensor<2xi64, #blocked>) -> tensor<2xi64, #blocked>
++// GPU: %9 = tt.atomic_cas acq_rel, cta, %8, %cst_0, %cst { allocation.offset = 0 } : (tensor<2x!tt.ptr<i64>, #blocked>, tensor<2xi64, #blocked>, tensor<2xi64, #blocked>) -> tensor<2xi64, #blocked>
+ // LLVM: llvm.inline_asm {{.*}} "mov.u64 $0, 0x0;\0A\09@$4 atom.global.acq_rel.cta.cas.b64 $0, [ $1 + 0 ], $2, $3;", "=l,l,l,l,b"
+ // LLVM: st.shared
+ // LLVM: nvvm.barrier0
+
+From 631b75c42a384091ca576b4d458a2118d756ddc4 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Sat, 19 Jul 2025 22:13:40 -0400
+Subject: [PATCH 41/53] Fix test
+
+---
+ test/TritonGPU/atomic-cas.mlir | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/test/TritonGPU/atomic-cas.mlir b/test/TritonGPU/atomic-cas.mlir
+index f3cb64446881..9ccdaa45e364 100644
+--- a/test/TritonGPU/atomic-cas.mlir
++++ b/test/TritonGPU/atomic-cas.mlir
+@@ -1,7 +1,7 @@
+ // RUN: triton-opt %s -convert-triton-to-tritongpu=target=cuda:80 --allocate-shared-memory 2>&1 | FileCheck %s --check-prefix=GPU
+ // RUN: triton-opt %s -convert-triton-to-tritongpu=target=cuda:80 --allocate-shared-memory -convert-triton-gpu-to-llvm 2>&1 | FileCheck %s --check-prefix=LLVM
+ 
+-// GPU: %9 = tt.atomic_cas acq_rel, cta, %8, %cst_0, %cst { allocation.offset = 0 } : (tensor<2x!tt.ptr<i64>, #blocked>, tensor<2xi64, #blocked>, tensor<2xi64, #blocked>) -> tensor<2xi64, #blocked>
++// GPU: %9 = tt.atomic_cas acq_rel, cta, %8, %cst_0, %cst { allocation.offset = 0 : i32 } : (tensor<2x!tt.ptr<i64>, #blocked>, tensor<2xi64, #blocked>, tensor<2xi64, #blocked>) -> tensor<2xi64, #blocked>
+ // LLVM: llvm.inline_asm {{.*}} "mov.u64 $0, 0x0;\0A\09@$4 atom.global.acq_rel.cta.cas.b64 $0, [ $1 + 0 ], $2, $3;", "=l,l,l,l,b"
+ // LLVM: st.shared
+ // LLVM: nvvm.barrier0
+
+From 1cb50e1fc6b829d81f806cf8365d57850d3aa4e6 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Sat, 19 Jul 2025 22:14:30 -0400
+Subject: [PATCH 42/53] Fix test
+
+---
+ test/TritonGPU/atomic-cas.mlir | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/test/TritonGPU/atomic-cas.mlir b/test/TritonGPU/atomic-cas.mlir
+index 9ccdaa45e364..a6e70ef4869d 100644
+--- a/test/TritonGPU/atomic-cas.mlir
++++ b/test/TritonGPU/atomic-cas.mlir
+@@ -1,7 +1,7 @@
+ // RUN: triton-opt %s -convert-triton-to-tritongpu=target=cuda:80 --allocate-shared-memory 2>&1 | FileCheck %s --check-prefix=GPU
+ // RUN: triton-opt %s -convert-triton-to-tritongpu=target=cuda:80 --allocate-shared-memory -convert-triton-gpu-to-llvm 2>&1 | FileCheck %s --check-prefix=LLVM
+ 
+-// GPU: %9 = tt.atomic_cas acq_rel, cta, %8, %cst_0, %cst { allocation.offset = 0 : i32 } : (tensor<2x!tt.ptr<i64>, #blocked>, tensor<2xi64, #blocked>, tensor<2xi64, #blocked>) -> tensor<2xi64, #blocked>
++// GPU: %9 = tt.atomic_cas acq_rel, cta, %8, %cst_0, %cst {allocation.offset = 0 : i32} : (tensor<2x!tt.ptr<i64>, #blocked>, tensor<2xi64, #blocked>, tensor<2xi64, #blocked>) -> tensor<2xi64, #blocked>
+ // LLVM: llvm.inline_asm {{.*}} "mov.u64 $0, 0x0;\0A\09@$4 atom.global.acq_rel.cta.cas.b64 $0, [ $1 + 0 ], $2, $3;", "=l,l,l,l,b"
+ // LLVM: st.shared
+ // LLVM: nvvm.barrier0
+
+From 448d778aed5607c38aa71ac533080fc51d39dce9 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Sat, 19 Jul 2025 22:17:21 -0400
+Subject: [PATCH 43/53] Fix test
+
+---
+ test/TritonGPU/atomic-cas.mlir | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/test/TritonGPU/atomic-cas.mlir b/test/TritonGPU/atomic-cas.mlir
+index a6e70ef4869d..4479fa633229 100644
+--- a/test/TritonGPU/atomic-cas.mlir
++++ b/test/TritonGPU/atomic-cas.mlir
+@@ -5,7 +5,7 @@
+ // LLVM: llvm.inline_asm {{.*}} "mov.u64 $0, 0x0;\0A\09@$4 atom.global.acq_rel.cta.cas.b64 $0, [ $1 + 0 ], $2, $3;", "=l,l,l,l,b"
+ // LLVM: st.shared
+ // LLVM: nvvm.barrier0
+-// LLVM: llvm.shared
++// LLVM: llvm.load
+ 
+ module {
+   tt.func public @atomic_cas_kernel_0d1d2e(%arg0: !tt.ptr<i64> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<i64> {tt.divisibility = 16 : i32}, %arg2: i32 {tt.max_divisibility = 8 : i32}) attributes {noinline = false} {
+
+From b3617d2e2fec05e9d93570f39bb23fe131ca16eb Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Sun, 20 Jul 2025 08:50:41 -0400
+Subject: [PATCH 44/53] Remove atomicNeedsSharedMemory
+
+---
+ include/triton/Analysis/Utility.h                          | 4 +++-
+ lib/Analysis/Utility.cpp                                   | 7 -------
+ .../amd/lib/TritonAMDGPUToLLVM/LoadStoreOpToLLVM.cpp       | 4 ++--
+ 3 files changed, 5 insertions(+), 10 deletions(-)
+
+diff --git a/include/triton/Analysis/Utility.h b/include/triton/Analysis/Utility.h
+index 2c14a42fb80a..5694f0a9dedb 100644
+--- a/include/triton/Analysis/Utility.h
++++ b/include/triton/Analysis/Utility.h
+@@ -252,7 +252,9 @@ bool cvtNeedsWarpShuffle(RankedTensorType srcTy, RankedTensorType dstTy);
+ // warps, and possibly blocks.
+ bool cvtNeedsSharedMemory(RankedTensorType srcTy, RankedTensorType dstTy);
+ 
+-bool atomicNeedsSharedMemory(Value result);
++// Return true if the src and dst layout match.
++bool matchMmaV3AndDotOperandLayout(RankedTensorType srcTy,
++                                   RankedTensorType dstTy);
+ 
+ // Check if MFMA layout can be converted to the dot operand
+ // layout using warp shuffle.
+diff --git a/lib/Analysis/Utility.cpp b/lib/Analysis/Utility.cpp
+index c7704716bbc6..09cf95c0ce95 100644
+--- a/lib/Analysis/Utility.cpp
++++ b/lib/Analysis/Utility.cpp
+@@ -797,13 +797,6 @@ bool cvtNeedsSharedMemory(RankedTensorType srcTy, RankedTensorType dstTy) {
+          !matchMFMAAndDotOperandShuffleCase(srcTy, dstTy);
+ }
+ 
+-bool atomicNeedsSharedMemory(Value value) {
+-  auto type = value.getType();
+-  if (isa<RankedTensorType>(type) || value.use_empty())
+-    return false;
+-  return true;
+-}
+-
+ namespace {
+ 
+ /// A data structure similar to SetVector but maintains
+diff --git a/third_party/amd/lib/TritonAMDGPUToLLVM/LoadStoreOpToLLVM.cpp b/third_party/amd/lib/TritonAMDGPUToLLVM/LoadStoreOpToLLVM.cpp
+index 730d0f542cca..42d9273069dc 100644
+--- a/third_party/amd/lib/TritonAMDGPUToLLVM/LoadStoreOpToLLVM.cpp
++++ b/third_party/amd/lib/TritonAMDGPUToLLVM/LoadStoreOpToLLVM.cpp
+@@ -1479,7 +1479,7 @@ struct AtomicCASOpConversion
+             loc, casPtr, casCmp, casVal, successOrdering, failureOrdering,
+             StringRef("agent"));
+ 
+-        if (atomicNeedsSharedMemory(op.getResult())) {
++        if (!op.getResult().use_empty()) {
+           // Extract the new_loaded value from the pair.
+           Value newLoaded = b.extract_val(valueElemTy, cmpxchg, 0);
+           Value atomPtr =
+@@ -1641,7 +1641,7 @@ struct AtomicRMWOpConversion
+     auto tid = getThreadId(rewriter, loc);
+ 
+     std::optional<Value> atomicSharedMemBase =
+-        atomicNeedsSharedMemory(opResult)
++        op->hasAttr("allocation.offset")
+             ? std::optional<Value>(getSharedMemoryBase(
+                   loc, rewriter, targetInfo, op.getOperation()))
+             : std::nullopt;
+
+From 64010369baaf598e91a4f195defa1943ddb1099d Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Sun, 20 Jul 2025 09:05:29 -0400
+Subject: [PATCH 45/53] Update test
+
+---
+ test/Conversion/amd/tritongpu_to_llvm.mlir    |  1 -
+ .../LoadStoreOpToLLVM.cpp                     | 23 +++++++++----------
+ 2 files changed, 11 insertions(+), 13 deletions(-)
+
+diff --git a/test/Conversion/amd/tritongpu_to_llvm.mlir b/test/Conversion/amd/tritongpu_to_llvm.mlir
+index 795e9c99964a..617750719943 100644
+--- a/test/Conversion/amd/tritongpu_to_llvm.mlir
++++ b/test/Conversion/amd/tritongpu_to_llvm.mlir
+@@ -260,7 +260,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
+   // CHECK-LABEL: atomic_runtime_lds_reduction
+   tt.func @atomic_runtime_lds_reduction(%arg0 : tensor<64x!tt.ptr<f32>, #blocked5>, %arg2 : tensor<64xf32, #blocked5>) {
+ 
+-    // CHECK: llvm.zext
+     // CHECK-COUNT-7: rocdl.update.dpp
+     // CHECK: llvm.bitcast
+     // CHECK-COUNT: llvm.amdgcqn.ds.permute
+diff --git a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
+index 22adc1b65916..0192ee0fe8a0 100644
+--- a/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
++++ b/third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/LoadStoreOpToLLVM.cpp
+@@ -17,7 +17,6 @@
+ #include "triton/Dialect/TritonGPU/IR/Attributes.h"
+ #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+ #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
+-#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
+ #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+ #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
+ #include "triton/Tools/LayoutUtils.h"
+@@ -50,17 +49,6 @@ Value maybeAnd(RewriterBase &rewriter, Location loc, Value a, Value b) {
+   return a ? a : b;
+ }
+ 
+-void createBarrier(ConversionPatternRewriter &rewriter, Location loc,
+-                   int numCTAs) {
+-  auto b = TritonLLVMOpBuilder(loc, rewriter);
+-  if (numCTAs == 1) {
+-    b.barrier();
+-  } else {
+-    rewriter.create<triton::nvidia_gpu::ClusterArriveOp>(loc, false);
+-    rewriter.create<triton::nvidia_gpu::ClusterWaitOp>(loc);
+-  }
+-}
+-
+ // Return a predicate that is true only if the current thread holds unique data,
+ // according to freeVarsMask. The predicate may be null to indicate no
+ // predication is required.
+@@ -576,6 +564,17 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
+   int computeCapability;
+ };
+ 
++void createBarrier(ConversionPatternRewriter &rewriter, Location loc,
++                   int numCTAs) {
++  auto b = TritonLLVMOpBuilder(loc, rewriter);
++  if (numCTAs == 1) {
++    b.barrier();
++  } else {
++    rewriter.create<triton::nvidia_gpu::ClusterArriveOp>(loc, false);
++    rewriter.create<triton::nvidia_gpu::ClusterWaitOp>(loc);
++  }
++}
++
+ struct AtomicCASOpConversion
+     : public ConvertOpToLLVMPattern<triton::AtomicCASOp>,
+       public LoadStoreConversionBase {
+
+From 8e291f6a00e7c545be3b05e0269ead847017749e Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Sun, 20 Jul 2025 09:08:39 -0400
+Subject: [PATCH 46/53] Update test
+
+---
+ python/test/unit/language/test_core.py | 5 ++---
+ 1 file changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/python/test/unit/language/test_core.py b/python/test/unit/language/test_core.py
+index 6139777e5afd..bcdd5ab30586 100644
+--- a/python/test/unit/language/test_core.py
++++ b/python/test/unit/language/test_core.py
+@@ -2007,7 +2007,6 @@ def kernel(I, O):
+ @pytest.mark.parametrize("size", [1, 4, 128])
+ @pytest.mark.parametrize("op", ["add", "cas"])
+ def test_tensor_atomic_use_result(dtype_str, size, op, device):
+-    # size 1 and 4 should trigger value broadcasting, while 128 should not
+ 
+     @triton.jit
+     def kernel(index_ptr, out_ptr, size: tl.constexpr, op: tl.constexpr):
+@@ -2020,10 +2019,10 @@ def kernel(index_ptr, out_ptr, size: tl.constexpr, op: tl.constexpr):
+                 val=tl.arange(0, size).to(index_ptr.dtype.element_ty),
+                 sem="relaxed",
+             )
+-        tl.store(out_ptr + write_index.to(tl.uint32), 5)
++        tl.store(out_ptr + write_index.to(tl.uint32)[:, None] * size + tl.arange(0, size)[None, :], 5)
+ 
+     index = torch.arange(0, size, device=device).to(dtype=getattr(torch, dtype_str))
+-    out = torch.zeros((size, ), device=device, dtype=getattr(torch, dtype_str))
++    out = torch.zeros((size, size), device=device, dtype=getattr(torch, dtype_str))
+     kernel[(1, )](index, out, size, op)
+     assert (out == 5).all()
+ 
+
+From 3d133dd3e965879eeefeb6a575e178eee89d23c3 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Sun, 20 Jul 2025 11:08:59 -0400
+Subject: [PATCH 47/53] Update test
+
+---
+ python/test/unit/language/test_core.py | 14 ++++++++------
+ 1 file changed, 8 insertions(+), 6 deletions(-)
+
+diff --git a/python/test/unit/language/test_core.py b/python/test/unit/language/test_core.py
+index bcdd5ab30586..8ac4bd9ea5fb 100644
+--- a/python/test/unit/language/test_core.py
++++ b/python/test/unit/language/test_core.py
+@@ -2003,23 +2003,25 @@ def kernel(I, O):
+         kernel[(1, )](I, O)
+ 
+ 
++@pytest.mark.interpreter
+ @pytest.mark.parametrize("dtype_str", ["int32", "float16"])
+-@pytest.mark.parametrize("size", [1, 4, 128])
++@pytest.mark.parametrize("size", [1, 4, 16])
+ @pytest.mark.parametrize("op", ["add", "cas"])
+ def test_tensor_atomic_use_result(dtype_str, size, op, device):
+ 
+     @triton.jit
+     def kernel(index_ptr, out_ptr, size: tl.constexpr, op: tl.constexpr):
+         if op == "add":
+-            write_index = tl.atomic_add(index_ptr + tl.arange(0, size), val=tl.arange(0, size), sem="relaxed")
++            write_index = tl.atomic_add(index_ptr + tl.arange(0, size)[:, None], val=tl.arange(0, size)[:, None],
++                                        sem="relaxed")
+         elif op == "cas":
+             write_index = tl.atomic_cas(
+-                index_ptr + tl.arange(0, size),
+-                cmp=tl.zeros((size, ), dtype=index_ptr.dtype.element_ty),
+-                val=tl.arange(0, size).to(index_ptr.dtype.element_ty),
++                index_ptr + tl.arange(0, size)[:, None],
++                cmp=tl.zeros((size, ), dtype=index_ptr.dtype.element_ty)[:, None],
++                val=tl.arange(0, size).to(index_ptr.dtype.element_ty)[:, None],
+                 sem="relaxed",
+             )
+-        tl.store(out_ptr + write_index.to(tl.uint32)[:, None] * size + tl.arange(0, size)[None, :], 5)
++        tl.store(out_ptr + write_index.to(tl.uint32) * size + tl.arange(0, size)[None, :], 5)
+ 
+     index = torch.arange(0, size, device=device).to(dtype=getattr(torch, dtype_str))
+     out = torch.zeros((size, size), device=device, dtype=getattr(torch, dtype_str))
+
+From 96e231f4ef7cc75692bee0cea326ce0dac1db76b Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Sun, 20 Jul 2025 20:49:43 -0400
+Subject: [PATCH 48/53] Fix a return
+
+---
+ third_party/amd/lib/TritonAMDGPUToLLVM/LoadStoreOpToLLVM.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/third_party/amd/lib/TritonAMDGPUToLLVM/LoadStoreOpToLLVM.cpp b/third_party/amd/lib/TritonAMDGPUToLLVM/LoadStoreOpToLLVM.cpp
+index 42d9273069dc..730e4de05560 100644
+--- a/third_party/amd/lib/TritonAMDGPUToLLVM/LoadStoreOpToLLVM.cpp
++++ b/third_party/amd/lib/TritonAMDGPUToLLVM/LoadStoreOpToLLVM.cpp
+@@ -1703,7 +1703,7 @@ struct AtomicRMWOpConversion
+         } else {
+           if (!atomicSharedMemBase.has_value()) {
+             rewriter.eraseOp(op);
+-            continue;
++            return success();
+           }
+           Value atomPtr = *atomicSharedMemBase;
+           b.barrier();
+
+From fe95ff76267d90ffd8c801fe92d962e9c3a6c043 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Sun, 20 Jul 2025 21:27:06 -0400
+Subject: [PATCH 49/53] Update
+
+---
+ python/test/unit/language/test_core.py | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/python/test/unit/language/test_core.py b/python/test/unit/language/test_core.py
+index 8ac4bd9ea5fb..b5e0924a255f 100644
+--- a/python/test/unit/language/test_core.py
++++ b/python/test/unit/language/test_core.py
+@@ -2008,6 +2008,10 @@ def kernel(I, O):
+ @pytest.mark.parametrize("size", [1, 4, 16])
+ @pytest.mark.parametrize("op", ["add", "cas"])
+ def test_tensor_atomic_use_result(dtype_str, size, op, device):
++    if is_hip():
++        pytest.skip(
++            "HIP is broken because (1) it doesn't support thread predicate in atomic cas, and (2) it doesn't support"
++            " atomic rmw with float16")
+ 
+     @triton.jit
+     def kernel(index_ptr, out_ptr, size: tl.constexpr, op: tl.constexpr):
+
+From cedbffe4dca308b65aa644d227a7268b65071df8 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Wed, 23 Jul 2025 09:39:13 -0400
+Subject: [PATCH 50/53] Remove function
+
+---
+ include/triton/Analysis/Utility.h | 4 ----
+ 1 file changed, 4 deletions(-)
+
+diff --git a/include/triton/Analysis/Utility.h b/include/triton/Analysis/Utility.h
+index 5694f0a9dedb..dc0b96506265 100644
+--- a/include/triton/Analysis/Utility.h
++++ b/include/triton/Analysis/Utility.h
+@@ -252,10 +252,6 @@ bool cvtNeedsWarpShuffle(RankedTensorType srcTy, RankedTensorType dstTy);
+ // warps, and possibly blocks.
+ bool cvtNeedsSharedMemory(RankedTensorType srcTy, RankedTensorType dstTy);
+ 
+-// Return true if the src and dst layout match.
+-bool matchMmaV3AndDotOperandLayout(RankedTensorType srcTy,
+-                                   RankedTensorType dstTy);
+-
+ // Check if MFMA layout can be converted to the dot operand
+ // layout using warp shuffle.
+ bool matchMFMAAndDotOperandShuffleCase(RankedTensorType srcTy,
+
+From ec64c75cf843e09ece6076587d2e909b38483c38 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Thu, 24 Jul 2025 06:57:19 -0400
+Subject: [PATCH 51/53] Fix compilation
+
+---
+ lib/Conversion/TritonGPUToLLVM/Utility.cpp | 13 +++++++------
+ 1 file changed, 7 insertions(+), 6 deletions(-)
+
+diff --git a/lib/Conversion/TritonGPUToLLVM/Utility.cpp b/lib/Conversion/TritonGPUToLLVM/Utility.cpp
+index dd47f0fa38cf..669654a42a6a 100644
+--- a/lib/Conversion/TritonGPUToLLVM/Utility.cpp
++++ b/lib/Conversion/TritonGPUToLLVM/Utility.cpp
+@@ -1904,13 +1904,14 @@ void finalizeTensorAtomicResults(Operation *op, RankedTensorType tensorTy,
+   };
+ 
+   lowerLdSt(loc, ctx, dstLayout, resultVals, valueElemTy, smemBase,
+-            /*affineOffset=*/b.i32_val(0),
+-            /*maskSpanAffineOffset=*/0, rewriter, targetInfo, {}, emitSt);
++            /*calcPaddedOffset=*/{}, /*affineOffset=*/b.i32_val(0),
++            /*maskSpanAffineOffset=*/0, rewriter, targetInfo,
++            /*maybeMaxVecElems=*/{}, emitSt);
+   b.barrier();
+-  resultVals =
+-      lowerLdSt(loc, ctx, dstLayout, resultVals, valueElemTy, smemBase,
+-                /*affineOffset=*/b.i32_val(0),
+-                /*maskSpanAffineOffset=*/0, rewriter, targetInfo, {}, emitLd);
++  resultVals = lowerLdSt(loc, ctx, dstLayout, resultVals, valueElemTy, smemBase,
++                         /*calcPaddedOffset=*/{}, /*affineOffset=*/b.i32_val(0),
++                         /*maskSpanAffineOffset=*/0, rewriter, targetInfo,
++                         /*maybeMaxVecElems=*/{}, emitLd);
+ 
+   // Create the result struct and replace the operation
+   Value resultStruct =
+
+From a010420becf8ddc39ceac76f50f8f5f4a55f3147 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Thu, 24 Jul 2025 07:05:26 -0400
+Subject: [PATCH 52/53] nopaddingoffset
+
+---
+ lib/Conversion/TritonGPUToLLVM/Utility.cpp | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/lib/Conversion/TritonGPUToLLVM/Utility.cpp b/lib/Conversion/TritonGPUToLLVM/Utility.cpp
+index 669654a42a6a..e09bf713c2ec 100644
+--- a/lib/Conversion/TritonGPUToLLVM/Utility.cpp
++++ b/lib/Conversion/TritonGPUToLLVM/Utility.cpp
+@@ -1903,13 +1903,15 @@ void finalizeTensorAtomicResults(Operation *op, RankedTensorType tensorTy,
+     return unpackLLVector(loc, loadedVec, rewriter);
+   };
+ 
++  auto noPaddingOffset = [](Value v) { return v; };
+   lowerLdSt(loc, ctx, dstLayout, resultVals, valueElemTy, smemBase,
+-            /*calcPaddedOffset=*/{}, /*affineOffset=*/b.i32_val(0),
++            /*calcPaddedOffset=*/noPaddingOffset, /*affineOffset=*/b.i32_val(0),
+             /*maskSpanAffineOffset=*/0, rewriter, targetInfo,
+             /*maybeMaxVecElems=*/{}, emitSt);
+   b.barrier();
+   resultVals = lowerLdSt(loc, ctx, dstLayout, resultVals, valueElemTy, smemBase,
+-                         /*calcPaddedOffset=*/{}, /*affineOffset=*/b.i32_val(0),
++                         /*calcPaddedOffset=*/noPaddingOffset,
++                         /*affineOffset=*/b.i32_val(0),
+                          /*maskSpanAffineOffset=*/0, rewriter, targetInfo,
+                          /*maybeMaxVecElems=*/{}, emitLd);
+ 
+
+From c96b3fd6a99e6e4bab6b0dcbc778f058e2728704 Mon Sep 17 00:00:00 2001
+From: Jokeren <robinho364@gmail.com>
+Date: Thu, 24 Jul 2025 16:17:41 -0400
+Subject: [PATCH 53/53] Change atomic-cas to a triton-gpu test
+
+---
+ test/TritonGPU/atomic-cas.mlir | 41 +++++++++++++++++-----------------
+ 1 file changed, 20 insertions(+), 21 deletions(-)
+
+diff --git a/test/TritonGPU/atomic-cas.mlir b/test/TritonGPU/atomic-cas.mlir
+index 4479fa633229..9d787a7ab2d3 100644
+--- a/test/TritonGPU/atomic-cas.mlir
++++ b/test/TritonGPU/atomic-cas.mlir
+@@ -1,30 +1,29 @@
+-// RUN: triton-opt %s -convert-triton-to-tritongpu=target=cuda:80 --allocate-shared-memory 2>&1 | FileCheck %s --check-prefix=GPU
+-// RUN: triton-opt %s -convert-triton-to-tritongpu=target=cuda:80 --allocate-shared-memory -convert-triton-gpu-to-llvm 2>&1 | FileCheck %s --check-prefix=LLVM
++// RUN: triton-opt %s -convert-triton-gpu-to-llvm 2>&1 | FileCheck %s
+ 
+-// GPU: %9 = tt.atomic_cas acq_rel, cta, %8, %cst_0, %cst {allocation.offset = 0 : i32} : (tensor<2x!tt.ptr<i64>, #blocked>, tensor<2xi64, #blocked>, tensor<2xi64, #blocked>) -> tensor<2xi64, #blocked>
+-// LLVM: llvm.inline_asm {{.*}} "mov.u64 $0, 0x0;\0A\09@$4 atom.global.acq_rel.cta.cas.b64 $0, [ $1 + 0 ], $2, $3;", "=l,l,l,l,b"
+-// LLVM: st.shared
+-// LLVM: nvvm.barrier0
+-// LLVM: llvm.load
++// CHECK: llvm.inline_asm {{.*}} "mov.u64 $0, 0x0;\0A\09@$4 atom.global.acq_rel.cta.cas.b64 $0, [ $1 + 0 ], $2, $3;", "=l,l,l,l,b"
++// CHECK: st.shared
++// CHECK: nvvm.barrier0
++// CHECK: llvm.load
+ 
+-module {
++#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
++module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:80", "ttg.threads-per-warp" = 32 : i32} {
+   tt.func public @atomic_cas_kernel_0d1d2e(%arg0: !tt.ptr<i64> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<i64> {tt.divisibility = 16 : i32}, %arg2: i32 {tt.max_divisibility = 8 : i32}) attributes {noinline = false} {
+-    %cst = arith.constant dense<2> : tensor<2xi64>
+-    %cst_0 = arith.constant dense<1> : tensor<2xi64>
++    %cst = arith.constant dense<2> : tensor<2xi64, #blocked>
++    %cst_0 = arith.constant dense<1> : tensor<2xi64, #blocked>
+     %c2_i32 = arith.constant 2 : i32
+     %0 = tt.get_program_id x : i32
+     %1 = arith.muli %0, %c2_i32 : i32
+-    %2 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32>
+-    %3 = tt.splat %1 : i32 -> tensor<2xi32>
+-    %4 = arith.addi %3, %2 : tensor<2xi32>
+-    %5 = tt.splat %arg2 : i32 -> tensor<2xi32>
+-    %6 = arith.cmpi slt, %4, %5 : tensor<2xi32>
+-    %7 = tt.splat %arg0 : !tt.ptr<i64> -> tensor<2x!tt.ptr<i64>>
+-    %8 = tt.addptr %7, %4 : tensor<2x!tt.ptr<i64>>, tensor<2xi32>
+-    %9 = tt.atomic_cas acq_rel, cta, %8, %cst_0, %cst : (tensor<2x!tt.ptr<i64>>, tensor<2xi64>, tensor<2xi64>) -> tensor<2xi64>
+-    %10 = tt.splat %arg1 : !tt.ptr<i64> -> tensor<2x!tt.ptr<i64>>
+-    %11 = tt.addptr %10, %4 : tensor<2x!tt.ptr<i64>>, tensor<2xi32>
+-    tt.store %11, %9, %6 : tensor<2x!tt.ptr<i64>>
++    %2 = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32, #blocked>
++    %3 = tt.splat %1 : i32 -> tensor<2xi32, #blocked>
++    %4 = arith.addi %3, %2 : tensor<2xi32, #blocked>
++    %5 = tt.splat %arg2 : i32 -> tensor<2xi32, #blocked>
++    %6 = arith.cmpi slt, %4, %5 : tensor<2xi32, #blocked>
++    %7 = tt.splat %arg0 : !tt.ptr<i64> -> tensor<2x!tt.ptr<i64>, #blocked>
++    %8 = tt.addptr %7, %4 : tensor<2x!tt.ptr<i64>, #blocked>, tensor<2xi32, #blocked>
++    %9 = tt.atomic_cas acq_rel, cta, %8, %cst_0, %cst {allocation.offset = 0 : i32} : (tensor<2x!tt.ptr<i64>, #blocked>, tensor<2xi64, #blocked>, tensor<2xi64, #blocked>) -> tensor<2xi64, #blocked>
++    %10 = tt.splat %arg1 : !tt.ptr<i64> -> tensor<2x!tt.ptr<i64>, #blocked>
++    %11 = tt.addptr %10, %4 : tensor<2x!tt.ptr<i64>, #blocked>, tensor<2xi32, #blocked>
++    tt.store %11, %9, %6 : tensor<2x!tt.ptr<i64>, #blocked>
+     tt.return
+   }
+ }

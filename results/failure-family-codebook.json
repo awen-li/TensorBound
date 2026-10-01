@@ -1,0 +1,21 @@
+{
+  "schema_version": "1.0.0",
+  "unit": "first invalid decision in one distinct repaired cause",
+  "primary_assignment_rule": "Assign the mechanism enacted by the earliest executed binding decision whose outcome violates an independently stated obligation and permits the reported physical effect. Preserve later mechanisms in the causal path without counting them as the primary family.",
+  "boundary_rules": [
+    "A relation absent at the decision is lost or omitted; a relation present but resolved to the wrong value is incorrectly mapped or translated.",
+    "A required predicate not evaluated is a missing eligibility check; a predicate evaluated from premises that do not entail its conclusion is an unsound assumption or inference.",
+    "An absent temporal edge is missing ordering or enforcement; an action that fires too early despite represented temporal state is a premature or unordered transition.",
+    "An absent concrete action is an omitted operation; an existing relation invalidated too early or retained after its source changes is premature invalidation or stale state."
+  ],
+  "families": {
+    "incorrect mapping or translation": "The required source fact reaches the decision, but the decision selects or computes the wrong target, index, offset, layout, placement, or encoding.",
+    "lost or omitted relation": "A relation represented upstream has no faithful representation at the decision because a field, edge, or propagation step drops it.",
+    "missing eligibility check": "An admission, reuse, fusion, or transformation decision proceeds without evaluating a required precondition.",
+    "unsound assumption or inference": "The decision derives a semantic property from premises that do not entail that property.",
+    "missing ordering or enforcement": "No dependency, wait, barrier, or protocol edge establishes a required temporal relation.",
+    "premature or unordered transition": "A transition executes before its predecessor or completion condition even though the surrounding mechanism represents the relevant temporal state.",
+    "premature invalidation or stale state": "A recorded relation is invalidated before its last valid use or remains cached after the source state changes.",
+    "omitted operation": "A required concrete action, such as a write, copy, conversion, retain, or release, is absent from the executed path."
+  }
+}

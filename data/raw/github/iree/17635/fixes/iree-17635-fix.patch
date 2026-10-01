@@ -1,0 +1,31 @@
+From b5ee2a927d3bc3c453c66e4276de6516f35a9cb6 Mon Sep 17 00:00:00 2001
+From: Scott Todd <scott.todd0@gmail.com>
+Date: Wed, 12 Jun 2024 22:59:35 +0000
+Subject: [PATCH] Tweak output_buffer_reference_test to repro ASan issue.
+
+Signed-off-by: Scott Todd <scott.todd0@gmail.com>
+---
+ .../bindings/python/test/api/output_buffer_reference_test.py   | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/compiler/bindings/python/test/api/output_buffer_reference_test.py b/compiler/bindings/python/test/api/output_buffer_reference_test.py
+index 1395f7b4e17d..16e2c9388af7 100644
+--- a/compiler/bindings/python/test/api/output_buffer_reference_test.py
++++ b/compiler/bindings/python/test/api/output_buffer_reference_test.py
+@@ -21,6 +21,7 @@
+     VmContext,
+     VmInstance,
+     VmModule,
++    load_vm_module,
+ )
+ 
+ 
+@@ -59,7 +60,7 @@ def run_mmap_free_before_context_test():
+     output.write(vmfb_contents)
+     mapped_memory = output.map_memory()
+     module = VmModule.wrap_buffer(instance, mapped_memory)
+-    context = VmContext(instance, modules=[module])
++    loaded_module = load_vm_module(module)
+     # Shutdown in the most egregious way possible.
+     # Note that during context destruction, the context needs some final
+     # access to the mapped memory to run destructors. It is easy for the

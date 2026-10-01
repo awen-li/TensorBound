@@ -1,0 +1,70 @@
+From 67e982d5cb5e65208168ddc6dd6ad24df3e5db9e Mon Sep 17 00:00:00 2001
+From: Markus Hoehnerbach <mhoehnerbach@meta.com>
+Date: Tue, 10 Mar 2026 21:52:40 +0000
+Subject: [PATCH] Fix weak dep check if not all indices are used (#175568)
+
+Fixes #174074
+
+This can happen also on non-UB paths when accumulate is set, as a
+consequence of how we inline the offset in there.
+
+Pull Request resolved: https://github.com/pytorch/pytorch/pull/175568
+Approved by: https://github.com/mlazos, https://github.com/eellison
+---
+ test/inductor/test_torchinductor.py | 25 +++++++++++++++++++++++++
+ torch/_inductor/scheduler.py        |  6 ++++++
+ 2 files changed, 31 insertions(+)
+
+diff --git a/test/inductor/test_torchinductor.py b/test/inductor/test_torchinductor.py
+index 4ed4c4952ce83..9141bad610358 100644
+--- a/test/inductor/test_torchinductor.py
++++ b/test/inductor/test_torchinductor.py
+@@ -8932,6 +8932,31 @@ def fn(x, idx):
+         self.common(fn, (a, idx))
+         assertGeneratedKernelCountEqual(self, 2)
+ 
++    @skip_if_halide
++    @skip_if_pallas
++    def test_index_put_duplicate_indices_no_accumulate(self):
++        # https://github.com/pytorch/pytorch/issues/174074
++        def fn(x):
++            x[[0, 0]] += x[[0, 0]]
++            return x
++
++        # ncols=2048 forces multiple Triton blocks on GPU, exposing the
++        # inter-block race that small tensors mask.
++        x = torch.randn(1, 2048, dtype=torch.float32)
++        self.common(fn, (x,))
++
++    @skip_if_pallas
++    def test_index_put_duplicate_indices_accumulate(self):
++        # accumulate=True is well-defined with duplicate indices.
++        def fn(x):
++            idx = torch.tensor([0, 0], device=x.device)
++            vals = x[[0, 0]] * 2
++            x.index_put_((idx,), vals, accumulate=True)
++            return x
++
++        x = torch.randn(1, 2048, dtype=torch.float32)
++        self.common(fn, (x,))
++
+     def test_adding_tensor_offsets(self):
+         @torch.compile(fullgraph=True)
+         def fn(x):
+diff --git a/torch/_inductor/scheduler.py b/torch/_inductor/scheduler.py
+index cfca2de6b1781..74929fbfeb96f 100644
+--- a/torch/_inductor/scheduler.py
++++ b/torch/_inductor/scheduler.py
+@@ -6016,6 +6016,12 @@ def fusable_weak_dep(
+         if free_symbol_is_type(write.index, SymT.TMP):
+             return False
+ 
++        # Non-injective scatter: range vars absent from write index mean
++        # multiple iterations hit the same location. Can't fuse the reader
++        # in or it will see partially-written state between iterations.
++        if not OrderedSet(write.var_names) <= write.index.free_symbols:
++            return False
++
+         real_name = self.mutation_real_name[weak_dep.mutating_buf]
+         relevant_reading_nodes = [node1]
+         if isinstance(node1, ForeachKernelSchedulerNode):

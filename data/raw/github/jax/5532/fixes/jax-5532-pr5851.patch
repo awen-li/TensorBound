@@ -1,0 +1,184 @@
+From 5d11d101c60837fbf14c52f37d477928f853abdc Mon Sep 17 00:00:00 2001
+From: Jean-Baptiste Lespiau <jblespiau@google.com>
+Date: Mon, 1 Mar 2021 12:32:39 -0800
+Subject: [PATCH] Move the x64 context manager threadlocal state from
+ jax/python to xla/c++
+
+Fixes #5532.
+
+PiperOrigin-RevId: 360252057
+---
+ jax/api.py                      | 10 +++++--
+ jax/config.py                   | 20 ++++++++++---
+ jax/experimental/x64_context.py |  2 +-
+ tests/x64_context_test.py       | 50 +++++++++++++++++++++++++++------
+ 4 files changed, 66 insertions(+), 16 deletions(-)
+
+diff --git a/jax/api.py b/jax/api.py
+index 25476e28a347..4e8508684926 100644
+--- a/jax/api.py
++++ b/jax/api.py
+@@ -355,7 +355,11 @@ def get_jax_enable_x64():
+     functions decorated with jax.jit), so we delay inspecting the value
+     of the jax_enable_x64 flag until JIT time.
+     """
+-    return config.x64_enabled
++    # TODO(jblespiau): Delete when jaxlib 0.1.62 is the minimal version.
++    if lib._xla_extension_version >= 4:
++      return config.read("jax_enable_x64")
++    else:
++      return config.x64_enabled
+ 
+   def get_jax_disable_jit_flag():
+     """Returns the value of the `jax_disable_jit` flag.
+@@ -375,8 +379,10 @@ def get_jax_disable_jit_flag():
+   @wraps(fun)
+   @api_boundary
+   def f_jitted(*args, **kwargs):
++    # TODO(jblespiau): We can remove `config.x64_enabled` when jaxlib has
++    # extension version 4
+     context = (getattr(core.thread_local_state.trace_state.trace_stack,
+-                       'dynamic', None), config.x64_enabled)
++                         "dynamic", None), config.x64_enabled)
+     # TODO(jblespiau): Move this to C++.
+     if (FLAGS.jax_debug_nans or FLAGS.jax_debug_infs) and not _jit_is_disabled():
+       device_arrays = cpp_jitted_f(context, *args, **kwargs)
+diff --git a/jax/config.py b/jax/config.py
+index ee0c15d8e0e8..7f90f6331ec2 100644
+--- a/jax/config.py
++++ b/jax/config.py
+@@ -16,6 +16,7 @@
+ import sys
+ import threading
+ from typing import Optional
++from jax import lib
+ 
+ def bool_env(varname: str, default: bool) -> bool:
+   """Read an environment variable and interpret it as a boolean.
+@@ -49,6 +50,7 @@ def __init__(self):
+ 
+ 
+ class Config:
++  # TODO(jakevdp): Remove when minimum jaxlib is has extension version 4
+   _thread_local_state = _ThreadLocalState()
+ 
+   def __init__(self):
+@@ -149,13 +151,23 @@ def disable_omnistaging(self):
+ 
+   @property
+   def x64_enabled(self):
+-    if self._thread_local_state.enable_x64 is None:
+-      self._thread_local_state.enable_x64 = bool(self.read('jax_enable_x64'))
+-    return self._thread_local_state.enable_x64
++   if lib._xla_extension_version >= 4:
++     if lib.jax_jit.get_enable_x64() is None:
++       lib.jax_jit.set_enable_x64(bool(self.read('jax_enable_x64')))
++     return lib.jax_jit.get_enable_x64()
++   else:
++     # TODO(jakevdp): Remove when minimum jaxlib is has extension version 4
++     if self._thread_local_state.enable_x64 is None:
++       self._thread_local_state.enable_x64 = bool(self.read('jax_enable_x64'))
++     return self._thread_local_state.enable_x64
+ 
+   # TODO(jakevdp): make this public when thread-local x64 is fully implemented.
+   def _set_x64_enabled(self, state):
+-    self._thread_local_state.enable_x64 = bool(state)
++    if lib._xla_extension_version >= 4:
++      lib.jax_jit.set_enable_x64(bool(state))
++    else:
++      # TODO(jakevdp): Remove when minimum jaxlib is has extension version 4
++      self._thread_local_state.enable_x64 = bool(state)
+ 
+ 
+ class NameSpace(object):
+diff --git a/jax/experimental/x64_context.py b/jax/experimental/x64_context.py
+index b2d7a4eb68e9..089f3a3690dc 100644
+--- a/jax/experimental/x64_context.py
++++ b/jax/experimental/x64_context.py
+@@ -18,7 +18,7 @@
+ """
+ 
+ from contextlib import contextmanager
+-from jax.config import config
++from jax import config
+ 
+ @contextmanager
+ def enable_x64():
+diff --git a/tests/x64_context_test.py b/tests/x64_context_test.py
+index c298d16a8ac9..00e80abfd227 100644
+--- a/tests/x64_context_test.py
++++ b/tests/x64_context_test.py
+@@ -16,10 +16,16 @@
+ import concurrent.futures
+ import time
+ 
+-from absl.testing import absltest, parameterized
+-
+-from jax import api, lax, partial, random
+-from jax.config import config, FLAGS
++from absl.testing import absltest
++from absl.testing import parameterized
++
++import jax
++from jax import api
++from jax import lax
++from jax import partial
++from jax import random
++from jax.config import config
++from jax.config import FLAGS
+ from jax.experimental import enable_x64, disable_x64
+ import jax.numpy as jnp
+ import jax.test_util as jtu
+@@ -48,11 +54,35 @@ def test_make_array(self, jit):
+     func = _maybe_jit(jit, lambda: jnp.arange(10.0))
+     dtype_start = func().dtype
+     with enable_x64():
+-      self.assertEqual(func().dtype, 'float64')
++      self.assertEqual(func().dtype, "float64")
+     with disable_x64():
+-      self.assertEqual(func().dtype, 'float32')
++      self.assertEqual(func().dtype, "float32")
+     self.assertEqual(func().dtype, dtype_start)
+ 
++  @parameterized.named_parameters(
++      jtu.cases_from_list({
++          "testcase_name": "_jit={}_f_{}".format(jit, f.__name__),
++          "jit": jit,
++          "enable_or_disable": f
++      } for jit in ["python", "cpp", None] for f in [enable_x64, disable_x64]))
++  def test_correctly_capture_default(self, jit, enable_or_disable):
++    if jit == "cpp" and not config.omnistaging_enabled:
++      self.skipTest("cpp_jit requires omnistaging")
++
++    # The fact we defined a jitted function with a block with a different value
++    # of `config.enable_x64` has no impact on the output.
++    with enable_or_disable():
++      func = _maybe_jit(jit, lambda: jnp.arange(10.0))
++      func()
++
++    expected_dtype = "float64" if config.read("jax_enable_x64") else "float32"
++    self.assertEqual(func().dtype, expected_dtype)
++
++    with enable_x64():
++      self.assertEqual(func().dtype, "float64")
++    with disable_x64():
++      self.assertEqual(func().dtype, "float32")
++
+   @parameterized.named_parameters(jtu.cases_from_list(
+       {"testcase_name": "_jit={}".format(jit), "jit": jit}
+       for jit in ["python", "cpp", None]))
+@@ -113,9 +143,11 @@ def func_x64():
+       self.assertEqual(x32.result(), jnp.int32)
+ 
+   def test_jit_cache(self):
+-    # TODO(jakevdp): enable this test when CPP jit cache is fixed.
+-    if FLAGS.experimental_cpp_jit:
+-      self.skipTest("Known failure due to https://github.com/google/jax/issues/5532")
++    if jtu.device_under_test() == "tpu":
++      self.skipTest("64-bit random not available on TPU")
++    if jax.lib._xla_extension_version < 4 and FLAGS.experimental_cpp_jit:
++      self.skipTest(
++          "Known failure due to https://github.com/google/jax/issues/5532")
+ 
+     f = partial(random.uniform, random.PRNGKey(0), (1,), 'float64', -1, 1)
+     with disable_x64():

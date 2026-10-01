@@ -1,0 +1,134 @@
+From 33cd17c81ae46a8ebf3822d3da238b414aac0f94 Mon Sep 17 00:00:00 2001
+From: eellison <elias.ellison@gmail.com>
+Date: Mon, 1 Jun 2026 13:54:46 -0700
+Subject: [PATCH] [inductor][cpu] Preserve explicit lowp-fp round-trips under
+ emulate_precision_casts (#185847)
+
+On CPU, an explicit fp32->fp16->fp32 cast was collapsed to a no-op even with
+emulate_precision_casts=True, silently dropping the fp16 rounding (issue #185337).
+
+The CPU codegen populated the reverse lowp-fp->fp32 CSE cache at to_dtype() time
+(via cache_dtype_convert), so a later fp16->fp32 cast was rewritten back to the
+original fp32 value. That reverse conversion is only lossless in the #115260
+case, where the lowp value is round-tripped through a buffer store. Move the
+cache population from to_dtype() time to store() time (cache_lowp_fp_on_store),
+recording the source on the CSE var (lowp_fp_from) and only caching the inverse
+when the value is actually stored. Explicit in-register casts then keep their
+rounding, while the #115260 store/reload optimization is unchanged.
+
+This makes emulate_precision_casts produce eager-faithful results for explicit
+lowp casts on CPU (matching CUDA). Default-config behavior is unchanged.
+
+Related: #181583 addresses the same area more broadly (it also changes the
+default collapse behavior in pointless_convert); this PR is the minimal
+CPU-codegen fix scoped to the emulate_precision_casts path.
+
+Fixes #185337
+
+Test Plan:
+    python test/inductor/test_cpu_repro.py -k test_emulate_precision_casts_explicit_lowp_round_trip
+    python test/inductor/test_cpu_repro.py -k "to_dtype or memory_copy"
+
+Authored by Claude.
+
+Pull Request resolved: https://github.com/pytorch/pytorch/pull/185847
+Approved by: https://github.com/BoyuanFeng, https://github.com/drisspg
+---
+ test/inductor/test_cpu_repro.py | 14 ++++++++++++++
+ torch/_inductor/codegen/cpp.py  | 30 ++++++++++++++++++++++++++----
+ 2 files changed, 40 insertions(+), 4 deletions(-)
+
+diff --git a/test/inductor/test_cpu_repro.py b/test/inductor/test_cpu_repro.py
+index 558be8f7c1b5d..9656a8d7ce5d5 100644
+--- a/test/inductor/test_cpu_repro.py
++++ b/test/inductor/test_cpu_repro.py
+@@ -3482,6 +3482,20 @@ def fn(x):
+             )
+         check_metrics_vec_kernel_count(1)
+ 
++    def test_emulate_precision_casts_explicit_lowp_round_trip(self):
++        # An explicit fp32->fp16->fp32 round-trip must keep its intermediate
++        # rounding under emulate_precision_casts. The CPU codegen used to collapse
++        # it via the reverse lowp-fp->fp32 CSE cache (populated at to_dtype time),
++        # silently dropping the fp16 rounding. See issue #185337.
++        def fn(x):
++            y = x.to(torch.float16).to(torch.float32)
++            return y, y.sum(dim=1)
++
++        x = torch.arange(20, dtype=torch.float32).reshape(5, 4).t() / 7.0
++        with config.patch({"emulate_precision_casts": True}):
++            torch._dynamo.reset()
++            self.common(fn, (x,))
++
+     def test_memory_copy_with_fusion(self):
+         def fn(x):
+             res = x.relu()
+diff --git a/torch/_inductor/codegen/cpp.py b/torch/_inductor/codegen/cpp.py
+index 7fd6176c1d5ae..cc536cc49008d 100644
+--- a/torch/_inductor/codegen/cpp.py
++++ b/torch/_inductor/codegen/cpp.py
+@@ -627,7 +627,12 @@ def to_dtype(x, dtype, src_dtype=None, use_compute_types=True):
+         expr = V.kernel.get_to_dtype_expr(x, dtype, src_dtype)
+         csevar = V.kernel.cse.generate(V.kernel.compute, expr)
+         csevar.update_on_args("to_dtype", (x, dtype), {"src_dtype": src_dtype})
+-        if use_compute_types and dtype in DTYPE_LOWP_FP and src_dtype == torch.float:
++        if (
++            use_compute_types
++            and dtype in DTYPE_LOWP_FP
++            and src_dtype == torch.float
++            and not config.emulate_precision_casts
++        ):
+             """
+             https://github.com/pytorch/pytorch/issues/115260
+             For FusedSchedulerNode[node1, node2], the node2 loads what node1 stores and the buffer is
+@@ -658,6 +663,10 @@ def to_dtype(x, dtype, src_dtype=None, use_compute_types=True):
+                 store(buf, node1_output_lowp)
+                 node2_input_lowp = node_output_lowp # hit store cache
+                 node2_input = node1_output # hit cse cache
++
++            This cache trick skips the lowp->fp32 round-trip rounding, so it is
++            disabled under emulate_precision_casts, where that rounding must be
++            preserved (e.g. an explicit fp32->fp16->fp32 user cast). See #185337.
+             """
+             V.kernel.cache_dtype_convert(x, src_dtype, csevar, dtype)
+         return csevar
+@@ -671,7 +680,11 @@ def round_to_int(x, dtype, src_dtype=None, use_compute_types=True):
+         expr = V.kernel.get_to_dtype_expr(x, dtype, src_dtype, rounding=True)
+         csevar = V.kernel.cse.generate(V.kernel.compute, expr)
+         csevar.update_on_args("round_to_int", (x, dtype), {"src_dtype": src_dtype})
+-        if dtype in DTYPE_LOWP_FP and src_dtype == torch.float:
++        if (
++            dtype in DTYPE_LOWP_FP
++            and src_dtype == torch.float
++            and not config.emulate_precision_casts
++        ):
+             V.kernel.cache_dtype_convert(x, src_dtype, csevar, dtype)
+         return csevar
+ 
+@@ -1673,7 +1686,12 @@ def to_dtype(x, dtype, src_dtype=None, use_compute_types=True):
+         expr = V.kernel.get_to_dtype_expr(x, dtype, src_dtype)
+         csevar = V.kernel.cse.generate(V.kernel.compute, expr)
+         csevar.update_on_args("to_dtype", (x, dtype), {"src_dtype": src_dtype})
+-        if use_compute_types and dtype in DTYPE_LOWP_FP and src_dtype == torch.float:
++        if (
++            use_compute_types
++            and dtype in DTYPE_LOWP_FP
++            and src_dtype == torch.float
++            and not config.emulate_precision_casts
++        ):
+             V.kernel.cache_dtype_convert(x, src_dtype, csevar, dtype)
+         return csevar
+ 
+@@ -1689,7 +1707,11 @@ def round_to_int(x, dtype, src_dtype=None, use_compute_types=True):
+         expr = V.kernel.get_to_dtype_expr(x, dtype, src_dtype, rounding=True)
+         csevar = V.kernel.cse.generate(V.kernel.compute, expr)
+         csevar.update_on_args("round_to_int", (x, dtype), {"src_dtype": src_dtype})
+-        if dtype in DTYPE_LOWP_FP and src_dtype == torch.float:
++        if (
++            dtype in DTYPE_LOWP_FP
++            and src_dtype == torch.float
++            and not config.emulate_precision_casts
++        ):
+             V.kernel.cache_dtype_convert(x, src_dtype, csevar, dtype)
+         return csevar
+ 

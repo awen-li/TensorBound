@@ -1,0 +1,58 @@
+From b6588ff0cd82267ca83faeffb93c6c17323ddae3 Mon Sep 17 00:00:00 2001
+From: Mahesh Ravishankar <ravishankarm@google.com>
+Date: Tue, 27 Jun 2023 16:27:55 -0700
+Subject: [PATCH] Avoid linking with MUSL imported functions if
+ `--iree-llvmcpu-link-embedded` is `false`.
+
+Fixes #14208
+---
+ .../HAL/Target/LLVMCPU/LLVMCPUTarget.cpp      | 29 ++++++++++---------
+ 1 file changed, 16 insertions(+), 13 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/Dialect/HAL/Target/LLVMCPU/LLVMCPUTarget.cpp b/compiler/src/iree/compiler/Dialect/HAL/Target/LLVMCPU/LLVMCPUTarget.cpp
+index 1eb504b343e3..ec8cd9f398e3 100644
+--- a/compiler/src/iree/compiler/Dialect/HAL/Target/LLVMCPU/LLVMCPUTarget.cpp
++++ b/compiler/src/iree/compiler/Dialect/HAL/Target/LLVMCPU/LLVMCPUTarget.cpp
+@@ -432,8 +432,9 @@ class LLVMCPUTargetBackend final : public TargetBackend {
+     }
+ 
+     // Link our libdevice after all codegen and user objects as they may
+-    // reference it. Some of the functions in here are only known used after we
+-    // perform LLVM ISel and need to be pulled in whether they are used or not.
++    // reference it. Some of the functions in here are only known used after
++    // we perform LLVM ISel and need to be pulled in whether they are used or
++    // not.
+     if (failed(linkBitcodeModule(
+             variantOp.getLoc(), moduleLinker, llvm::Linker::OverrideFromSrc,
+             *targetMachine, "libdevice",
+@@ -446,17 +447,19 @@ class LLVMCPUTargetBackend final : public TargetBackend {
+              << targetTriple.str() << "'";
+     }
+ 
+-    // Link musl last and pull in all of it - this is sad but LLVM will take IR
+-    // intrinsics and generate calls out to libc during code generation and we
+-    // have no control over that - if we don't provide the symbols here then
+-    // linking with ld will fail.
+-    if (failed(linkBitcodeModule(
+-            variantOp.getLoc(), moduleLinker, llvm::Linker::OverrideFromSrc,
+-            *targetMachine, "libmusl",
+-            loadMuslBitcode(targetMachine.get(), context)))) {
+-      return mlir::emitError(variantOp.getLoc())
+-             << "failed linking in builtin library for target triple '"
+-             << targetTriple.str() << "'";
++    if (options_.linkEmbedded) {
++      // Link musl last and pull in all of it - this is sad but LLVM will take
++      // IR intrinsics and generate calls out to libc during code generation and
++      // we have no control over that - if we don't provide the symbols here
++      // then linking with ld will fail.
++      if (failed(linkBitcodeModule(
++              variantOp.getLoc(), moduleLinker, llvm::Linker::OverrideFromSrc,
++              *targetMachine, "libmusl",
++              loadMuslBitcode(targetMachine.get(), context)))) {
++        return mlir::emitError(variantOp.getLoc())
++               << "failed linking in builtin library for target triple '"
++               << targetTriple.str() << "'";
++      }
+     }
+ 
+     // Tracks ukernel functions, in order to set their linkage to internal

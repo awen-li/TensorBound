@@ -1,0 +1,61 @@
+From 36d2179a855b3104e60b8ab3b417c9a985a3527f Mon Sep 17 00:00:00 2001
+From: Jake VanderPlas <jakevdp@google.com>
+Date: Fri, 10 Mar 2023 10:49:25 -0800
+Subject: [PATCH] Add xla garbage collection to gc.callback
+
+---
+ jax/_src/lib/__init__.py |  8 ++++++--
+ tests/api_test.py        | 13 +++++++++++++
+ 2 files changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/jax/_src/lib/__init__.py b/jax/_src/lib/__init__.py
+index 6c434d53c1cf..3144402c80bc 100644
+--- a/jax/_src/lib/__init__.py
++++ b/jax/_src/lib/__init__.py
+@@ -15,10 +15,9 @@
+ # This module is largely a wrapper around `jaxlib` that performs version
+ # checking on import.
+ 
+-import platform
++import gc
+ import re
+ import os
+-import warnings
+ from typing import Optional, Tuple
+ 
+ try:
+@@ -94,6 +93,11 @@ def _parse_version(v: str) -> Tuple[int, ...]:
+ jax_jit = xla_client._xla.jax_jit
+ pmap_lib = xla_client._xla.pmap_lib
+ 
++# XLA garbage collection: see https://github.com/google/jax/issues/14882
++def _xla_gc_callback(*args):
++  xla_client._xla.collect_garbage()
++gc.callbacks.append(_xla_gc_callback)
++
+ import jaxlib.gpu_solver as gpu_solver  # pytype: disable=import-error
+ import jaxlib.gpu_sparse as gpu_sparse  # pytype: disable=import-error
+ import jaxlib.gpu_prng as gpu_prng  # pytype: disable=import-error
+diff --git a/tests/api_test.py b/tests/api_test.py
+index 978c225471db..18e52550024d 100644
+--- a/tests/api_test.py
++++ b/tests/api_test.py
+@@ -9629,5 +9629,18 @@ def test_autodidax_smoketest(self):
+     autodidax_module = importlib.util.module_from_spec(spec)
+     spec.loader.exec_module(autodidax_module)
+ 
++class GarbageCollectionTest(jtu.JaxTestCase):
++  def test_xla_gc_callback(self):
++    # https://github.com/google/jax/issues/14882
++    x_np = np.arange(10, dtype='int32')
++    x_jax = jax.device_put(x_np)
++    x_np_weakref = weakref.ref(x_np)
++
++    del x_np
++    del x_jax
++    gc.collect()
++
++    assert x_np_weakref() is None
++
+ if __name__ == '__main__':
+   absltest.main(testLoader=jtu.JaxTestLoader())

@@ -1,0 +1,66 @@
+From 0f9fcefa1e62a80e51ad8f7b0f9f0d20c3411b2f Mon Sep 17 00:00:00 2001
+From: Alessandro Potenza <ap.alessandro.potenza@gmail.com>
+Date: Tue, 22 Sep 2026 00:21:54 +0000
+Subject: [PATCH] [inductor] Don't reinplace a scatter whose src is a view of
+ the mutated storage (#198010)
+
+Fixes #197829
+
+`x[1:] = x[:-1].clone()` is traced to slice, clone, copy, slice_scatter, copy_. `remove_noop_ops` drops the clone, which is fine while the graph is functional. The reinplacing pass then turns `_generalized_scatter(inp, src, ...)` into `view(inp).copy_(src)`, but by then `src` is a view of `inp`'s own storage, so the copy reads what it is overwriting: a race between blocks on a GPU, row 0 in every row on the CPU backend.
+
+`can_inplace` looks at later uses of the mutated storage, not at the node's other operands. `should_reinplace_scatter` now declines when `src` shares `inp`'s storage, and the functional decomposition, which clones `inp`, is used instead.
+
+Tested on 2.14.0+cu130 (RTX 4070) with the patched `reinplace.py`: the thirteen spellings listed in the issue go from 10 wrong to 0 on CUDA and from 9 wrong to 0 on CPU. `test/inductor/test_inplacing_pass.py` with the new test: 1 failed, 28 passed before; 29 passed after. The new test runs on CPU because the failure is deterministic there.
+
+Pull Request resolved: https://github.com/pytorch/pytorch/pull/198010
+Approved by: https://github.com/ezyang
+---
+ test/inductor/test_inplacing_pass.py   | 13 +++++++++++++
+ torch/_inductor/fx_passes/reinplace.py | 10 +++++++++-
+ 2 files changed, 22 insertions(+), 1 deletion(-)
+
+diff --git a/test/inductor/test_inplacing_pass.py b/test/inductor/test_inplacing_pass.py
+index 9a8a80c9fc092..f93f131d5ea71 100644
+--- a/test/inductor/test_inplacing_pass.py
++++ b/test/inductor/test_inplacing_pass.py
+@@ -137,6 +137,19 @@ def f(x, y):
+ 
+         self._test(f)
+ 
++    def test_dont_reinplace_scatter_from_overlapping_view(self):
++        # https://github.com/pytorch/pytorch/issues/197829
++        def f(x):
++            x[1:] = x[:-1].clone()
++            return x
++
++        # On CPU the overlapping copy is wrong at any size. On a GPU it only
++        # shows with many blocks, and not on every run.
++        x = torch.randn(64, 8)
++        x2 = x.clone()
++        self.assertEqual(f(x), torch.compile(f)(x2))
++        self.assertEqual(x, x2)
++
+     def test_view_index_put_should_reinplace_copy_to_base(self):
+         def f(input_pos, val, cache):
+             cache_view = aten.reshape.default(cache, [4, -1])
+diff --git a/torch/_inductor/fx_passes/reinplace.py b/torch/_inductor/fx_passes/reinplace.py
+index 1e7205fe61de5..f75de05e88021 100644
+--- a/torch/_inductor/fx_passes/reinplace.py
++++ b/torch/_inductor/fx_passes/reinplace.py
+@@ -227,7 +227,15 @@ def should_reinplace_scatter(node: torch.fx.Node) -> bool:
+     input and output would have been realized anyway.
+ 
+     """
+-    inp, _src, _view_ops = node.args
++    inp, src, _view_ops = node.args
++
++    # The mutating decomposition is view(inp).copy_(src). If src is itself a
++    # view of inp's storage (x[1:] = x[:-1].clone(), once the clone has been
++    # removed as a no-op), that copy reads what it is overwriting.
++    if isinstance(inp, torch.fx.Node) and isinstance(src, torch.fx.Node):
++        inp_storage = get_node_storage(inp)
++        if inp_storage is not None and inp_storage == get_node_storage(src):
++            return False
+ 
+     # Mutating scatter ops unconditionally realize input and output
+     if scatter_always_uses_mutation(node):

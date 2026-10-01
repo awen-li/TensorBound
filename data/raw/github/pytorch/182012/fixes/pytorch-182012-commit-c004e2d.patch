@@ -1,0 +1,147 @@
+From c004e2dc8082e016df1893e3f42a831ea3f12c75 Mon Sep 17 00:00:00 2001
+From: irshadcc <irshadcc135@gmail.com>
+Date: Wed, 24 Jun 2026 08:29:29 +0000
+Subject: [PATCH] Fix torch.compile produce wrong output due to problem in
+ decomposition (#182292)
+
+Fixes #182012
+
+```python
+import torch
+def fn(x, src):
+    return torch.diagonal_scatter(x, src, 0).sum()
+
+x2 = x.clone().detach().requires_grad_(True)
+s2 = src.clone().detach().requires_grad_(True)
+torch.compile(fn)(x2, s2).backward()
+print(f"compiled x2.grad = \n{x2.grad}")
+```
+
+Actual IR
+```text
+op1: SchedulerNode(ComputedBuffer)
+op1.writes = [MemoryDep('buf1', 0, {})]
+op1.unmet_dependencies = [StarDep(name='buf0', mode=None)]
+op1.met_dependencies = []
+op1.outputs = [
+    buf1: ComputedBuffer
+    buf1.layout = MutationLayoutSHOULDREMOVE('cuda:0', torch.float32, size=[8], stride=[0, 0])
+    buf1.mutations = ['buf0']
+    buf1.users = [NodeUser(node=OUTPUT, can_inplace=False, is_weak=False)]
+]
+op1.group.device = cuda:0
+op1.group.iteration = (8, 1)
+op1.sizes = ([8], [])
+buf0_layout = FixedLayout('cuda:0', torch.float32, size=[1, 1], stride=[0, 0])
+buf1_layout = MutationLayoutSHOULDREMOVE('cuda:0', torch.float32, size=[8], stride=[0, 0])
+class op1_loop_body:
+    var_ranges = {p0: 8}
+    index0 = 0
+    def body(self, ops):
+        constant = ops.constant(0.0, torch.float32)
+        get_index = self.get_index('index0')
+        store = ops.store('buf1', get_index, constant, None)
+        return store
+```
+
+Expected IR
+```text
+op1: SchedulerNode(ComputedBuffer)
+op1.writes = [MemoryDep('buf1', 9*d0, {d0: 8})]
+op1.unmet_dependencies = [StarDep(name='buf0', mode=None)]
+op1.met_dependencies = []
+op1.min_input_distance = 1
+op1.max_input_distance = 1
+op1.outputs = [
+    buf1: ComputedBuffer
+    buf1.layout = MutationLayoutSHOULDREMOVE('cuda:0', torch.float32, size=[8], stride=[8, 1])
+    buf1.mutations = ['buf0']
+    buf1.users = [NodeUser(node=OUTPUT, can_inplace=False, is_weak=False)]
+]
+op1.group.device = cuda:0
+op1.group.iteration = (8, 1)
+op1.sizes = ([8], [])
+buf0_layout = FixedLayout('cuda:0', torch.float32, size=[8, 8], stride=[8, 1])
+buf1_layout = MutationLayoutSHOULDREMOVE('cuda:0', torch.float32, size=[8], stride=[8, 1])
+class op1_loop_body:
+    var_ranges = {p0: 8}
+    index0 = 9*p0
+    def body(self, ops):
+        constant = ops.constant(0.0, torch.float32)
+        get_index = self.get_index('index0')
+        store = ops.store('buf1', get_index, constant, None)
+        return store
+```
+
+Pull Request resolved: https://github.com/pytorch/pytorch/pull/182292
+Approved by: https://github.com/jansel
+---
+ ...ts.test_diagonal_scatter_overlap_input_cpu |  0
+ test/inductor/test_torchinductor.py           | 24 +++++++++++++++++++
+ torch/_refs/__init__.py                       | 14 ++++++++++-
+ 3 files changed, 37 insertions(+), 1 deletion(-)
+ create mode 100644 test/inductor/pallas_expected_failures/CpuTests.test_diagonal_scatter_overlap_input_cpu
+
+diff --git a/test/inductor/pallas_expected_failures/CpuTests.test_diagonal_scatter_overlap_input_cpu b/test/inductor/pallas_expected_failures/CpuTests.test_diagonal_scatter_overlap_input_cpu
+new file mode 100644
+index 0000000000000..e69de29bb2d1d
+diff --git a/test/inductor/test_torchinductor.py b/test/inductor/test_torchinductor.py
+index 1268fccb640bd..4089877135620 100644
+--- a/test/inductor/test_torchinductor.py
++++ b/test/inductor/test_torchinductor.py
+@@ -11024,6 +11024,30 @@ def fn(x, a, offset, dim1, dim2):
+                 self.assertEqual(x.grad, x_ref.grad)
+                 self.assertEqual(y.grad, y_ref.grad)
+ 
++    def test_diagonal_scatter_overlap_input(self):
++        # The decomposition for diagonal_scatter (and the other *_scatter ops)
++        # uses clone_preserve_strides, which must materialize a contiguous
++        # buffer when the input has internal memory overlap (e.g. an expand
++        # of a scalar with stride 0). Otherwise the diagonal write aliases
++        # the entire output and corrupts non-diagonal positions. This pattern
++        # arises naturally in the backward of diagonal_scatter(x, src).sum().
++        def fn(x, src):
++            return torch.diagonal_scatter(x, src, 0).sum()
++
++        x = torch.randn(8, 8, device=self.device, requires_grad=True)
++        src = torch.randn(8, device=self.device, requires_grad=True)
++
++        x_eager = x.clone().detach().requires_grad_(True)
++        src_eager = src.clone().detach().requires_grad_(True)
++        fn(x_eager, src_eager).backward()
++
++        x_compiled = x.clone().detach().requires_grad_(True)
++        src_compiled = src.clone().detach().requires_grad_(True)
++        torch.compile(fn)(x_compiled, src_compiled).backward()
++
++        self.assertEqual(x_eager.grad, x_compiled.grad)
++        self.assertEqual(src_eager.grad, src_compiled.grad)
++
+     @skip_if_gpu_halide  # accuracy issue
+     def test_slice_scatter(self):
+         def fn(x, a):
+diff --git a/torch/_refs/__init__.py b/torch/_refs/__init__.py
+index 6d72dd9119d2f..f20ab38bb63a9 100644
+--- a/torch/_refs/__init__.py
++++ b/torch/_refs/__init__.py
+@@ -4732,7 +4732,19 @@ def diagonal_scatter(
+ ) -> TensorLikeType:
+     from torch.fx.experimental.symbolic_shapes import guard_or_false, sym_or
+ 
+-    out = utils.clone_preserve_strides(input)
++    # Mirror at::native::clone_preserve_strides: when the input has internal
++    # memory overlap (e.g. an expand from a scalar with stride 0), we cannot
++    # preserve its strides because copy_to() below would write through aliased
++    # storage and corrupt non-diagonal positions. This arises in the backward
++    # of diagonal_scatter(x, src).sum(), where grad_output is expanded. Fall
++    # back to a plain clone, which materializes a contiguous buffer.
++    if builtins.any(
++        guard_or_false(sz > 1) and guard_or_false(s == 0)
++        for sz, s in zip(input.size(), input.stride())
++    ):
++        out = input.clone()
++    else:
++        out = utils.clone_preserve_strides(input)
+     diag = out.diagonal(offset, dim1, dim2)
+     # Use sym_or + guard_or_false to handle unbacked symbolic dimensions.
+     torch._check(

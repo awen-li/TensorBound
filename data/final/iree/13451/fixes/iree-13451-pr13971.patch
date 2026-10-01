@@ -1,0 +1,2390 @@
+From 299f9c3180afb1996c5f6a7ba1f972233e77886e Mon Sep 17 00:00:00 2001
+From: Nicolas Vasilache <nicolas.vasilache@gmail.com>
+Date: Thu, 1 Jun 2023 06:54:40 -0700
+Subject: [PATCH 01/11] Harden the tensorcore matmul strategy and add debug
+ messages
+
+---
+ .../TransformStrategies/Common/Common.cpp     | 22 +++++-----
+ .../TransformStrategies/Common/Common.h       |  5 ++-
+ .../TransformStrategies/GPU/Common.cpp        |  2 +-
+ .../GPU/MatmulTensorCoreStrategy.cpp          | 35 +++++++++++++--
+ .../GPU/MatmulTensorCoreStrategy.h            | 35 ++++++++-------
+ .../iree/compiler/Codegen/Utils/GPUUtils.cpp  | 43 ++++++++++++++++++-
+ 6 files changed, 107 insertions(+), 35 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/Codegen/TransformStrategies/Common/Common.cpp b/compiler/src/iree/compiler/Codegen/TransformStrategies/Common/Common.cpp
+index 28516d7d611b..0b545b74f4ee 100644
+--- a/compiler/src/iree/compiler/Codegen/TransformStrategies/Common/Common.cpp
++++ b/compiler/src/iree/compiler/Codegen/TransformStrategies/Common/Common.cpp
+@@ -24,6 +24,7 @@ using namespace mlir;
+ 
+ #define DEBUG_TYPE "iree-transform-builder"
+ #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
++#define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
+ 
+ // TODO: significantly better namespacing.
+ using iree_compiler::IREE::transform_dialect::ApplyBufferOptimizationsOp;
+@@ -107,9 +108,8 @@ void mlir::iree_compiler::createTransformRegion(
+         b.create<transform::YieldOp>(loc);
+       });
+   (void)sequence;
+-  LLVM_DEBUG(DBGS() << "transformation script:\n");
+-  LLVM_DEBUG(DBGS() << "verification: " << sequence.verify().succeeded()
+-                    << "\n");
++  LDBG("transformation script:\n");
++  LDBG("verification: " << sequence.verify().succeeded() << "\n");
+   LLVM_DEBUG(sequence.print(DBGS()));
+ }
+ 
+@@ -296,13 +296,15 @@ Value mlir::iree_compiler::buildLowerMaskedTransfersAndCleanup(
+       containingOpH, [](OpBuilder &b, Location loc) {
+         b.create<transform::ApplyLowerMaskedTransfersPatternsOp>(loc);
+       });
+-  b.create<transform::ApplyPatternsOp>(
+-      containingOpH, [](OpBuilder &b, Location loc) {
+-        b.create<transform::ApplyCastAwayVectorLeadingOneDimPatternsOp>(loc);
+-        b.create<transform::ApplyFoldUnitExtentDimsViaSlicesPatternsOp>(loc);
+-        b.create<IREE::transform_dialect::
+-                     ApplyFoldReshapeIntoTensorHalInterfacePatternsOp>(loc);
+-      });
++  if (cleanup) {
++    b.create<transform::ApplyPatternsOp>(
++        containingOpH, [](OpBuilder &b, Location loc) {
++          b.create<transform::ApplyCastAwayVectorLeadingOneDimPatternsOp>(loc);
++          b.create<transform::ApplyFoldUnitExtentDimsViaSlicesPatternsOp>(loc);
++          b.create<IREE::transform_dialect::
++                       ApplyFoldReshapeIntoTensorHalInterfacePatternsOp>(loc);
++        });
++  }
+   return containingOpH;
+ }
+ 
+diff --git a/compiler/src/iree/compiler/Codegen/TransformStrategies/Common/Common.h b/compiler/src/iree/compiler/Codegen/TransformStrategies/Common/Common.h
+index 67d855c4cafb..9643a48d11dc 100644
+--- a/compiler/src/iree/compiler/Codegen/TransformStrategies/Common/Common.h
++++ b/compiler/src/iree/compiler/Codegen/TransformStrategies/Common/Common.h
+@@ -202,14 +202,15 @@ Value buildVectorize(ImplicitLocOpBuilder &b, Value funcH,
+ /// Takes a handle to a containing op and returns an updated handle to the
+ /// containing op.
+ Value buildLowerMaskedTransfersAndCleanup(ImplicitLocOpBuilder &b,
+-                                          Value containingOpH);
++                                          Value containingOpH,
++                                          bool cleanup = true);
+ 
+ /// Build transform IR that applies vector mask lowering and subsequent cleanup
+ /// patterns (fold-memref-aliases).
+ /// Takes a handle to a containing op and returns an updated handle to the
+ /// containing op.
+ Value buildLowerVectorMasksAndCleanup(ImplicitLocOpBuilder &b,
+-                                      Value containingOpH);
++                                      Value containingOpH, bool cleanup = true);
+ 
+ /// Build transform IR to hoist redundant subset operations.
+ void buildHoisting(ImplicitLocOpBuilder &b, Value funcH);
+diff --git a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/Common.cpp b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/Common.cpp
+index a375f7908659..56129029fa20 100644
+--- a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/Common.cpp
++++ b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/Common.cpp
+@@ -507,7 +507,7 @@ void mlir::iree_compiler::gpu::buildMatmulVectorization(
+   // TODO: don't rematch, apply on the variant op directly.
+   Value funcH =
+       b.create<transform::MatchOp>(variantH, func::FuncOp::getOperationName());
+-  funcH = buildLowerMaskedTransfersAndCleanup(b, funcH);
++  funcH = buildLowerMaskedTransfersAndCleanup(b, funcH, /*cleanup=*/false);
+ 
+   // Apply vectorization + cleanups to what remains.
+   funcH = iree_compiler::buildVectorize(b, funcH, /*applyCleanups=*/true);
+diff --git a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.cpp b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.cpp
+index 6e7a9620a7c8..e555c5f00737 100644
+--- a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.cpp
++++ b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.cpp
+@@ -12,6 +12,10 @@
+ #include "iree/compiler/Codegen/TransformStrategies/Common/Common.h"
+ #include "iree/compiler/Codegen/TransformStrategies/GPU/Common.h"
+ #include "iree/compiler/Codegen/TransformStrategies/GPU/Strategies.h"
++#include "iree/compiler/Codegen/TransformDialectStrategies/Common/Common.h"
++#include "iree/compiler/Codegen/TransformDialectStrategies/GPU/Common.h"
++#include "iree/compiler/Codegen/TransformDialectStrategies/GPU/Strategies.h"
++#include "llvm/ADT/STLExtras.h"
+ #include "llvm/Support/CommandLine.h"
+ #include "llvm/Support/Debug.h"
+ #include "llvm/Support/raw_ostream.h"
+@@ -28,6 +32,7 @@ using namespace mlir;
+ 
+ #define DEBUG_TYPE "iree-transform-builder"
+ #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
++#define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
+ 
+ // TODO: significantly better namespacing.
+ using iree_compiler::buildPad;
+@@ -129,7 +134,7 @@ void MatmulStrategy::initDefaultValues() {
+   blockTileSizes = {clBlockTileSizeX, clBlockTileSizeY, clBlockTileSizeZ};
+   reductionTileSize = clReductionTileSize;
+   numThreads = {clNumThreadsX, clNumThreadsY, clNumThreadsZ};
+-  numWarps = {clNumWarpsX, clNumThreadsY, clNumThreadsZ};
++  numWarps = {clNumWarpsX, clNumWarpsY, clNumWarpsZ};
+   useAsyncCopies = clUseAsyncCopies;
+   useMmaSync = clUseMmaSync;
+   pipelineDepth = clPipelineDepth;
+@@ -143,6 +148,16 @@ void MatmulStrategy::initDefaultValues() {
+ 
+ LLVM_DUMP_METHOD void MatmulStrategy::dump() const { print(llvm::errs()); }
+ 
++static llvm::raw_ostream &printMappingInfo(
++    llvm::raw_ostream &os, const MatmulStrategy::MappingInfo &mapping) {
++  os << "MappingInfo{";
++  llvm::interleaveComma(mapping.numThreads, os << "numThreads: {");
++  llvm::interleaveComma(mapping.tileSizes, os << "}, tileSizes: {");
++  llvm::interleaveComma(mapping.threadMapping, os << "}, threadMapping: {");
++  os << "}}";
++  return os;
++}
++
+ void MatmulStrategy::print(llvm::raw_ostream &os) const {
+   os << "\n--- Matmul strategy ---\n";
+   os << "- block tile sizes: {";
+@@ -172,10 +187,20 @@ void MatmulStrategy::print(llvm::raw_ostream &os) const {
+     isFirst = false;
+   }
+   os << "}\n";
+-
+   os << "- use async copies: " << useAsyncCopies << '\n';
+   os << "- use mma sync: " << useMmaSync << '\n';
+   os << "- pipeline depth: " << pipelineDepth << '\n';
++
++  os << "\n-- Derived quantities --\n";
++  os << "- lhs copy:\n";
++  os << "    -> vector size (num elements): " << lhsCopyVectorSize() << '\n';
++  printMappingInfo(os << "    -> ", lhsCopyMapping()) << '\n';
++  os << "- rhs copy:\n";
++  os << "    -> vector size (num elements): " << rhsCopyVectorSize() << '\n';
++  printMappingInfo(os << "    -> ", rhsCopyMapping()) << '\n';
++  os << "- res copy:\n";
++  os << "    -> vector size (num elements): " << resCopyVectorSize() << '\n';
++  printMappingInfo(os << "    -> ", resCopyMapping()) << '\n';
+ }
+ 
+ static std::tuple<Value, Value, Value, Value>
+@@ -213,6 +238,7 @@ buildMatmulStrategyBlockDistribution(ImplicitLocOpBuilder &b, Value variantH,
+ 
+ void iree_compiler::gpu::buildMatmulTensorCoreStrategy(
+     ImplicitLocOpBuilder &b, Value variantH, const MatmulStrategy &strategy) {
++  LLVM_DEBUG(strategy.print(DBGS()));
+   assert(strategy.totalNumThreads() ==
+              strategy.totalNumWarps() * kCudaWarpSize &&
+          "Number of threads specified by warps must match total number of "
+@@ -283,14 +309,15 @@ void iree_compiler::gpu::buildMatmulTensorCoreStrategy(
+ 
+   if (strategy.useAsyncCopies) {
+     // Step 10. Multi-buffering.
+-    buildMultiBuffering(b, funcH, strategy);
++    if (strategy.pipelineDepth > 1) buildMultiBuffering(b, funcH, strategy);
+ 
+     // Step 11. Convert to async copies.
+     // TODO: avoid consuming handles and returning here.
+     funcH = buildConvertToAsyncCopies(b, funcH, strategy);
+ 
+     // Step 12. Pipeline shared memory copies.
+-    buildPipelineSharedMemoryCopies(b, funcH, strategy);
++    if (strategy.pipelineDepth > 1)
++      buildPipelineSharedMemoryCopies(b, funcH, strategy);
+   }
+ 
+   // Step 13. Late lowerings and cleanups.
+diff --git a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.h b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.h
+index f51548c197d6..1b47237e2baa 100644
+--- a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.h
++++ b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.h
+@@ -80,14 +80,15 @@ class MatmulStrategy : public AbstractGemmLikeStrategy {
+     assert(totalNumThreads() % numThreadsK == 0 &&
+            "num threads must be divisible by num threads along k");
+     int64_t numThreadsM = totalNumThreads() / numThreadsK;
+-    assert(blockTileM() % numThreadsM == 0 &&
+-           "blockTileSizes[0] must be divisible by numThreadsM");
+-    assert(reductionTileSize % numThreadsK == 0 &&
+-           "reductionTileSize must be divisible by numThreadsK");
++//     assert(blockTileM() % numThreadsM == 0 &&
++//            "blockTileSizes[0] must be divisible by numThreadsM");
++//     assert(reductionTileSize % numThreadsK == 0 &&
++//            "reductionTileSize must be divisible by numThreadsK");
+     return MappingInfo{
+         /*numThreads=*/{numThreadsM, numThreadsK},
+         /*tileSizes=*/
+-        {blockTileM() / numThreadsM, reductionTileSize / numThreadsK},
++        {std::max(1l, blockTileM() / numThreadsM), 
++        std::max(1l, reductionTileSize / numThreadsK)},
+         /*threadMapping=*/{linearIdX(ctx), linearIdY(ctx)}};
+   }
+   // RHS copy is of size kxn.
+@@ -98,14 +99,15 @@ class MatmulStrategy : public AbstractGemmLikeStrategy {
+     assert(totalNumThreads() % numThreadsN == 0 &&
+            "num threads must be divisible by num threads along n");
+     int64_t numThreadsK = totalNumThreads() / numThreadsN;
+-    assert(reductionTileSize % numThreadsK == 0 &&
+-           "blockTileSizes[0] must be divisible by numThreadsK");
+-    assert(blockTileN() % numThreadsN == 0 &&
+-           "reductionTileSize must be divisible by numThreadsN");
++//     assert(reductionTileSize % numThreadsK == 0 &&
++//            "blockTileSizes[0] must be divisible by numThreadsK");
++//     assert(blockTileN() % numThreadsN == 0 &&
++//            "reductionTileSize must be divisible by numThreadsN");
+     return MappingInfo{
+         /*numThreads=*/{numThreadsK, numThreadsN},
+         /*tileSizes=*/
+-        {reductionTileSize / numThreadsK, blockTileN() / numThreadsN},
++        {std::max(1l, reductionTileSize / numThreadsK), 
++        std::max(1l, blockTileN() / numThreadsN)},
+         /*threadMapping=*/{linearIdY(ctx), linearIdX(ctx)}};
+   }
+   // RES copy is of size mxn.
+@@ -116,20 +118,21 @@ class MatmulStrategy : public AbstractGemmLikeStrategy {
+     assert(totalNumThreads() % numThreadsN == 0 &&
+            "num threads must be divisible by num threads along n");
+     int64_t numThreadsM = totalNumThreads() / numThreadsN;
+-    assert(blockTileM() % numThreadsM == 0 &&
+-           "blockTileSizes[0] must be divisible by numThreadsM");
+-    assert(blockTileN() % numThreadsN == 0 &&
+-           "blockTileSizes[1] must be divisible by numThreadsN");
++//     assert(blockTileM() % numThreadsM == 0 &&
++//            "blockTileSizes[0] must be divisible by numThreadsM");
++//     assert(blockTileN() % numThreadsN == 0 &&
++//            "blockTileSizes[1] must be divisible by numThreadsN");
+     return MappingInfo{/*numThreads=*/{numThreadsM, numThreadsN},
+                        /*tileSizes=*/
+-                       {blockTileM() / numThreadsM, blockTileN() / numThreadsN},
++                       {std::max(1l, blockTileM() / numThreadsM), 
++                        std::max(1l, blockTileN() / numThreadsN)},
+                        /*threadMapping=*/{linearIdY(ctx), linearIdX(ctx)}};
+   }
+   // COMPUTE is of size mxn.
+   MappingInfo computeMapping() const override {
+     return MappingInfo{/*numThreads=*/{numWarps[0], numWarps[1]},
+                        /*tileSizes=*/{},
+-                       /*threadMapping=*/{warpY(ctx), warpX(ctx)}};
++                       /*threadMapping=*/{warpX(ctx), warpY(ctx)}};
+   }
+ 
+   void print(llvm::raw_ostream &os) const;
+diff --git a/compiler/src/iree/compiler/Codegen/Utils/GPUUtils.cpp b/compiler/src/iree/compiler/Codegen/Utils/GPUUtils.cpp
+index 27e4b44d224d..0fb54705fd36 100644
+--- a/compiler/src/iree/compiler/Codegen/Utils/GPUUtils.cpp
++++ b/compiler/src/iree/compiler/Codegen/Utils/GPUUtils.cpp
+@@ -7,6 +7,7 @@
+ #include "iree/compiler/Codegen/Utils/GPUUtils.h"
+ 
+ #include "iree/compiler/Codegen/Utils/MarkerUtils.h"
++#include "llvm/ADT/STLExtras.h"
+ #include "llvm/Support/Debug.h"
+ #include "mlir/Dialect/Affine/IR/AffineOps.h"
+ #include "mlir/Dialect/Arith/IR/Arith.h"
+@@ -18,6 +19,7 @@
+ #define DEBUG_TYPE "iree-codegen-gpu-utils"
+ #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
+ #define DBGSNL() (llvm::dbgs() << "\n")
++#define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
+ 
+ static constexpr unsigned kShuffleBitWidth = 32;
+ 
+@@ -673,13 +675,19 @@ std::optional<SmallVector<int64_t>> getMmaNativeVectorSize(Operation *op) {
+       mmaShapeK = 16;
+     else if (sourceType.isF32())
+       mmaShapeK = 8;
+-    else
++    else {
++      LDBG("unsupported shape for vector.contract: ");
+       return std::nullopt;
++    }
+ 
+     // Initialize/set the starting dims of the ranked shape, such as batch,
+     // to 1.
+     SmallVector<int64_t> mmaShape(contract.getIteratorTypes().size() - 3, 1);
+     mmaShape.append({mmaShapeM, mmaShapeN, mmaShapeK});
++    LLVM_DEBUG({
++      llvm::interleaveComma(mmaShape, DBGS() << "shape for vector.contract: ");
++      llvm::dbgs() << "\n";
++    });
+     return mmaShape;
+   }
+ 
+@@ -687,6 +695,11 @@ std::optional<SmallVector<int64_t>> getMmaNativeVectorSize(Operation *op) {
+   if (auto writeOp = dyn_cast<vector::TransferWriteOp>(op)) {
+     SmallVector<int64_t> outputShape(writeOp.getVectorType().getRank() - 2, 1);
+     outputShape.append({mmaShapeM, mmaShapeN});
++    LLVM_DEBUG({
++      llvm::interleaveComma(outputShape,
++                            DBGS() << "shape for vector.xfer_write: ");
++      llvm::dbgs() << "\n";
++    });
+     return outputShape;
+   }
+ 
+@@ -700,7 +713,7 @@ std::optional<SmallVector<int64_t>> getMmaNativeVectorSize(Operation *op) {
+         getVectorContractOpOperandIdForVectorReadOp(op);
+     if (!operandId) {
+       LLVM_DEBUG({
+-        DBGS() << "Failed to get operandId for vector::TransferReadOp: " << *op
++        DBGS() << "Failed to get operandId for vector::xfer_read: " << *op
+                << "\n";
+       });
+       return std::nullopt;
+@@ -712,6 +725,11 @@ std::optional<SmallVector<int64_t>> getMmaNativeVectorSize(Operation *op) {
+       if (*operandId == 2) {
+         SmallVector<int64_t> readShape;
+         readShape.append({mmaShapeM, mmaShapeN});
++        LLVM_DEBUG({
++          llvm::interleaveComma(readShape,
++                                DBGS() << "shape for vector.xfer_read: ");
++          llvm::dbgs() << "\n";
++        });
+         return readShape;
+       }
+ 
+@@ -732,6 +750,11 @@ std::optional<SmallVector<int64_t>> getMmaNativeVectorSize(Operation *op) {
+ 
+         SmallVector<int64_t> readShape;
+         readShape.append({16, 16});
++        LLVM_DEBUG({
++          llvm::interleaveComma(readShape,
++                                DBGS() << "shape for vector.xfer_read: ");
++          llvm::dbgs() << "\n";
++        });
+         return readShape;
+       }
+     }
+@@ -745,12 +768,22 @@ std::optional<SmallVector<int64_t>> getMmaNativeVectorSize(Operation *op) {
+       if (*operandId == 2) {
+         SmallVector<int64_t> readShape;
+         readShape.append({mmaShapeM, mmaShapeN});
++        LLVM_DEBUG({
++          llvm::interleaveComma(readShape,
++                                DBGS() << "shape for vector.xfer_read: ");
++          llvm::dbgs() << "\n";
++        });
+         return readShape;
+       }
+       // For matrixA.
+       if (*operandId == 0) {
+         SmallVector<int64_t> readShape;
+         readShape.append({mmaShapeM, mmaShapeK});
++        LLVM_DEBUG({
++          llvm::interleaveComma(readShape,
++                                DBGS() << "shape for vector.xfer_read: ");
++          llvm::dbgs() << "\n";
++        });
+         return readShape;
+       }
+       // For matrixB.
+@@ -767,10 +800,16 @@ std::optional<SmallVector<int64_t>> getMmaNativeVectorSize(Operation *op) {
+           if (sliceType && sliceType != vecType) return std::nullopt;
+           sliceType = vecType;
+         }
++        LLVM_DEBUG({
++          llvm::interleaveComma(sliceType.getShape(),
++                                DBGS() << "shape for vector.xfer_read: ");
++          llvm::dbgs() << "\n";
++        });
+         return llvm::to_vector(sliceType.getShape());
+       }
+     }
+   }
++  LDBG("unsupported shape for " << op->getName().getStringRef());
+   return std::nullopt;
+ }
+ 
+
+From 8b3890e5c84c2968ad665d83ffc275219c993775 Mon Sep 17 00:00:00 2001
+From: Nicolas Vasilache <nicolasvasilache@users.noreply.github.com>
+Date: Fri, 2 Jun 2023 12:17:23 +0000
+Subject: [PATCH 02/11] Plug in barrier removal in matmul TD strategy and
+ activate mma_sync pipeline
+
+---
+ .../TransformExtensions/LLVMGPUExtensions.cpp | 34 ++++++++++++++++---
+ .../LLVMGPUExtensionsOps.td                   |  3 +-
+ .../TransformStrategies/GPU/Common.cpp        |  1 +
+ .../GPU/MatmulTensorCoreStrategy.cpp          |  3 ++
+ 4 files changed, 36 insertions(+), 5 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/Codegen/LLVMGPU/TransformExtensions/LLVMGPUExtensions.cpp b/compiler/src/iree/compiler/Codegen/LLVMGPU/TransformExtensions/LLVMGPUExtensions.cpp
+index 8d72ea254634..0e307db24114 100644
+--- a/compiler/src/iree/compiler/Codegen/LLVMGPU/TransformExtensions/LLVMGPUExtensions.cpp
++++ b/compiler/src/iree/compiler/Codegen/LLVMGPU/TransformExtensions/LLVMGPUExtensions.cpp
+@@ -764,9 +764,11 @@ transform_dialect::PipelineSharedMemoryCopiesOp::applyToOne(
+     transform::TransformState &state) {
+   IRRewriter rewriter(getContext());
+   int64_t depth(getDepth());
++  auto schedule = getUseMmaSync()
++                      ? PipeliningSchedulingStrategy::nvidiaTensorCore
++                      : PipeliningSchedulingStrategy::loadGlobalStage0;
+   FailureOr<scf::ForOp> pipelinedFor = iree_compiler::pipelineSharedMemoryCopy(
+-      rewriter, forOp, PipeliningSchedulingStrategy::loadGlobalStage0, false,
+-      depth);
++      rewriter, forOp, schedule, false, depth);
+   if (failed(pipelinedFor)) return emitDefaultSilenceableFailure(forOp);
+   results.push_back(pipelinedFor.value());
+   return DiagnosedSilenceableFailure::success();
+@@ -1210,6 +1212,11 @@ static bool mayAlias(Value first, Value second) {
+       return globFirst.getNameAttr() == globSecond.getNameAttr();
+     }
+   }
++  if (auto subSpanFirst = first.getDefiningOp<HAL::InterfaceBindingSubspanOp>()) {
++    if (auto subSpanSecond = second.getDefiningOp<HAL::InterfaceBindingSubspanOp>()) {
++      return subSpanFirst.getBindingAttr() == subSpanSecond.getBindingAttr();
++    }
++  }
+ 
+   bool isDistinct[] = {producesDistinctBase(first.getDefiningOp()),
+                        producesDistinctBase(second.getDefiningOp())};
+@@ -1292,11 +1299,30 @@ static bool haveConflictingEffects(
+           isa<MemoryEffects::Allocate>(after.getEffect())) {
+         continue;
+       }
++      
++      // In the particular case that the before effect is a free, we only have 2
++      // possibilities:
++      //   1. either the program is well-formed and there must be an interleaved
++      //      alloc that must limit the scope of effect lookback and we can
++      //      safely ignore the free -> read / free -> write and free -> free
++      //      conflicts.
++      //   2. either the program is ill-formed and we are in undefined behavior
++      //      territory.
++      if (isa<MemoryEffects::Free>(before.getEffect()))
++        continue;
+ 
+       // Other kinds of effects create a conflict, e.g. read-after-write.
+-      LLVM_DEBUG(DBGS() << "found a conflict between: " << before.getValue()
++      LLVM_DEBUG(DBGS() << "found a conflict between (before): " << before.getValue()
++                        << " read:" << isa<MemoryEffects::Read>(before.getEffect())
++                        << " write:" << isa<MemoryEffects::Write>(before.getEffect())
++                        << " alloc:" << isa<MemoryEffects::Allocate>(before.getEffect())
++                        << " free:" << isa<MemoryEffects::Free>(before.getEffect())
+                         << "\n");
+-      LLVM_DEBUG(DBGS() << "and:                      " << after.getValue()
++      LLVM_DEBUG(DBGS() << "and (after):                " << after.getValue()
++                        << " read:" << isa<MemoryEffects::Read>(after.getEffect())
++                        << " write:" << isa<MemoryEffects::Write>(after.getEffect())
++                        << " alloc:" << isa<MemoryEffects::Allocate>(after.getEffect())
++                        << " free:" << isa<MemoryEffects::Free>(after.getEffect())
+                         << "\n");
+       return true;
+     }
+diff --git a/compiler/src/iree/compiler/Codegen/LLVMGPU/TransformExtensions/LLVMGPUExtensionsOps.td b/compiler/src/iree/compiler/Codegen/LLVMGPU/TransformExtensions/LLVMGPUExtensionsOps.td
+index 99d7dd2b5a85..7a0865a18d93 100644
+--- a/compiler/src/iree/compiler/Codegen/LLVMGPU/TransformExtensions/LLVMGPUExtensionsOps.td
++++ b/compiler/src/iree/compiler/Codegen/LLVMGPU/TransformExtensions/LLVMGPUExtensionsOps.td
+@@ -420,7 +420,8 @@ def PipelineSharedMemoryCopiesOp : Op<
+   let arguments = (
+       ins TransformHandleTypeInterface:$for_op,
+           I64Attr:$depth,
+-          UnitAttr:$peel_epilogue);
++          UnitAttr:$peel_epilogue,
++          UnitAttr:$use_mma_sync);
+   let results = (outs TransformHandleTypeInterface:$result);
+ 
+   let cppNamespace = "mlir::iree_compiler::IREE::transform_dialect";
+diff --git a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/Common.cpp b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/Common.cpp
+index 56129029fa20..f19ebdcd8bb0 100644
+--- a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/Common.cpp
++++ b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/Common.cpp
+@@ -630,6 +630,7 @@ void mlir::iree_compiler::gpu::buildPipelineSharedMemoryCopies(
+       transform::AnyOpType::get(b.getContext()), forOpH);
+   // TODO: depth from strategy, or directly from individual buffers.
+   pipelineOp.setDepth(strategy.pipelineDepth);
++  pipelineOp.setUseMmaSync(strategy.useMmaSync);
+ }
+ 
+ Value mlir::iree_compiler::gpu::buildBufferize(ImplicitLocOpBuilder &b,
+diff --git a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.cpp b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.cpp
+index e555c5f00737..df4c6c616485 100644
+--- a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.cpp
++++ b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.cpp
+@@ -51,6 +51,7 @@ using iree_compiler::gpu::kCudaWarpSize;
+ using iree_compiler::gpu::MatmulStrategy;
+ using iree_compiler::gpu::scaleUpByBitWidth;
+ using iree_compiler::IREE::transform_dialect::ApplyPatternsOpPatterns;
++using iree_compiler::IREE::transform_dialect::EliminateGpuBarriersOp;
+ using iree_compiler::IREE::transform_dialect::
+     IREEPopulateWorkgroupCountRegionUsingNumThreadsSliceOp;
+ using transform::MatchOp;
+@@ -303,6 +304,8 @@ void iree_compiler::gpu::buildMatmulTensorCoreStrategy(
+   funcH = buildMapToBlockAndThreads(b, funcH, strategy.numThreads,
+                                     strategy.numWarps);
+ 
++  funcH = b.create<EliminateGpuBarriersOp>(funcH);
++
+   // Step 9. Convert to tensor core ops.
+   // TODO: avoid consuming handles and returning here.
+   funcH = buildConvertToTensorCoreOp(b, funcH, strategy);
+
+From 9ceccd57abab9481109916bb3bc1f436ce2bf598 Mon Sep 17 00:00:00 2001
+From: Nicolas Vasilache <nicolasvasilache@users.noreply.github.com>
+Date: Tue, 6 Jun 2023 14:39:25 +0000
+Subject: [PATCH 03/11] Add support to synchronize sequential loop
+
+---
+ .../TransformExtensions/LLVMGPUExtensions.cpp | 56 +++++++++++++------
+ .../LLVMGPUExtensionsOps.td                   | 33 +++++++++++
+ .../TransformStrategies/GPU/Common.cpp        | 14 +++++
+ .../GPU/MatmulTensorCoreStrategy.cpp          |  1 -
+ .../GPU/MatmulTensorCoreStrategy.h            | 50 ++++++++---------
+ 5 files changed, 110 insertions(+), 44 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/Codegen/LLVMGPU/TransformExtensions/LLVMGPUExtensions.cpp b/compiler/src/iree/compiler/Codegen/LLVMGPU/TransformExtensions/LLVMGPUExtensions.cpp
+index 0e307db24114..88e03bb996f3 100644
+--- a/compiler/src/iree/compiler/Codegen/LLVMGPU/TransformExtensions/LLVMGPUExtensions.cpp
++++ b/compiler/src/iree/compiler/Codegen/LLVMGPU/TransformExtensions/LLVMGPUExtensions.cpp
+@@ -774,6 +774,25 @@ transform_dialect::PipelineSharedMemoryCopiesOp::applyToOne(
+   return DiagnosedSilenceableFailure::success();
+ }
+ 
++//===----------------------------------------------------------------------===//
++// SynchronizeLoopOp
++//===----------------------------------------------------------------------===//
++
++void transform_dialect::SynchronizeLoopOp::getEffects(
++    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
++  transform::onlyReadsHandle(getForOp(), effects);
++  transform::modifiesPayload(effects);
++}
++
++DiagnosedSilenceableFailure transform_dialect::SynchronizeLoopOp::applyToOne(
++    scf::ForOp forOp, transform::ApplyToEachResultList &results,
++    transform::TransformState &state) {
++  IRRewriter rewriter(getContext());
++  rewriter.setInsertionPointAfter(forOp);
++  rewriter.create<gpu::BarrierOp>(forOp.getLoc());
++  return DiagnosedSilenceableFailure::success();
++}
++
+ //===---------------------------------------------------------------------===//
+ // CreateAsyncGroupsOp.
+ //===---------------------------------------------------------------------===//
+@@ -1212,8 +1231,10 @@ static bool mayAlias(Value first, Value second) {
+       return globFirst.getNameAttr() == globSecond.getNameAttr();
+     }
+   }
+-  if (auto subSpanFirst = first.getDefiningOp<HAL::InterfaceBindingSubspanOp>()) {
+-    if (auto subSpanSecond = second.getDefiningOp<HAL::InterfaceBindingSubspanOp>()) {
++  if (auto subSpanFirst =
++          first.getDefiningOp<HAL::InterfaceBindingSubspanOp>()) {
++    if (auto subSpanSecond =
++            second.getDefiningOp<HAL::InterfaceBindingSubspanOp>()) {
+       return subSpanFirst.getBindingAttr() == subSpanSecond.getBindingAttr();
+     }
+   }
+@@ -1299,7 +1320,7 @@ static bool haveConflictingEffects(
+           isa<MemoryEffects::Allocate>(after.getEffect())) {
+         continue;
+       }
+-      
++
+       // In the particular case that the before effect is a free, we only have 2
+       // possibilities:
+       //   1. either the program is well-formed and there must be an interleaved
+@@ -1308,22 +1329,23 @@ static bool haveConflictingEffects(
+       //      conflicts.
+       //   2. either the program is ill-formed and we are in undefined behavior
+       //      territory.
+-      if (isa<MemoryEffects::Free>(before.getEffect()))
+-        continue;
++      if (isa<MemoryEffects::Free>(before.getEffect())) continue;
+ 
+       // Other kinds of effects create a conflict, e.g. read-after-write.
+-      LLVM_DEBUG(DBGS() << "found a conflict between (before): " << before.getValue()
+-                        << " read:" << isa<MemoryEffects::Read>(before.getEffect())
+-                        << " write:" << isa<MemoryEffects::Write>(before.getEffect())
+-                        << " alloc:" << isa<MemoryEffects::Allocate>(before.getEffect())
+-                        << " free:" << isa<MemoryEffects::Free>(before.getEffect())
+-                        << "\n");
+-      LLVM_DEBUG(DBGS() << "and (after):                " << after.getValue()
+-                        << " read:" << isa<MemoryEffects::Read>(after.getEffect())
+-                        << " write:" << isa<MemoryEffects::Write>(after.getEffect())
+-                        << " alloc:" << isa<MemoryEffects::Allocate>(after.getEffect())
+-                        << " free:" << isa<MemoryEffects::Free>(after.getEffect())
+-                        << "\n");
++      LLVM_DEBUG(
++          DBGS() << "found a conflict between (before): " << before.getValue()
++                 << " read:" << isa<MemoryEffects::Read>(before.getEffect())
++                 << " write:" << isa<MemoryEffects::Write>(before.getEffect())
++                 << " alloc:"
++                 << isa<MemoryEffects::Allocate>(before.getEffect()) << " free:"
++                 << isa<MemoryEffects::Free>(before.getEffect()) << "\n");
++      LLVM_DEBUG(
++          DBGS() << "and (after):                " << after.getValue()
++                 << " read:" << isa<MemoryEffects::Read>(after.getEffect())
++                 << " write:" << isa<MemoryEffects::Write>(after.getEffect())
++                 << " alloc:" << isa<MemoryEffects::Allocate>(after.getEffect())
++                 << " free:" << isa<MemoryEffects::Free>(after.getEffect())
++                 << "\n");
+       return true;
+     }
+   }
+diff --git a/compiler/src/iree/compiler/Codegen/LLVMGPU/TransformExtensions/LLVMGPUExtensionsOps.td b/compiler/src/iree/compiler/Codegen/LLVMGPU/TransformExtensions/LLVMGPUExtensionsOps.td
+index 7a0865a18d93..767860b5a5c6 100644
+--- a/compiler/src/iree/compiler/Codegen/LLVMGPU/TransformExtensions/LLVMGPUExtensionsOps.td
++++ b/compiler/src/iree/compiler/Codegen/LLVMGPU/TransformExtensions/LLVMGPUExtensionsOps.td
+@@ -439,6 +439,39 @@ def PipelineSharedMemoryCopiesOp : Op<
+   }];
+ }
+ 
++def SynchronizeLoopOp : Op<
++    Transform_Dialect, "iree.synchronize_loop", [
++      DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
++      TransformEachOpTrait,
++      TransformOpInterface]> {
++  let description = [{
++    This inserts a gpu.barrier after a given scf.for loop.
++
++    #### Return modes
++    This transform consumes the scf.for handle and produces a result handle
++    which points to the new scf.for loop generated. It will fail if the loop
++    cannot be pipelined or if there are no shared memory copies.
++  }];
++
++  let arguments = (
++      ins TransformHandleTypeInterface:$for_op);
++  let results = (outs);
++
++  let cppNamespace = "mlir::iree_compiler::IREE::transform_dialect";
++
++  let assemblyFormat = [{ 
++    $for_op 
++    attr-dict 
++    `:` functional-type(operands, results)}];
++
++  let extraClassDeclaration = [{
++    ::mlir::DiagnosedSilenceableFailure applyToOne(
++        ::mlir::scf::ForOp forOp,
++        ::mlir::transform::ApplyToEachResultList &results,
++        ::mlir::transform::TransformState &state);
++  }];
++}
++
+ def CreateAsyncGroupsOp :
+   Op<Transform_Dialect, "iree.create_async_groups",
+     [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+diff --git a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/Common.cpp b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/Common.cpp
+index f19ebdcd8bb0..4b77e30fa9c3 100644
+--- a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/Common.cpp
++++ b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/Common.cpp
+@@ -52,6 +52,7 @@ using iree_compiler::gpu::buildCommonTrailingStrategy;
+ using iree_compiler::gpu::buildMapToBlockAndThreads;
+ using iree_compiler::gpu::GPUModel;
+ using iree_compiler::IREE::transform_dialect::ApplyBufferOptimizationsOp;
++using iree_compiler::IREE::transform_dialect::EliminateGpuBarriersOp;
+ using iree_compiler::IREE::transform_dialect::IREEBufferizeOp;
+ using iree_compiler::IREE::transform_dialect::IREEEliminateEmptyTensorsOp;
+ using iree_compiler::IREE::transform_dialect::
+@@ -59,6 +60,7 @@ using iree_compiler::IREE::transform_dialect::
+ using iree_compiler::IREE::transform_dialect::
+     IREEPopulateWorkgroupCountRegionUsingNumThreadsSliceOp;
+ using iree_compiler::IREE::transform_dialect::ShareForallOperandsOp;
++using iree_compiler::IREE::transform_dialect::SynchronizeLoopOp;
+ using transform::FuseIntoContainingOp;
+ using transform::MatchOp;
+ using transform::RewriteInDestinationPassingStyleOp;
+@@ -547,6 +549,15 @@ Value mlir::iree_compiler::gpu::buildConvertToTensorCoreOp(
+       config.unrollVectorsGpuWmma = true;
+     b.create<ApplyPatternsOp>(funcH, config);
+   }
++
++  Value forH = b.create<transform::MatchOp>(
++      transform::OperationType::get(b.getContext(), "scf.for"), funcH,
++      b.getStrArrayAttr({scf::ForOp::getOperationName()}),
++      /*matchInterfaceEnum=*/transform::MatchInterfaceEnumAttr(),
++      /*opAttrs=*/DictionaryAttr(),
++      /*filterResultType=*/TypeAttr());
++  b.create<SynchronizeLoopOp>(forH);
++
+   // TODO: not a functional style transform and avoid returning funcH.
+   funcH = b.create<transform::HoistRedundantVectorTransfersOp>(
+       transform::AnyOpType::get(b.getContext()), funcH);
+@@ -560,6 +571,9 @@ Value mlir::iree_compiler::gpu::buildConvertToTensorCoreOp(
+     vectorToMMaConversionOp.setUseMmaSync(true);
+   else
+     vectorToMMaConversionOp.setUseWmma(true);
++
++  // Post-hoc elimiation of barriers.
++  funcH = b.create<EliminateGpuBarriersOp>(funcH);
+   return funcH;
+ }
+ 
+diff --git a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.cpp b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.cpp
+index df4c6c616485..ee6b335074ae 100644
+--- a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.cpp
++++ b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.cpp
+@@ -303,7 +303,6 @@ void iree_compiler::gpu::buildMatmulTensorCoreStrategy(
+   Value funcH = b.create<MatchOp>(variantH, func::FuncOp::getOperationName());
+   funcH = buildMapToBlockAndThreads(b, funcH, strategy.numThreads,
+                                     strategy.numWarps);
+-
+   funcH = b.create<EliminateGpuBarriersOp>(funcH);
+ 
+   // Step 9. Convert to tensor core ops.
+diff --git a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.h b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.h
+index 1b47237e2baa..97082d8e1b8a 100644
+--- a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.h
++++ b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.h
+@@ -80,16 +80,15 @@ class MatmulStrategy : public AbstractGemmLikeStrategy {
+     assert(totalNumThreads() % numThreadsK == 0 &&
+            "num threads must be divisible by num threads along k");
+     int64_t numThreadsM = totalNumThreads() / numThreadsK;
+-//     assert(blockTileM() % numThreadsM == 0 &&
+-//            "blockTileSizes[0] must be divisible by numThreadsM");
+-//     assert(reductionTileSize % numThreadsK == 0 &&
+-//            "reductionTileSize must be divisible by numThreadsK");
+-    return MappingInfo{
+-        /*numThreads=*/{numThreadsM, numThreadsK},
+-        /*tileSizes=*/
+-        {std::max(1l, blockTileM() / numThreadsM), 
+-        std::max(1l, reductionTileSize / numThreadsK)},
+-        /*threadMapping=*/{linearIdX(ctx), linearIdY(ctx)}};
++    assert(blockTileM() % numThreadsM == 0 &&
++           "blockTileM must be divisible by numThreadsM");
++    assert(reductionTileSize % numThreadsK == 0 &&
++           "reductionTileSize must be divisible by numThreadsK");
++    return MappingInfo{/*numThreads=*/{numThreadsM, numThreadsK},
++                       /*tileSizes=*/
++                       {std::max(1l, blockTileM() / numThreadsM),
++                        std::max(1l, reductionTileSize / numThreadsK)},
++                       /*threadMapping=*/{linearIdX(ctx), linearIdY(ctx)}};
+   }
+   // RHS copy is of size kxn.
+   MappingInfo rhsCopyMapping() const override {
+@@ -99,32 +98,31 @@ class MatmulStrategy : public AbstractGemmLikeStrategy {
+     assert(totalNumThreads() % numThreadsN == 0 &&
+            "num threads must be divisible by num threads along n");
+     int64_t numThreadsK = totalNumThreads() / numThreadsN;
+-//     assert(reductionTileSize % numThreadsK == 0 &&
+-//            "blockTileSizes[0] must be divisible by numThreadsK");
+-//     assert(blockTileN() % numThreadsN == 0 &&
+-//            "reductionTileSize must be divisible by numThreadsN");
+-    return MappingInfo{
+-        /*numThreads=*/{numThreadsK, numThreadsN},
+-        /*tileSizes=*/
+-        {std::max(1l, reductionTileSize / numThreadsK), 
+-        std::max(1l, blockTileN() / numThreadsN)},
+-        /*threadMapping=*/{linearIdY(ctx), linearIdX(ctx)}};
++    assert(reductionTileSize % numThreadsK == 0 &&
++           "reductionTileSize must be divisible by numThreadsK");
++    assert(blockTileN() % numThreadsN == 0 &&
++           "blockTileN must be divisible by numThreadsN");
++    return MappingInfo{/*numThreads=*/{numThreadsK, numThreadsN},
++                       /*tileSizes=*/
++                       {std::max(1l, reductionTileSize / numThreadsK),
++                        std::max(1l, blockTileN() / numThreadsN)},
++                       /*threadMapping=*/{linearIdY(ctx), linearIdX(ctx)}};
+   }
+   // RES copy is of size mxn.
+   MappingInfo resCopyMapping() const override {
+     assert(blockTileN() % resCopyVectorSize() == 0 &&
+            "vector size must divide n");
+-    int64_t numThreadsN = blockTileSizes[1] / resCopyVectorSize();
++    int64_t numThreadsN = blockTileN() / resCopyVectorSize();
+     assert(totalNumThreads() % numThreadsN == 0 &&
+            "num threads must be divisible by num threads along n");
+     int64_t numThreadsM = totalNumThreads() / numThreadsN;
+-//     assert(blockTileM() % numThreadsM == 0 &&
+-//            "blockTileSizes[0] must be divisible by numThreadsM");
+-//     assert(blockTileN() % numThreadsN == 0 &&
+-//            "blockTileSizes[1] must be divisible by numThreadsN");
++    assert(blockTileM() % numThreadsM == 0 &&
++           "blockTileM() must be divisible by numThreadsM");
++    assert(blockTileN() % numThreadsN == 0 &&
++           "blockTileN() must be divisible by numThreadsN");
+     return MappingInfo{/*numThreads=*/{numThreadsM, numThreadsN},
+                        /*tileSizes=*/
+-                       {std::max(1l, blockTileM() / numThreadsM), 
++                       {std::max(1l, blockTileM() / numThreadsM),
+                         std::max(1l, blockTileN() / numThreadsN)},
+                        /*threadMapping=*/{linearIdY(ctx), linearIdX(ctx)}};
+   }
+
+From 683e2d7eef9f4a0987b16b4b4e1cc53892ec4d8d Mon Sep 17 00:00:00 2001
+From: Nicolas Vasilache <nicolasvasilache@users.noreply.github.com>
+Date: Tue, 6 Jun 2023 17:51:21 +0000
+Subject: [PATCH 04/11] Update tests and improve error messages
+
+---
+ .../LLVMGPU/test/set_transform_strategy.mlir  | 98 ++++++++++++++++---
+ .../GPU/AbstractGemmLikeStrategy.h            |  8 ++
+ .../GPU/MatmulTensorCoreStrategy.cpp          | 35 ++++---
+ .../GPU/MatmulTensorCoreStrategy.h            | 72 +++++++++-----
+ 4 files changed, 164 insertions(+), 49 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/Codegen/LLVMGPU/test/set_transform_strategy.mlir b/compiler/src/iree/compiler/Codegen/LLVMGPU/test/set_transform_strategy.mlir
+index e69dc5d6236d..15be9bfe10cf 100644
+--- a/compiler/src/iree/compiler/Codegen/LLVMGPU/test/set_transform_strategy.mlir
++++ b/compiler/src/iree/compiler/Codegen/LLVMGPU/test/set_transform_strategy.mlir
+@@ -1,4 +1,5 @@
+ // RUN: iree-opt %s --split-input-file --pass-pipeline="builtin.module(hal.executable(hal.executable.variant(iree-llvmgpu-lower-executable-target{test-lowering-configuration})))" --iree-codegen-llvmgpu-enable-transform-dialect-matmul-tensorcore-strategy --iree-codegen-llvmgpu-enable-transform-dialect-aligned-matmul | FileCheck %s
++
+ // Check that setting the command line options affect the transform
+ // strategy as expected.
+ // RUN: iree-opt %s --split-input-file --pass-pipeline="builtin.module(hal.executable(hal.executable.variant(iree-llvmgpu-lower-executable-target{test-lowering-configuration})))" --iree-codegen-llvmgpu-enable-transform-dialect-matmul-tensorcore-strategy \
+@@ -17,6 +18,42 @@
+ // RUN: -td-matmul-strategy-pipeline-depth=5 \
+ // RUN: | FileCheck --check-prefix=WITH_OPTIONS %s
+ 
++// Check that various more exotic strategies apply properly e2e but without otherwise checking their content.
++// RUN: iree-opt %s --split-input-file --pass-pipeline="builtin.module(hal.executable(hal.executable.variant(iree-llvmgpu-lower-executable-target{test-lowering-configuration})))" --iree-codegen-llvmgpu-enable-transform-dialect-matmul-tensorcore-strategy \
++// RUN: --iree-codegen-llvmgpu-enable-transform-dialect-aligned-matmul \
++// RUN: -td-matmul-strategy-blk-size-x=16 \
++// RUN: -td-matmul-strategy-blk-size-y=16 \
++// RUN: -td-matmul-strategy-blk-size-z=1 \
++// RUN: -td-matmul-strategy-reduc-size=16 \
++// RUN: -td-matmul-strategy-num-threads-x=32 \
++// RUN: -td-matmul-strategy-num-threads-y=1 \
++// RUN: -td-matmul-strategy-num-threads-z=1 \
++// RUN: -td-matmul-strategy-num-warps-x=1 \
++// RUN: -td-matmul-strategy-num-warps-y=1 \
++// RUN: -td-matmul-strategy-num-warps-z=1 \
++// RUN: -td-matmul-strategy-use-async-copies=true \
++// RUN: -td-matmul-strategy-use-mma-sync=true \
++// RUN: -td-matmul-strategy-pipeline-depth=9 \
++// RUN: | FileCheck --check-prefix=WITH_OPTIONS_2 %s
++
++// Check that various more exotic strategies apply properly e2e but without otherwise checking their content.
++// RUN: iree-opt %s --split-input-file --pass-pipeline="builtin.module(hal.executable(hal.executable.variant(iree-llvmgpu-lower-executable-target{test-lowering-configuration})))" --iree-codegen-llvmgpu-enable-transform-dialect-matmul-tensorcore-strategy \
++// RUN: --iree-codegen-llvmgpu-enable-transform-dialect-aligned-matmul \
++// RUN: -td-matmul-strategy-blk-size-x=128 \
++// RUN: -td-matmul-strategy-blk-size-y=64 \
++// RUN: -td-matmul-strategy-blk-size-z=1 \
++// RUN: -td-matmul-strategy-reduc-size=16 \
++// RUN: -td-matmul-strategy-num-threads-x=128 \
++// RUN: -td-matmul-strategy-num-threads-y=2 \
++// RUN: -td-matmul-strategy-num-threads-z=1 \
++// RUN: -td-matmul-strategy-num-warps-x=1 \
++// RUN: -td-matmul-strategy-num-warps-y=8 \
++// RUN: -td-matmul-strategy-num-warps-z=1 \
++// RUN: -td-matmul-strategy-use-async-copies=true \
++// RUN: -td-matmul-strategy-use-mma-sync=true \
++// RUN: -td-matmul-strategy-pipeline-depth=3 \
++// RUN: | FileCheck --check-prefix=WITH_OPTIONS_3 %s
++
+ hal.executable @matmul {
+ hal.executable.variant public @cuda_nvptx_fb, target = <"cuda", "cuda-nvptx-fb", {target_arch = "sm_80"}> {
+   hal.executable.export public @matmul ordinal(0) layout(#hal.pipeline.layout<push_constants = 0, sets = [<0, bindings = [<0, storage_buffer, ReadOnly>, <1, storage_buffer, ReadOnly>, <2, storage_buffer>]>]>) {
+@@ -59,8 +96,8 @@ hal.executable.variant public @cuda_nvptx_fb, target = <"cuda", "cuda-nvptx-fb",
+ // CHECK: transform.structured.tile_to_forall_op %{{.*}}   num_threads [4, 32] tile_sizes [](mapping = [#gpu.linear<y>, #gpu.linear<x>])
+ // CHECK: transform.scf.take_assumed_branch %{{.*}} take_else_branch : (!transform.any_op) -> ()
+ // CHECK: transform.structured.tile_to_forall_op %{{.*}}   num_threads [4, 32] tile_sizes [](mapping = [#gpu.linear<y>, #gpu.linear<x>])
+-// CHECK: transform.structured.tile_to_forall_op %{{.*}}   num_threads [2, 2] tile_sizes [](mapping = [#gpu.warp<y>, #gpu.warp<x>])
+-// CHECK: transform.structured.tile_to_forall_op %{{.*}}   num_threads [2, 2] tile_sizes [](mapping = [#gpu.warp<y>, #gpu.warp<x>])
++// CHECK: transform.structured.tile_to_forall_op %{{.*}}   num_threads [2, 2] tile_sizes [](mapping = [#gpu.warp<x>, #gpu.warp<y>])
++// CHECK: transform.structured.tile_to_forall_op %{{.*}}   num_threads [2, 2] tile_sizes [](mapping = [#gpu.warp<x>, #gpu.warp<y>])
+ // CHECK: transform.structured.masked_vectorize %{{.*}} vector_sizes [4, 4]
+ // CHECK: transform.structured.masked_vectorize %{{.*}} vector_sizes [4, 4]
+ // CHECK: transform.structured.masked_vectorize %{{.*}} vector_sizes [32, 4]
+@@ -77,9 +114,12 @@ hal.executable.variant public @cuda_nvptx_fb, target = <"cuda", "cuda-nvptx-fb",
+ // CHECK: } : !transform.any_op
+ // CHECK: transform.iree.apply_patterns %{{.*}} {extract_address_computations}
+ // CHECK: transform.iree.apply_patterns %{{.*}} {unroll_vectors_gpu_wmma}
++// CHECK: transform.structured.match ops{["scf.for"]} in %{{.*}} 
++// CHECK: transform.iree.synchronize_loop %{{.*}}
+ // CHECK: transform.structured.hoist_redundant_vector_transfers %{{.*}}
+ // CHECK: transform.iree.apply_buffer_optimizations %{{.*}}
+ // CHECK: transform.iree.vector.vector_to_mma_conversion %{{.*}} {use_wmma}
++// CHECK: transform.iree.eliminate_gpu_barriers
+ // CHECK: apply_patterns to %{{.*}} {
+ // CHECK:   transform.apply_patterns.memref.fold_memref_alias_ops
+ // CHECK: } : !transform.any_op
+@@ -114,8 +154,8 @@ hal.executable.variant public @cuda_nvptx_fb, target = <"cuda", "cuda-nvptx-fb",
+ // WITH_OPTIONS: transform.structured.tile_to_forall_op %{{.*}}   num_threads [8, 16] tile_sizes [](mapping = [#gpu.linear<y>, #gpu.linear<x>])
+ // WITH_OPTIONS: transform.scf.take_assumed_branch %{{.*}} take_else_branch : (!transform.any_op) -> ()
+ // WITH_OPTIONS: transform.structured.tile_to_forall_op %{{.*}}   num_threads [8, 16] tile_sizes [](mapping = [#gpu.linear<y>, #gpu.linear<x>])
+-// WITH_OPTIONS: transform.structured.tile_to_forall_op %{{.*}}   num_threads [1, 4] tile_sizes [](mapping = [#gpu.warp<y>, #gpu.warp<x>])
+-// WITH_OPTIONS: transform.structured.tile_to_forall_op %{{.*}}   num_threads [1, 4] tile_sizes [](mapping = [#gpu.warp<y>, #gpu.warp<x>])
++// WITH_OPTIONS: transform.structured.tile_to_forall_op %{{.*}}   num_threads [1, 4] tile_sizes [](mapping = [#gpu.warp<x>, #gpu.warp<y>])
++// WITH_OPTIONS: transform.structured.tile_to_forall_op %{{.*}}   num_threads [1, 4] tile_sizes [](mapping = [#gpu.warp<x>, #gpu.warp<y>])
+ // WITH_OPTIONS: transform.structured.masked_vectorize %{{.*}} vector_sizes [4, 4]
+ // WITH_OPTIONS: transform.structured.masked_vectorize %{{.*}} vector_sizes [1, 4]
+ // WITH_OPTIONS: transform.structured.masked_vectorize %{{.*}} vector_sizes [32, 4]
+@@ -136,10 +176,13 @@ hal.executable.variant public @cuda_nvptx_fb, target = <"cuda", "cuda-nvptx-fb",
+ // The unroll attribute should match td-matmul-use-mma-sync, for true: mma_sync,
+ // for false:_wmma.
+ // WITH_OPTIONS: transform.iree.apply_patterns %{{.*}} {unroll_vectors_gpu_mma_sync}
++// WITH_OPTIONS: transform.structured.match ops{["scf.for"]} in %{{.*}} 
++// WITH_OPTIONS: transform.iree.synchronize_loop %{{.*}}
+ // WITH_OPTIONS: transform.structured.hoist_redundant_vector_transfers %{{.*}}
+ // WITH_OPTIONS: transform.iree.apply_buffer_optimizations %{{.*}}
+ // The attribute should match td-matmul-use-mma-sync.
+ // WITH_OPTIONS: transform.iree.vector.vector_to_mma_conversion %{{.*}} {use_mma_sync}
++// WITH_OPTIONS: transform.iree.eliminate_gpu_barriers
+ // WITH_OPTIONS: apply_patterns to %{{.*}} {
+ // WITH_OPTIONS:   transform.apply_patterns.memref.fold_memref_alias_ops
+ // WITH_OPTIONS: } : !transform.any_op
+@@ -150,7 +193,7 @@ hal.executable.variant public @cuda_nvptx_fb, target = <"cuda", "cuda-nvptx-fb",
+ // The attribute should match td-matmul-use-mma-sync.
+ // WITH_OPTIONS: transform.iree.create_async_groups %{{.*}} {use_mma_sync = true}
+ // The depth should match td-matmul-strategy-pipeline-depth: 5.
+-// WITH_OPTIONS: transform.iree.pipeline_shared_memory_copies %{{.*}} {depth = 5 : i64}
++// WITH_OPTIONS: transform.iree.pipeline_shared_memory_copies %{{.*}} {depth = 5 : i64, use_mma_sync}
+ // WITH_OPTIONS: transform.apply_patterns.vector.lower_masks
+ // WITH_OPTIONS: transform.apply_patterns.vector.materialize_masks
+ // WITH_OPTIONS: apply_patterns to %{{.*}} {
+@@ -159,6 +202,11 @@ hal.executable.variant public @cuda_nvptx_fb, target = <"cuda", "cuda-nvptx-fb",
+ // WITH_OPTIONS: } : !transform.any_op
+ // WITH_OPTIONS: transform.iree.apply_patterns %{{.*}} {canonicalization, cse, licm}
+ 
++
++// WITH_OPTIONS_2-LABEL: func @matmul
++
++// WITH_OPTIONS_3-LABEL: func @matmul
++
+ // -----
+ 
+ hal.executable @matmul {
+@@ -200,8 +248,8 @@ hal.executable.variant public @cuda_nvptx_fb, target = <"cuda", "cuda-nvptx-fb",
+ // CHECK: transform.structured.tile_to_forall_op %{{.*}}   num_threads [2, 64] tile_sizes [](mapping = [#gpu.linear<y>, #gpu.linear<x>])
+ // align2
+ // CHECK: transform.structured.tile_to_forall_op %{{.*}}   num_threads [2, 64] tile_sizes [](mapping = [#gpu.linear<y>, #gpu.linear<x>])
+-// CHECK: transform.structured.tile_to_forall_op %{{.*}}   num_threads [2, 2] tile_sizes [](mapping = [#gpu.warp<y>, #gpu.warp<x>])
+-// CHECK: transform.structured.tile_to_forall_op %{{.*}}   num_threads [2, 2] tile_sizes [](mapping = [#gpu.warp<y>, #gpu.warp<x>])
++// CHECK: transform.structured.tile_to_forall_op %{{.*}}   num_threads [2, 2] tile_sizes [](mapping = [#gpu.warp<x>, #gpu.warp<y>])
++// CHECK: transform.structured.tile_to_forall_op %{{.*}}   num_threads [2, 2] tile_sizes [](mapping = [#gpu.warp<x>, #gpu.warp<y>])
+ // align1
+ // CHECK: transform.structured.masked_vectorize %{{.*}} vector_sizes [16, 1]
+ // align2
+@@ -209,6 +257,10 @@ hal.executable.variant public @cuda_nvptx_fb, target = <"cuda", "cuda-nvptx-fb",
+ // align2
+ // CHECK: transform.structured.masked_vectorize %{{.*}} vector_sizes [64, 2]
+ 
++// WITH_OPTIONS_2-LABEL: func @matmul
++
++// WITH_OPTIONS_3-LABEL: func @matmul
++
+ // -----
+ hal.executable @matmul {
+ hal.executable.variant public @cuda_nvptx_fb, target = <"cuda", "cuda-nvptx-fb", {target_arch = "sm_80"}> {
+@@ -240,6 +292,10 @@ hal.executable.variant public @cuda_nvptx_fb, target = <"cuda", "cuda-nvptx-fb",
+ 
+ // CHECK: transform.sequence  failures(propagate) {
+ 
++// WITH_OPTIONS_2-LABEL: func @matmul
++
++// WITH_OPTIONS_3-LABEL: func @matmul
++
+ // -----
+ hal.executable @matmul_partially_unaligned {
+ hal.executable.variant public @cuda_nvptx_fb, target = <"cuda", "cuda-nvptx-fb", {target_arch = "sm_80"}> {
+@@ -287,9 +343,9 @@ hal.executable.variant public @cuda_nvptx_fb, target = <"cuda", "cuda-nvptx-fb",
+ // CHECK:      %{{.*}}, %[[TILED_RHS:.+]] = transform.structured.tile_to_forall_op %[[RHS_PAD]]   num_threads [4, 32] tile_sizes [](mapping = [#gpu.linear<y>, #gpu.linear<x>])
+ // CHECK:      transform.structured.match ops{["scf.if"]}
+ // CHECK:      transform.scf.take_assumed_branch %{{.*}} take_else_branch
+-// CHECK:      transform.structured.tile_to_forall_op %{{.*}}   num_threads [2, 2] tile_sizes [](mapping = [#gpu.warp<y>, #gpu.warp<x>])
+-// CHECK:      transform.structured.tile_to_forall_op %{{.*}}   num_threads [2, 2] tile_sizes [](mapping = [#gpu.warp<y>, #gpu.warp<x>])
+-// CHECK:      transform.iree.apply_patterns %{{.*}} {canonicalization, cse, licm}
++// CHECK:      transform.structured.tile_to_forall_op %{{.*}}   num_threads [2, 2] tile_sizes [](mapping = [#gpu.warp<x>, #gpu.warp<y>])
++// CHECK:      transform.structured.tile_to_forall_op %{{.*}}   num_threads [2, 2] tile_sizes [](mapping = [#gpu.warp<x>, #gpu.warp<y>])
++// CHECK:      transform.iree.apply_patterns %{{.*}} {canonicalization, cse, licm, tiling_canonicalization}
+ 
+ // alignLhs
+ // CHECK:      transform.structured.masked_vectorize %[[TILED_LHS]] vector_sizes [4, 4]
+@@ -299,6 +355,10 @@ hal.executable.variant public @cuda_nvptx_fb, target = <"cuda", "cuda-nvptx-fb",
+ // CHECK:      transform.apply_patterns.vector.lower_masks
+ // CHECK:      transform.apply_patterns.vector.materialize_masks
+ 
++// WITH_OPTIONS_2-LABEL: func @matmul_partially_unaligned
++
++// WITH_OPTIONS_3-LABEL: func @matmul_partially_unaligned
++
+ // -----
+ hal.executable @aligned_matmul {
+ hal.executable.variant public @cuda_nvptx_fb, target = <"cuda", "cuda-nvptx-fb", {target_arch = "sm_80"}> {
+@@ -347,15 +407,19 @@ hal.executable.variant public @cuda_nvptx_fb, target = <"cuda", "cuda-nvptx-fb",
+ // CHECK:      %[[RHS_COPY:.+]] = transform.structured.rewrite_in_destination_passing_style %[[RHS_PAD]]
+ // CHECK:      transform.structured.tile_to_forall_op %[[LHS_COPY]]   num_threads [32, 4] tile_sizes [](mapping = [#gpu.linear<x>, #gpu.linear<y>])
+ // CHECK:      transform.structured.tile_to_forall_op %[[RHS_COPY]]   num_threads [4, 32] tile_sizes [](mapping = [#gpu.linear<y>, #gpu.linear<x>])
+-// CHECK:      transform.structured.tile_to_forall_op %{{.*}}   num_threads [2, 2] tile_sizes [](mapping = [#gpu.warp<y>, #gpu.warp<x>])
+-// CHECK:      transform.structured.tile_to_forall_op %{{.*}}   num_threads [2, 2] tile_sizes [](mapping = [#gpu.warp<y>, #gpu.warp<x>])
+-// CHECK:      transform.iree.apply_patterns %{{.*}} {canonicalization, cse, licm}
++// CHECK:      transform.structured.tile_to_forall_op %{{.*}}   num_threads [2, 2] tile_sizes [](mapping = [#gpu.warp<x>, #gpu.warp<y>])
++// CHECK:      transform.structured.tile_to_forall_op %{{.*}}   num_threads [2, 2] tile_sizes [](mapping = [#gpu.warp<x>, #gpu.warp<y>])
++// CHECK:      transform.iree.apply_patterns %{{.*}} {canonicalization, cse, licm, tiling_canonicalization}
+ 
+ // Verify we don't go down the path without the flag.
+ // WITH_OPTIONS-LABEL: func @aligned_matmul
+ 
+ // WITH_OPTIONS-NOT: transform.sequence  failures(propagate) {
+ 
++// WITH_OPTIONS_2-LABEL: func @aligned_matmul
++
++// WITH_OPTIONS_3-LABEL: func @aligned_matmul
++
+ // -----
+ 
+ hal.executable @matmul_too_small {
+@@ -391,6 +455,10 @@ hal.executable.variant public @cuda_nvptx_fb, target = <"cuda", "cuda-nvptx-fb",
+ // just fallback to the simt strategy.
+ // CHECK-NOT: transform.sequence
+ 
++// WITH_OPTIONS_2-LABEL: func @matmul_too_small
++
++// WITH_OPTIONS_3-LABEL: func @matmul_too_small
++
+ // -----
+ 
+ hal.executable @f16_matmul {
+@@ -422,3 +490,7 @@ hal.executable.variant public @cuda_nvptx_fb, target = <"cuda", "cuda-nvptx-fb",
+ // CHECK:       iree_codegen.translation_info<LLVMGPUMatmulSimt>
+ // CHECK-LABEL: func @f16_matmul
+ // CHECK-NOT: transform.sequence
++
++// WITH_OPTIONS_2-LABEL: func @f16_matmul
++
++// WITH_OPTIONS_3-LABEL: func @f16_matmul
+diff --git a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/AbstractGemmLikeStrategy.h b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/AbstractGemmLikeStrategy.h
+index bf29876af279..e62b81d79180 100644
+--- a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/AbstractGemmLikeStrategy.h
++++ b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/AbstractGemmLikeStrategy.h
+@@ -47,6 +47,9 @@ struct AbstractGemmLikeStrategy {
+   virtual int64_t blockTileM() const = 0;
+   virtual int64_t blockTileN() const = 0;
+ 
++  virtual int64_t numWarpsM() const = 0;
++  virtual int64_t numWarpsN() const = 0;
++
+   bool alignedLhs() const {
+     return m() % blockTileM() == 0 && k() % reductionTileSize == 0;
+   }
+@@ -88,12 +91,17 @@ struct AbstractGemmLikeStrategy {
+     // vectorization properly computes the bounds automatically.
+     SmallVector<int64_t> tileSizes;
+     SmallVector<Attribute> threadMapping;
++    void print(llvm::raw_ostream &os) const;
++    LLVM_DUMP_METHOD void dump() const;
+   };
+ 
+   virtual MappingInfo getBlockMapping() const = 0;
+   virtual MappingInfo lhsCopyMapping() const = 0;
++  virtual LogicalResult validateLhsCopyMapping() const = 0;
+   virtual MappingInfo rhsCopyMapping() const = 0;
++  virtual LogicalResult validateRhsCopyMapping() const = 0;
+   virtual MappingInfo resCopyMapping() const = 0;
++  virtual LogicalResult validateResCopyMapping() const = 0;
+   virtual MappingInfo computeMapping() const = 0;
+ 
+   virtual void print(llvm::raw_ostream &os) const = 0;
+diff --git a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.cpp b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.cpp
+index ee6b335074ae..114aaef590ae 100644
+--- a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.cpp
++++ b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.cpp
+@@ -149,14 +149,13 @@ void MatmulStrategy::initDefaultValues() {
+ 
+ LLVM_DUMP_METHOD void MatmulStrategy::dump() const { print(llvm::errs()); }
+ 
+-static llvm::raw_ostream &printMappingInfo(
+-    llvm::raw_ostream &os, const MatmulStrategy::MappingInfo &mapping) {
++void mlir::iree_compiler::gpu::AbstractGemmLikeStrategy::MappingInfo::print(
++    llvm::raw_ostream &os) const {
+   os << "MappingInfo{";
+-  llvm::interleaveComma(mapping.numThreads, os << "numThreads: {");
+-  llvm::interleaveComma(mapping.tileSizes, os << "}, tileSizes: {");
+-  llvm::interleaveComma(mapping.threadMapping, os << "}, threadMapping: {");
++  llvm::interleaveComma(numThreads, os << "numThreads: {");
++  llvm::interleaveComma(tileSizes, os << "}, tileSizes: {");
++  llvm::interleaveComma(threadMapping, os << "}, threadMapping: {");
+   os << "}}";
+-  return os;
+ }
+ 
+ void MatmulStrategy::print(llvm::raw_ostream &os) const {
+@@ -195,13 +194,14 @@ void MatmulStrategy::print(llvm::raw_ostream &os) const {
+   os << "\n-- Derived quantities --\n";
+   os << "- lhs copy:\n";
+   os << "    -> vector size (num elements): " << lhsCopyVectorSize() << '\n';
+-  printMappingInfo(os << "    -> ", lhsCopyMapping()) << '\n';
+-  os << "- rhs copy:\n";
++  lhsCopyMapping().print(os << "    -> ");
++  os << "\n- rhs copy:\n";
+   os << "    -> vector size (num elements): " << rhsCopyVectorSize() << '\n';
+-  printMappingInfo(os << "    -> ", rhsCopyMapping()) << '\n';
+-  os << "- res copy:\n";
++  rhsCopyMapping().print(os << "    -> ");
++  os << "\n- res copy:\n";
+   os << "    -> vector size (num elements): " << resCopyVectorSize() << '\n';
+-  printMappingInfo(os << "    -> ", resCopyMapping()) << '\n';
++  resCopyMapping().print(os << "    -> ");
++  os << "\n";
+ }
+ 
+ static std::tuple<Value, Value, Value, Value>
+@@ -239,6 +239,19 @@ buildMatmulStrategyBlockDistribution(ImplicitLocOpBuilder &b, Value variantH,
+ 
+ void iree_compiler::gpu::buildMatmulTensorCoreStrategy(
+     ImplicitLocOpBuilder &b, Value variantH, const MatmulStrategy &strategy) {
++  if (failed(strategy.validateLhsCopyMapping())) {
++    strategy.print(llvm::errs());
++    assert(false && "invalid lhs copy mapping");
++  }
++  if (failed(strategy.validateRhsCopyMapping())) {
++    strategy.print(llvm::errs());
++    assert(false && "invalid rhs copy mapping");
++  }
++  if (failed(strategy.validateResCopyMapping())) {
++    strategy.print(llvm::errs());
++    assert(false && "invalid res copy mapping");
++  }
++
+   LLVM_DEBUG(strategy.print(DBGS()));
+   assert(strategy.totalNumThreads() ==
+              strategy.totalNumWarps() * kCudaWarpSize &&
+diff --git a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.h b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.h
+index 97082d8e1b8a..5be58d3e513f 100644
+--- a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.h
++++ b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.h
+@@ -12,6 +12,7 @@
+ #include "iree/compiler/Codegen/TransformStrategies/GPU/AbstractGemmLikeStrategy.h"
+ #include "iree/compiler/Codegen/TransformStrategies/GPU/Common.h"
+ #include "mlir/Dialect/GPU/IR/GPUDialect.h"
++#include "mlir/Support/LogicalResult.h"
+ 
+ namespace llvm {
+ class raw_ostream;
+@@ -64,6 +65,15 @@ class MatmulStrategy : public AbstractGemmLikeStrategy {
+     return blockTileSizes[1];
+   }
+ 
++  int64_t numWarpsM() const override {
++    assert(numWarps.size() >= 2 && "need at least 2 warp sizes");
++    return numWarps[0];
++  }
++  int64_t numWarpsN() const override {
++    assert(numWarps.size() >= 2 && "need at least 2 warp sizes");
++    return numWarps[1];
++  }
++
+   using AbstractGemmLikeStrategy::MappingInfo;
+ 
+   MappingInfo getBlockMapping() const override {
+@@ -74,61 +84,73 @@ class MatmulStrategy : public AbstractGemmLikeStrategy {
+ 
+   // LHS copy is of size mxk.
+   MappingInfo lhsCopyMapping() const override {
+-    assert(reductionTileSize % lhsCopyVectorSize() == 0 &&
+-           "vector size must divide reductionTileSize");
+     int64_t numThreadsK = reductionTileSize / lhsCopyVectorSize();
+-    assert(totalNumThreads() % numThreadsK == 0 &&
+-           "num threads must be divisible by num threads along k");
+     int64_t numThreadsM = totalNumThreads() / numThreadsK;
+-    assert(blockTileM() % numThreadsM == 0 &&
+-           "blockTileM must be divisible by numThreadsM");
+-    assert(reductionTileSize % numThreadsK == 0 &&
+-           "reductionTileSize must be divisible by numThreadsK");
+     return MappingInfo{/*numThreads=*/{numThreadsM, numThreadsK},
+                        /*tileSizes=*/
+                        {std::max(1l, blockTileM() / numThreadsM),
+                         std::max(1l, reductionTileSize / numThreadsK)},
+                        /*threadMapping=*/{linearIdX(ctx), linearIdY(ctx)}};
+   }
++
++  LogicalResult validateLhsCopyMapping() const override {
++    MappingInfo mapping = lhsCopyMapping();
++    bool cond1 = (reductionTileSize % lhsCopyVectorSize() == 0);
++    bool cond2 =
++        (totalNumThreads() == mapping.numThreads[0] * mapping.numThreads[1]);
++    bool cond3 = (blockTileM() % mapping.numThreads[0] == 0);
++    bool cond4 = (reductionTileSize % mapping.numThreads[1] == 0);
++    return success(cond1 && cond2 && cond3 && cond4);
++  }
++
+   // RHS copy is of size kxn.
+   MappingInfo rhsCopyMapping() const override {
+-    assert(blockTileN() % rhsCopyVectorSize() == 0 &&
+-           "vector size must divide blockTileSizes[1]");
+     int64_t numThreadsN = blockTileN() / rhsCopyVectorSize();
+-    assert(totalNumThreads() % numThreadsN == 0 &&
+-           "num threads must be divisible by num threads along n");
+     int64_t numThreadsK = totalNumThreads() / numThreadsN;
+-    assert(reductionTileSize % numThreadsK == 0 &&
+-           "reductionTileSize must be divisible by numThreadsK");
+-    assert(blockTileN() % numThreadsN == 0 &&
+-           "blockTileN must be divisible by numThreadsN");
+     return MappingInfo{/*numThreads=*/{numThreadsK, numThreadsN},
+                        /*tileSizes=*/
+                        {std::max(1l, reductionTileSize / numThreadsK),
+                         std::max(1l, blockTileN() / numThreadsN)},
+                        /*threadMapping=*/{linearIdY(ctx), linearIdX(ctx)}};
+   }
++
++  LogicalResult validateRhsCopyMapping() const override {
++    MappingInfo mapping = rhsCopyMapping();
++    bool cond1 = (blockTileN() % rhsCopyVectorSize() == 0);
++    bool cond2 =
++        (totalNumThreads() == mapping.numThreads[0] * mapping.numThreads[1]);
++    bool cond3 = (reductionTileSize % mapping.numThreads[0] == 0);
++    bool cond4 = (blockTileN() % mapping.numThreads[1] == 0);
++    return success(cond1 && cond2 && cond3 && cond4);
++  }
++
+   // RES copy is of size mxn.
+   MappingInfo resCopyMapping() const override {
+-    assert(blockTileN() % resCopyVectorSize() == 0 &&
+-           "vector size must divide n");
+     int64_t numThreadsN = blockTileN() / resCopyVectorSize();
+-    assert(totalNumThreads() % numThreadsN == 0 &&
+-           "num threads must be divisible by num threads along n");
+     int64_t numThreadsM = totalNumThreads() / numThreadsN;
+-    assert(blockTileM() % numThreadsM == 0 &&
+-           "blockTileM() must be divisible by numThreadsM");
+-    assert(blockTileN() % numThreadsN == 0 &&
+-           "blockTileN() must be divisible by numThreadsN");
+     return MappingInfo{/*numThreads=*/{numThreadsM, numThreadsN},
+                        /*tileSizes=*/
+                        {std::max(1l, blockTileM() / numThreadsM),
+                         std::max(1l, blockTileN() / numThreadsN)},
+                        /*threadMapping=*/{linearIdY(ctx), linearIdX(ctx)}};
+   }
++
++  LogicalResult validateResCopyMapping() const override {
++    MappingInfo mapping = resCopyMapping();
++    bool cond1 = (blockTileN() % resCopyVectorSize() == 0);
++    bool cond2 =
++        (totalNumThreads() == mapping.numThreads[0] * mapping.numThreads[1]);
++    bool cond3 = (blockTileM() % mapping.numThreads[0] == 0);
++    bool cond4 = (blockTileN() % mapping.numThreads[1] == 0);
++    return success(cond1 && cond2 && cond3 && cond4);
++  }
++
+   // COMPUTE is of size mxn.
+   MappingInfo computeMapping() const override {
+-    return MappingInfo{/*numThreads=*/{numWarps[0], numWarps[1]},
++    // Warps along M and N need to properly be ordered along the X and Y
++    // dimensions respectively, otherwise we would improperly generate
++    // predicated code.
++    return MappingInfo{/*numThreads=*/{numWarpsM(), numWarpsN()},
+                        /*tileSizes=*/{},
+                        /*threadMapping=*/{warpX(ctx), warpY(ctx)}};
+   }
+
+From a73c2e429d0eb3f2e781fcfd583b31cb57ce9c31 Mon Sep 17 00:00:00 2001
+From: Nicolas Vasilache <nicolasvasilache@users.noreply.github.com>
+Date: Wed, 7 Jun 2023 18:35:15 +0000
+Subject: [PATCH 05/11] NFC - Refactor and better documentation + debug support
+
+---
+ .../Codegen/Common/GPU/GPUPipelining.cpp      |  23 ++-
+ .../TransformExtensions/LLVMGPUExtensions.cpp |  14 ++
+ .../Codegen/LLVMGPU/Utils/LLVMGPUUtils.cpp    |   9 +-
+ .../GPU/AbstractGemmLikeStrategy.h            | 115 +++++++++----
+ .../GPU/MatmulTensorCoreStrategy.cpp          |  18 +-
+ .../GPU/MatmulTensorCoreStrategy.h            | 156 ++++++++++++++----
+ 6 files changed, 248 insertions(+), 87 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/Codegen/Common/GPU/GPUPipelining.cpp b/compiler/src/iree/compiler/Codegen/Common/GPU/GPUPipelining.cpp
+index e3ed871e2050..8223f2e21b14 100644
+--- a/compiler/src/iree/compiler/Codegen/Common/GPU/GPUPipelining.cpp
++++ b/compiler/src/iree/compiler/Codegen/Common/GPU/GPUPipelining.cpp
+@@ -353,6 +353,7 @@ struct MainLoopInfo {
+         // Pipeline and schedule the most inner for op ,i.e., the mainloop that
+         // should be a flat region.
+         isSchedulable = false;
++        LDBG("-- found op with regions -> not schedulable: " << op);
+         return;
+       }
+       if (isa<nvgpu::DeviceAsyncCopyOp>(op)) {
+@@ -399,11 +400,23 @@ struct MainLoopInfo {
+     // If one of the ingredients (`cp.async`, `cp.commit_group`,
+     // `cp.wait_group`, `bar.sync`, `mma.sync`, `ldmatrix` or `ld.shared`) for
+     // scheduling is missing, the mainloop cannot be scheduled.
+-    if (copyGlobalToSharedOps.empty() || asyncCreateGroupOp.empty() ||
+-        asyncWaitOps.empty() || barrierOps.empty() || warpOperations.empty()) {
++    if (copyGlobalToSharedOps.empty()) {
++      LDBG("-- missing copyGlobalToSharedOps -> not schedulable");
++      isSchedulable = false;
++    } else if (asyncCreateGroupOp.empty()) {
++      LDBG("-- missing asyncCreateGroupOp -> not schedulable");
++      isSchedulable = false;
++    } else if (asyncWaitOps.empty()) {
++      LDBG("-- missing asyncWaitOps -> not schedulable");
++      isSchedulable = false;
++    } else if (barrierOps.empty()) {
++      LDBG("-- missing barrierOps -> not schedulable");
++      isSchedulable = false;
++    } else if (warpOperations.empty()) {
++      LDBG("-- missing warpOperations -> not schedulable");
+       isSchedulable = false;
+-      return;
+     }
++    if (!isSchedulable) return;
+ 
+     // Collect the dependent operations for `cp.async` in the mainloop order for
+     // coarse-grained software pipeling. The deps are collected in stage order,
+@@ -480,12 +493,12 @@ static void getNvidiaAmpereTensorCorePipeline(
+     unsigned numStages) {
+   // Analyze the main loop and obtain information for coarse-grained pipelining
+   // and fine-grained instruction scheduling.
+-  MainLoopInfo mainloop(forOp);
+   LDBG("Start getNvidiaAmpereTensorCorePipeline");
++  MainLoopInfo mainloop(forOp);
+ 
+   // If the mainloop is not schedulable, return an empty schedule.
+   if (!mainloop.isSchedulable) {
+-    LDBG("--main loop is not schedulable");
++    LDBG("--main loop is not schedulable -> " << forOp);
+     return;
+   }
+ 
+diff --git a/compiler/src/iree/compiler/Codegen/LLVMGPU/TransformExtensions/LLVMGPUExtensions.cpp b/compiler/src/iree/compiler/Codegen/LLVMGPU/TransformExtensions/LLVMGPUExtensions.cpp
+index 88e03bb996f3..d5c7a83ad985 100644
+--- a/compiler/src/iree/compiler/Codegen/LLVMGPU/TransformExtensions/LLVMGPUExtensions.cpp
++++ b/compiler/src/iree/compiler/Codegen/LLVMGPU/TransformExtensions/LLVMGPUExtensions.cpp
+@@ -40,10 +40,12 @@ using llvm::dbgs;
+ 
+ #define DEBUG_TYPE "transform-llvmgpu-extensions"
+ #define DEBUG_TYPE_ALIAS "transform-llvmgpu-extensions-alias"
++#define DEBUG_VECTOR_TO_MMA "transform-llvmgpu-extensions-vector-to-mma"
+ 
+ #define DBGS() (dbgs() << '[' << DEBUG_TYPE << "] ")
+ #define LDBG(X) LLVM_DEBUG(dbgs() << '[' << DEBUG_TYPE << "] " << X)
+ #define DBGS_ALIAS() (dbgs() << '[' << DEBUG_TYPE_ALIAS << "] ")
++#define DBGS_VECTOR_TO_MMA() (dbgs() << '[' << DEBUG_VECTOR_TO_MMA << "] ")
+ 
+ using namespace mlir;
+ using namespace mlir::iree_compiler::IREE;
+@@ -695,6 +697,11 @@ transform_dialect::VectorToMMAConversionOp::applyToOne(
+     return emitDefaultDefiniteFailure(target);
+   }
+ 
++  DEBUG_WITH_TYPE(DEBUG_VECTOR_TO_MMA, {
++    DBGS_VECTOR_TO_MMA() << "after cast away vector leading one dim patterns:\n"
++                         << *target << "\n";
++  });
++
+   IRRewriter rewriter(target->getContext());
+   rewriter.setListener(&listener);
+   auto diag = DiagnosedSilenceableFailure::success();
+@@ -709,6 +716,13 @@ transform_dialect::VectorToMMAConversionOp::applyToOne(
+     return mlir::emitDefiniteFailure(target,
+                                      "vector to mma patterns failed to apply");
+ 
++  DEBUG_WITH_TYPE(DEBUG_VECTOR_TO_MMA,
++                  {
++                    DBGS_VECTOR_TO_MMA()
++                        << "after convert vector to NVVM compatible MMA sync:\n"
++                        << *target << "\n";
++                  });
++
+   // Using TF32 for Float.
+   RewritePatternSet f32ToTF32patterns(funcOp.getContext());
+   nvgpu::populateMmaSyncF32ToTF32Patterns(f32ToTF32patterns,
+diff --git a/compiler/src/iree/compiler/Codegen/LLVMGPU/Utils/LLVMGPUUtils.cpp b/compiler/src/iree/compiler/Codegen/LLVMGPU/Utils/LLVMGPUUtils.cpp
+index 960fbde46487..6a30b5deffd0 100644
+--- a/compiler/src/iree/compiler/Codegen/LLVMGPU/Utils/LLVMGPUUtils.cpp
++++ b/compiler/src/iree/compiler/Codegen/LLVMGPU/Utils/LLVMGPUUtils.cpp
+@@ -30,6 +30,7 @@ static bool isContiguousStore(Operation* write) {
+   if (auto transferWrite = dyn_cast<vector::TransferWriteOp>(write)) {
+     if (!transferWrite.getPermutationMap().isMinorIdentity() ||
+         !transferWrite.isDimInBounds(0) || transferWrite.getMask()) {
++      LDBG("--not a contiguous store op: " << *write);
+       return false;
+     }
+     return true;
+@@ -37,6 +38,7 @@ static bool isContiguousStore(Operation* write) {
+   if (isa<vector::StoreOp>(write)) {
+     return true;
+   }
++  LDBG("--not a store op: " << write->getName().getStringRef());
+   return false;
+ }
+ 
+@@ -44,6 +46,7 @@ static bool isContiguousRead(Operation* read) {
+   if (auto transferRead = dyn_cast<vector::TransferReadOp>(read)) {
+     if (!transferRead.isDimInBounds(0) ||
+         !transferRead.getPermutationMap().isMinorIdentity()) {
++      LDBG("--not a contiguous load op: " << *read);
+       return false;
+     }
+     return true;
+@@ -51,6 +54,7 @@ static bool isContiguousRead(Operation* read) {
+   if (isa<vector::LoadOp>(read)) {
+     return true;
+   }
++  LDBG("--not a load op: " << read->getName().getStringRef());
+   return false;
+ }
+ 
+@@ -149,10 +153,7 @@ void createAsyncGroups(RewriterBase& rewriter, func::FuncOp funcOp,
+   llvm::SmallSetVector<Operation*, 16> copyToSharedMem;
+   // Look for all the copy that can be converted to async copy ops.
+   funcOp.walk([&](Operation* writeOp) {
+-    if (!isContiguousStore(writeOp)) {
+-      LDBG("--not a contiguous store: " << *writeOp);
+-      return WalkResult::advance();
+-    }
++    if (!isContiguousStore(writeOp)) return WalkResult::advance();
+     LDBG("--candidate writeOp: " << *writeOp);
+     Value vectorVal = getValueStored(writeOp);
+     if (llvm::cast<VectorType>(vectorVal.getType()).getRank() != 1) {
+diff --git a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/AbstractGemmLikeStrategy.h b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/AbstractGemmLikeStrategy.h
+index e62b81d79180..23231d7787d4 100644
+--- a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/AbstractGemmLikeStrategy.h
++++ b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/AbstractGemmLikeStrategy.h
+@@ -25,40 +25,32 @@ struct AbstractGemmLikeStrategy {
+ 
+   virtual ~AbstractGemmLikeStrategy();
+ 
++  //===--------------------------------------------------------------------===//
++  // Parameters that control the tiling and mapping.
++  //===--------------------------------------------------------------------===//
++  struct MappingInfo {
++    SmallVector<int64_t> numThreads;
++    // Explicitly computing the tileSizes is only needed until masked
++    // vectorization properly computes the bounds automatically.
++    SmallVector<int64_t> tileSizes;
++    SmallVector<Attribute> threadMapping;
++    void print(llvm::raw_ostream &os) const;
++    LLVM_DUMP_METHOD void dump() const;
++  };
++
+   /// Tile sizes for the workgroup / determines grid size for all known
+   /// reduction strategies. The initial values are set by initDefaultValues();
+   SmallVector<int64_t> blockTileSizes;
+   int64_t reductionTileSize;
+   SmallVector<int64_t> numThreads;
+   SmallVector<int64_t> numWarps;
+-
+-  bool useAsyncCopies;
+-  bool useMmaSync;
+-  int64_t pipelineDepth;
+-
+-  SmallVector<float> paddingValues;
+-  SmallVector<int64_t> paddingDimensions;
+-  SmallVector<int64_t> packingDimensions;
+-
+-  virtual int64_t m() const = 0;
+-  virtual int64_t n() const = 0;
+-  virtual int64_t k() const = 0;
+-
+   virtual int64_t blockTileM() const = 0;
+   virtual int64_t blockTileN() const = 0;
+ 
+   virtual int64_t numWarpsM() const = 0;
+   virtual int64_t numWarpsN() const = 0;
+ 
+-  bool alignedLhs() const {
+-    return m() % blockTileM() == 0 && k() % reductionTileSize == 0;
+-  }
+-  bool alignedRhs() const {
+-    return n() % blockTileN() == 0 && k() % reductionTileSize == 0;
+-  }
+-  bool alignedRes() const {
+-    return m() % blockTileM() == 0 && n() % blockTileN() == 0;
+-  }
++  virtual MappingInfo getBlockMapping() const = 0;
+ 
+   /// Common values based on derived quantities.
+   int64_t totalNumThreads() const {
+@@ -66,13 +58,22 @@ struct AbstractGemmLikeStrategy {
+     for (auto v : numThreads) res *= v;
+     return res;
+   }
++
+   int64_t totalNumWarps() const {
+     int64_t res = 1;
+     for (auto v : numWarps) res *= v;
+     return res;
+   }
+ 
+-  // Copy vector sizes based on inner most K/N dims.
++  //===--------------------------------------------------------------------===//
++  // Parameters that control copy/padding transfers from global to shared.
++  //===--------------------------------------------------------------------===//
++  SmallVector<float> paddingValues;
++  SmallVector<int64_t> paddingDimensions;
++  SmallVector<int64_t> packingDimensions;
++
++  // Copy vector sizes based on innermost K/N dims.
++  // TODO: These are now hardcoded for f32 but are element-type dependent.
+   int64_t lhsCopyVectorSize() const {
+     if (k() % 4 == 0) return 4;
+     if (k() % 2 == 0) return 2;
+@@ -85,27 +86,75 @@ struct AbstractGemmLikeStrategy {
+   }
+   int64_t resCopyVectorSize() const { return rhsCopyVectorSize(); }
+ 
+-  struct MappingInfo {
+-    SmallVector<int64_t> numThreads;
+-    // Explicitly computing the tileSizes is only needed until masked
+-    // vectorization properly computes the bounds automatically.
+-    SmallVector<int64_t> tileSizes;
+-    SmallVector<Attribute> threadMapping;
+-    void print(llvm::raw_ostream &os) const;
+-    LLVM_DUMP_METHOD void dump() const;
+-  };
++  bool alignedLhs() const {
++    return m() % blockTileM() == 0 && k() % reductionTileSize == 0;
++  }
++  bool alignedRhs() const {
++    return n() % blockTileN() == 0 && k() % reductionTileSize == 0;
++  }
++  bool alignedRes() const {
++    return m() % blockTileM() == 0 && n() % blockTileN() == 0;
++  }
+ 
+-  virtual MappingInfo getBlockMapping() const = 0;
+   virtual MappingInfo lhsCopyMapping() const = 0;
+   virtual LogicalResult validateLhsCopyMapping() const = 0;
+   virtual MappingInfo rhsCopyMapping() const = 0;
+   virtual LogicalResult validateRhsCopyMapping() const = 0;
+   virtual MappingInfo resCopyMapping() const = 0;
+   virtual LogicalResult validateResCopyMapping() const = 0;
++
++  //===--------------------------------------------------------------------===//
++  // Parameters that control compute mapping decisions.
++  //===--------------------------------------------------------------------===//
++  bool useAsyncCopies;
++  bool useMmaSync;
++  int64_t pipelineDepth;
+   virtual MappingInfo computeMapping() const = 0;
+ 
++  virtual LogicalResult validate() const = 0;
++
++  //===--------------------------------------------------------------------===//
++  // Problem-related quantities.
++  //===--------------------------------------------------------------------===//
++  virtual int64_t m() const = 0;
++  virtual int64_t n() const = 0;
++  virtual int64_t k() const = 0;
++
+   virtual void print(llvm::raw_ostream &os) const = 0;
+   virtual LLVM_DUMP_METHOD void dump() const = 0;
++
++  //===--------------------------------------------------------------------===//
++  // Preconditions of internal transforms lifted to the top-level for more
++  // actionnable error messages. In the fullness of time, transforms should
++  // expose preconditions and we should aggregate them automatically.
++  //===--------------------------------------------------------------------===//
++
++  // TODO: To handle different element types efficiently, it would be much
++  // better to expose the unrolling to native size explicitly to the transforms
++  // rather than hide it behind an opaque transform.
++
++  // wmma preconditions that we want to lift out in an actionnable top-level
++  // error message instead of failing late in the transformation schedule.
++  // TODO: These are now hardcoded for f32 but are element-type dependent.
++  // Precondition: the pipeline transformation for wmma requires at least 2
++  // k-groups.
++  constexpr static int64_t kMinWmmaMinM = 16;
++  constexpr static int64_t kMinWmmaMinN = 16;
++  constexpr static int64_t kMinWmmaMinK = 8;
++
++  // mma.sync preconditions that we want to lift out in an actionnable top-level
++  // error message instead of failing late in the transformation schedule.
++  // TODO: These are now hardcoded for f32 but are element-type dependent.
++  // Precondition: the pipeline transformation for mma.sync requires at least 2
++  // k-groups.
++  constexpr static int64_t kMinMmaSyncGroups = 2;
++  // Precondition: the pipeline transformation for mma.sync requires at least a
++  // pipeline depth of 3.
++  constexpr static int64_t kMinMmaSyncPipelineDepth = 3;
++  // Precondition: if mma.sync is used, the tile sizes must be at least 8x8x4.
++  constexpr static int64_t kMinMmaSyncMinM = 8;
++  constexpr static int64_t kMinMmaSyncMinN = 8;
++  constexpr static int64_t kMinMmaSyncMinK = 4;
+ };
+ 
+ }  // namespace gpu
+diff --git a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.cpp b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.cpp
+index 114aaef590ae..522d295f88d9 100644
+--- a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.cpp
++++ b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.cpp
+@@ -239,24 +239,12 @@ buildMatmulStrategyBlockDistribution(ImplicitLocOpBuilder &b, Value variantH,
+ 
+ void iree_compiler::gpu::buildMatmulTensorCoreStrategy(
+     ImplicitLocOpBuilder &b, Value variantH, const MatmulStrategy &strategy) {
+-  if (failed(strategy.validateLhsCopyMapping())) {
++  if (failed(strategy.validate())) {
+     strategy.print(llvm::errs());
+-    assert(false && "invalid lhs copy mapping");
++    assert(false && "invalid strategy");
+   }
+-  if (failed(strategy.validateRhsCopyMapping())) {
+-    strategy.print(llvm::errs());
+-    assert(false && "invalid rhs copy mapping");
+-  }
+-  if (failed(strategy.validateResCopyMapping())) {
+-    strategy.print(llvm::errs());
+-    assert(false && "invalid res copy mapping");
+-  }
+-
+   LLVM_DEBUG(strategy.print(DBGS()));
+-  assert(strategy.totalNumThreads() ==
+-             strategy.totalNumWarps() * kCudaWarpSize &&
+-         "Number of threads specified by warps must match total number of "
+-         "threads");
++
+   // Step 1. Apply block-level part of the strategy, keeps everything fused.
+   auto [fillH, matmulH, maybeTiledTrailingHBlock, forall] =
+       buildMatmulStrategyBlockDistribution(b, variantH, strategy);
+diff --git a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.h b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.h
+index 5be58d3e513f..60ccb362addf 100644
+--- a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.h
++++ b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.h
+@@ -13,6 +13,7 @@
+ #include "iree/compiler/Codegen/TransformStrategies/GPU/Common.h"
+ #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+ #include "mlir/Support/LogicalResult.h"
++#include "mlir/Support/MathExtras.h"
+ 
+ namespace llvm {
+ class raw_ostream;
+@@ -84,65 +85,74 @@ class MatmulStrategy : public AbstractGemmLikeStrategy {
+ 
+   // LHS copy is of size mxk.
+   MappingInfo lhsCopyMapping() const override {
+-    int64_t numThreadsK = reductionTileSize / lhsCopyVectorSize();
+-    int64_t numThreadsM = totalNumThreads() / numThreadsK;
++    int64_t numThreadsK = mlir::ceilDiv(reductionTileSize, lhsCopyVectorSize());
++    int64_t numThreadsM =
++        std::min(blockTileM(), mlir::ceilDiv(totalNumThreads(), numThreadsK));
+     return MappingInfo{/*numThreads=*/{numThreadsM, numThreadsK},
+                        /*tileSizes=*/
+-                       {std::max(1l, blockTileM() / numThreadsM),
+-                        std::max(1l, reductionTileSize / numThreadsK)},
++                       {mlir::ceilDiv(blockTileM(), numThreadsM),
++                        mlir::ceilDiv(reductionTileSize, numThreadsK)},
+                        /*threadMapping=*/{linearIdX(ctx), linearIdY(ctx)}};
+   }
+ 
+   LogicalResult validateLhsCopyMapping() const override {
+     MappingInfo mapping = lhsCopyMapping();
+-    bool cond1 = (reductionTileSize % lhsCopyVectorSize() == 0);
+-    bool cond2 =
+-        (totalNumThreads() == mapping.numThreads[0] * mapping.numThreads[1]);
+-    bool cond3 = (blockTileM() % mapping.numThreads[0] == 0);
+-    bool cond4 = (reductionTileSize % mapping.numThreads[1] == 0);
+-    return success(cond1 && cond2 && cond3 && cond4);
++    // It is fine to use fewer threads to copy the LHS.
++    if (totalNumThreads() < mapping.numThreads[0] * mapping.numThreads[1]) {
++      llvm::errs() << "too many threads used for transferring lhs: "
++                   << mapping.numThreads[0] << " * " << mapping.numThreads[1]
++                   << " > " << totalNumThreads() << "\n";
++      return failure();
++    }
++    return success();
+   }
+ 
+   // RHS copy is of size kxn.
+   MappingInfo rhsCopyMapping() const override {
+-    int64_t numThreadsN = blockTileN() / rhsCopyVectorSize();
+-    int64_t numThreadsK = totalNumThreads() / numThreadsN;
++    int64_t numThreadsN = mlir::ceilDiv(blockTileN(), rhsCopyVectorSize());
++    int64_t numThreadsK = std::min(
++        reductionTileSize, mlir::ceilDiv(totalNumThreads(), numThreadsN));
+     return MappingInfo{/*numThreads=*/{numThreadsK, numThreadsN},
+                        /*tileSizes=*/
+-                       {std::max(1l, reductionTileSize / numThreadsK),
+-                        std::max(1l, blockTileN() / numThreadsN)},
++                       {mlir::ceilDiv(reductionTileSize, numThreadsK),
++                        mlir::ceilDiv(blockTileN(), numThreadsN)},
+                        /*threadMapping=*/{linearIdY(ctx), linearIdX(ctx)}};
+   }
+ 
+   LogicalResult validateRhsCopyMapping() const override {
+     MappingInfo mapping = rhsCopyMapping();
+-    bool cond1 = (blockTileN() % rhsCopyVectorSize() == 0);
+-    bool cond2 =
+-        (totalNumThreads() == mapping.numThreads[0] * mapping.numThreads[1]);
+-    bool cond3 = (reductionTileSize % mapping.numThreads[0] == 0);
+-    bool cond4 = (blockTileN() % mapping.numThreads[1] == 0);
+-    return success(cond1 && cond2 && cond3 && cond4);
++    // It is fine to use fewer threads to copy the RHS.
++    if (totalNumThreads() < mapping.numThreads[0] * mapping.numThreads[1]) {
++      llvm::errs() << "too many threads used for transferring rhs: "
++                   << mapping.numThreads[0] << " * " << mapping.numThreads[1]
++                   << " > " << totalNumThreads() << "\n";
++      return failure();
++    }
++    return success();
+   }
+ 
+   // RES copy is of size mxn.
+   MappingInfo resCopyMapping() const override {
+-    int64_t numThreadsN = blockTileN() / resCopyVectorSize();
+-    int64_t numThreadsM = totalNumThreads() / numThreadsN;
++    int64_t numThreadsN = mlir::ceilDiv(blockTileN(), resCopyVectorSize());
++    int64_t numThreadsM =
++        std::min(blockTileM(), mlir::ceilDiv(totalNumThreads(), numThreadsN));
+     return MappingInfo{/*numThreads=*/{numThreadsM, numThreadsN},
+                        /*tileSizes=*/
+-                       {std::max(1l, blockTileM() / numThreadsM),
+-                        std::max(1l, blockTileN() / numThreadsN)},
++                       {std::max(1l, mlir::ceilDiv(blockTileM(), numThreadsM)),
++                        std::max(1l, mlir::ceilDiv(blockTileN(), numThreadsN))},
+                        /*threadMapping=*/{linearIdY(ctx), linearIdX(ctx)}};
+   }
+ 
+   LogicalResult validateResCopyMapping() const override {
+     MappingInfo mapping = resCopyMapping();
+-    bool cond1 = (blockTileN() % resCopyVectorSize() == 0);
+-    bool cond2 =
+-        (totalNumThreads() == mapping.numThreads[0] * mapping.numThreads[1]);
+-    bool cond3 = (blockTileM() % mapping.numThreads[0] == 0);
+-    bool cond4 = (blockTileN() % mapping.numThreads[1] == 0);
+-    return success(cond1 && cond2 && cond3 && cond4);
++    // It is fine to use fewer threads to copy the RES.
++    if (totalNumThreads() < mapping.numThreads[0] * mapping.numThreads[1]) {
++      llvm::errs() << "too many threads used for transferring res: "
++                   << mapping.numThreads[0] << " * " << mapping.numThreads[1]
++                   << " > " << totalNumThreads() << "\n";
++      return failure();
++    }
++    return success();
+   }
+ 
+   // COMPUTE is of size mxn.
+@@ -155,6 +165,92 @@ class MatmulStrategy : public AbstractGemmLikeStrategy {
+                        /*threadMapping=*/{warpX(ctx), warpY(ctx)}};
+   }
+ 
++  LogicalResult validate() const override {
++    if (totalNumThreads() != totalNumWarps() * kCudaWarpSize) {
++      llvm::errs() << "Number of threads specified by warps must match total "
++                      "number of threads\n";
++      return failure();
++    }
++    if (m() < blockTileM()) {
++      llvm::errs() << "m(" << m() << ") < blockTileM(" << blockTileM() << ") ";
++      llvm::errs() << "this is at risk of not vectorizing and is NYI";
++      return failure();
++    }
++    if (n() < blockTileN()) {
++      llvm::errs() << "n(" << n() << ") < blockTileN(" << blockTileN() << ") ";
++      llvm::errs() << "this is at risk of not vectorizing and is NYI";
++      return failure();
++    }
++    if (k() < reductionTileSize) {
++      llvm::errs() << "k(" << k() << ") < reductionTileSize("
++                   << reductionTileSize << ") ";
++      llvm::errs() << "this is at risk of not vectorizing and is NYI";
++      return failure();
++    }
++
++    if (failed(validateLhsCopyMapping())) {
++      llvm::errs() << "invalid lhs copy mapping";
++      return failure();
++    }
++    if (failed(validateRhsCopyMapping())) {
++      llvm::errs() << "invalid rhs copy mapping";
++      return failure();
++    }
++    if (failed(validateResCopyMapping())) {
++      llvm::errs() << "invalid res copy mapping";
++      return failure();
++    }
++
++    if (pipelineDepth > 1 && reductionTileSize * pipelineDepth > k()) {
++      llvm::errs() << "pipeline depth too large for reduction tile size";
++      return failure();
++    }
++    if (useMmaSync) {
++      if (blockTileM() < kMinMmaSyncMinM) {
++        llvm::errs() << "mma.sync requires at least " << kMinMmaSyncMinM
++                     << " block tile size in M";
++        return failure();
++      }
++      if (blockTileN() < kMinMmaSyncMinN) {
++        llvm::errs() << "mma.sync requires at least " << kMinMmaSyncMinN
++                     << " block tile size in N";
++        return failure();
++      }
++      if (reductionTileSize < kMinMmaSyncMinK) {
++        llvm::errs() << "mma.sync requires at least " << kMinMmaSyncMinK
++                     << " block tile size in K";
++        return failure();
++      }
++      if (pipelineDepth > 1 && pipelineDepth < kMinMmaSyncPipelineDepth) {
++        llvm::errs() << "mma.sync pipelining requires at least "
++                     << kMinMmaSyncPipelineDepth << " stages";
++        return failure();
++      }
++      if (pipelineDepth > 1 && reductionTileSize * kMinMmaSyncGroups > k()) {
++        llvm::errs() << "mma.sync pipelining requires at least "
++                     << kMinMmaSyncGroups << " k groups";
++        return failure();
++      }
++    } else {
++      if (blockTileM() < kMinWmmaMinM) {
++        llvm::errs() << "wmma requires at least " << kMinWmmaMinM
++                     << " block tile size in M";
++        return failure();
++      }
++      if (blockTileN() < kMinWmmaMinN) {
++        llvm::errs() << "wmma requires at least " << kMinWmmaMinN
++                     << " block tile size in N";
++        return failure();
++      }
++      if (reductionTileSize < kMinWmmaMinK) {
++        llvm::errs() << "wmma requires at least " << kMinWmmaMinK
++                     << " block tile size in K";
++        return failure();
++      }
++    }
++    return success();
++  }
++
+   void print(llvm::raw_ostream &os) const;
+   LLVM_DUMP_METHOD void dump() const;
+ };
+
+From 41f99819df2193bc24e092d483e7212fbf121f3d Mon Sep 17 00:00:00 2001
+From: Nicolas Vasilache <nicolasvasilache@users.noreply.github.com>
+Date: Thu, 8 Jun 2023 13:47:47 +0000
+Subject: [PATCH 06/11] NFC - Rebase and cleanup options string
+
+---
+ .../LLVMGPU/test/set_transform_strategy.mlir  | 36 +++-------
+ .../TransformStrategies/Common/Common.cpp     |  7 +-
+ .../GPU/MatmulTensorCoreStrategy.cpp          | 71 +++++--------------
+ 3 files changed, 30 insertions(+), 84 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/Codegen/LLVMGPU/test/set_transform_strategy.mlir b/compiler/src/iree/compiler/Codegen/LLVMGPU/test/set_transform_strategy.mlir
+index 15be9bfe10cf..f742408b59f9 100644
+--- a/compiler/src/iree/compiler/Codegen/LLVMGPU/test/set_transform_strategy.mlir
++++ b/compiler/src/iree/compiler/Codegen/LLVMGPU/test/set_transform_strategy.mlir
+@@ -3,16 +3,10 @@
+ // Check that setting the command line options affect the transform
+ // strategy as expected.
+ // RUN: iree-opt %s --split-input-file --pass-pipeline="builtin.module(hal.executable(hal.executable.variant(iree-llvmgpu-lower-executable-target{test-lowering-configuration})))" --iree-codegen-llvmgpu-enable-transform-dialect-matmul-tensorcore-strategy \
+-// RUN: -td-matmul-strategy-blk-size-x=256 \
+-// RUN: -td-matmul-strategy-blk-size-y=64 \
+-// RUN: -td-matmul-strategy-blk-size-z=1 \
++// RUN: -td-matmul-strategy-blk-sizes=256,64,1 \
+ // RUN: -td-matmul-strategy-reduc-size=8 \
+-// RUN: -td-matmul-strategy-num-threads-x=32 \
+-// RUN: -td-matmul-strategy-num-threads-y=4 \
+-// RUN: -td-matmul-strategy-num-threads-z=1 \
+-// RUN: -td-matmul-strategy-num-warps-x=1 \
+-// RUN: -td-matmul-strategy-num-warps-y=4 \
+-// RUN: -td-matmul-strategy-num-warps-z=1 \
++// RUN: -td-matmul-strategy-num-threads=32,4,1 \
++// RUN: -td-matmul-strategy-num-warps=1,4,1 \
+ // RUN: -td-matmul-strategy-use-async-copies=true \
+ // RUN: -td-matmul-strategy-use-mma-sync=true \
+ // RUN: -td-matmul-strategy-pipeline-depth=5 \
+@@ -21,16 +15,10 @@
+ // Check that various more exotic strategies apply properly e2e but without otherwise checking their content.
+ // RUN: iree-opt %s --split-input-file --pass-pipeline="builtin.module(hal.executable(hal.executable.variant(iree-llvmgpu-lower-executable-target{test-lowering-configuration})))" --iree-codegen-llvmgpu-enable-transform-dialect-matmul-tensorcore-strategy \
+ // RUN: --iree-codegen-llvmgpu-enable-transform-dialect-aligned-matmul \
+-// RUN: -td-matmul-strategy-blk-size-x=16 \
+-// RUN: -td-matmul-strategy-blk-size-y=16 \
+-// RUN: -td-matmul-strategy-blk-size-z=1 \
++// RUN: -td-matmul-strategy-blk-sizes=16,16,1 \
+ // RUN: -td-matmul-strategy-reduc-size=16 \
+-// RUN: -td-matmul-strategy-num-threads-x=32 \
+-// RUN: -td-matmul-strategy-num-threads-y=1 \
+-// RUN: -td-matmul-strategy-num-threads-z=1 \
+-// RUN: -td-matmul-strategy-num-warps-x=1 \
+-// RUN: -td-matmul-strategy-num-warps-y=1 \
+-// RUN: -td-matmul-strategy-num-warps-z=1 \
++// RUN: -td-matmul-strategy-num-threads=32,1,1
++// RUN: -td-matmul-strategy-num-warps=1,1,1
+ // RUN: -td-matmul-strategy-use-async-copies=true \
+ // RUN: -td-matmul-strategy-use-mma-sync=true \
+ // RUN: -td-matmul-strategy-pipeline-depth=9 \
+@@ -39,16 +27,10 @@
+ // Check that various more exotic strategies apply properly e2e but without otherwise checking their content.
+ // RUN: iree-opt %s --split-input-file --pass-pipeline="builtin.module(hal.executable(hal.executable.variant(iree-llvmgpu-lower-executable-target{test-lowering-configuration})))" --iree-codegen-llvmgpu-enable-transform-dialect-matmul-tensorcore-strategy \
+ // RUN: --iree-codegen-llvmgpu-enable-transform-dialect-aligned-matmul \
+-// RUN: -td-matmul-strategy-blk-size-x=128 \
+-// RUN: -td-matmul-strategy-blk-size-y=64 \
+-// RUN: -td-matmul-strategy-blk-size-z=1 \
++// RUN: -td-matmul-strategy-blk-sizes=128,64,1
+ // RUN: -td-matmul-strategy-reduc-size=16 \
+-// RUN: -td-matmul-strategy-num-threads-x=128 \
+-// RUN: -td-matmul-strategy-num-threads-y=2 \
+-// RUN: -td-matmul-strategy-num-threads-z=1 \
+-// RUN: -td-matmul-strategy-num-warps-x=1 \
+-// RUN: -td-matmul-strategy-num-warps-y=8 \
+-// RUN: -td-matmul-strategy-num-warps-z=1 \
++// RUN: -td-matmul-strategy-num-threads=128,2,1 \
++// RUN: -td-matmul-strategy-num-warps=1,8,1 \
+ // RUN: -td-matmul-strategy-use-async-copies=true \
+ // RUN: -td-matmul-strategy-use-mma-sync=true \
+ // RUN: -td-matmul-strategy-pipeline-depth=3 \
+diff --git a/compiler/src/iree/compiler/Codegen/TransformStrategies/Common/Common.cpp b/compiler/src/iree/compiler/Codegen/TransformStrategies/Common/Common.cpp
+index 0b545b74f4ee..c85bc2d50efb 100644
+--- a/compiler/src/iree/compiler/Codegen/TransformStrategies/Common/Common.cpp
++++ b/compiler/src/iree/compiler/Codegen/TransformStrategies/Common/Common.cpp
+@@ -291,7 +291,8 @@ Value mlir::iree_compiler::buildVectorize(ImplicitLocOpBuilder &b, Value funcH,
+ }
+ 
+ Value mlir::iree_compiler::buildLowerMaskedTransfersAndCleanup(
+-    ImplicitLocOpBuilder &b, Value containingOpH) {
++    ImplicitLocOpBuilder &b, Value containingOpH, bool cleanup) {
++  // TODO: avoid functional style transform so we can apply to the variant.
+   b.create<transform::ApplyPatternsOp>(
+       containingOpH, [](OpBuilder &b, Location loc) {
+         b.create<transform::ApplyLowerMaskedTransfersPatternsOp>(loc);
+@@ -309,7 +310,7 @@ Value mlir::iree_compiler::buildLowerMaskedTransfersAndCleanup(
+ }
+ 
+ Value mlir::iree_compiler::buildLowerVectorMasksAndCleanup(
+-    ImplicitLocOpBuilder &b, Value containingOpH) {
++    ImplicitLocOpBuilder &b, Value containingOpH, bool cleanup) {
+   b.create<transform::ApplyPatternsOp>(
+       containingOpH, [](OpBuilder &b, Location loc) {
+         b.create<transform::ApplyLowerMasksPatternsOp>(loc);
+@@ -318,7 +319,7 @@ Value mlir::iree_compiler::buildLowerVectorMasksAndCleanup(
+       containingOpH, [](OpBuilder &b, Location loc) {
+         b.create<transform::ApplyMaterializeMasksPatternsOp>(loc);
+       });
+-  {
++  if (cleanup) {
+     iree_compiler::buildCanonicalizationAndEnablingTransforms(
+         b, containingOpH, [](OpBuilder &b, Location loc) {
+           b.create<transform::ApplyFoldMemrefAliasOpsPatternsOp>(loc);
+diff --git a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.cpp b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.cpp
+index 522d295f88d9..8c911892a0e6 100644
+--- a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.cpp
++++ b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.cpp
+@@ -59,83 +59,46 @@ using transform_ext::RegisterMatchCallbacksOp;
+ 
+ /// Options to set the default values of the matmul strategy.
+ 
+-/// Block tile size X, Y, Z.
+-static llvm::cl::opt<int64_t> clBlockTileSizeX(
+-    "td-matmul-strategy-blk-size-x",
+-    llvm::cl::desc("block tile size for dim X (x,y,z) for the transform "
++static llvm::cl::list<int64_t> clBlockTileSizes(
++    "td-matmul-strategy-blk-sizes",
++    llvm::cl::desc("block tile size for dims (x,y,z) for the transform "
+                    "dialect matmul strategy"),
+-    llvm::cl::init(128));
+-static llvm::cl::opt<int64_t> clBlockTileSizeY(
+-    "td-matmul-strategy-blk-size-y",
+-    llvm::cl::desc("block tile size for dim Y (x,y,z) for the transform "
+-                   "dialect matmul strategy"),
+-    llvm::cl::init(128));
+-static llvm::cl::opt<int64_t> clBlockTileSizeZ(
+-    "td-matmul-strategy-blk-size-z",
+-    llvm::cl::desc("block tile size for dim z (x,y,z) for the transform "
+-                   "dialect matmul strategy"),
+-    llvm::cl::init(1));
+-
++    llvm::cl::list_init(ArrayRef<int64_t>{128, 128, 1}),
++    llvm::cl::CommaSeparated);
+ static llvm::cl::opt<int64_t> clReductionTileSize(
+     "td-matmul-strategy-reduc-size",
+     llvm::cl::desc(
+         "reduction tile sized for the transform dialect matmul strategy"),
+     llvm::cl::init(16));
+-
+-/// Number of threads X, Y, Z.
+-static llvm::cl::opt<int64_t> clNumThreadsX(
+-    "td-matmul-strategy-num-threads-x",
+-    llvm::cl::desc("number of threads for dim X (x,y,z) for the transform "
+-                   "dialect matmul strategy"),
+-    llvm::cl::init(64));
+-static llvm::cl::opt<int64_t> clNumThreadsY(
+-    "td-matmul-strategy-num-threads-y",
+-    llvm::cl::desc("number of threads for dim Y (x,y,z) for the transform "
+-                   "dialect matmul strategy"),
+-    llvm::cl::init(2));
+-static llvm::cl::opt<int64_t> clNumThreadsZ(
+-    "td-matmul-strategy-num-threads-z",
+-    llvm::cl::desc("number of threads for dim z (x,y,z) for the transform "
++static llvm::cl::list<int64_t> clNumThreads(
++    "td-matmul-strategy-num-threads",
++    llvm::cl::desc("number of threads for dims (x,y,z) for the transform "
+                    "dialect matmul strategy"),
+-    llvm::cl::init(1));
+-
+-/// Number of warps X, Y, Z.
+-static llvm::cl::opt<int64_t> clNumWarpsX(
+-    "td-matmul-strategy-num-warps-x",
+-    llvm::cl::desc("number of warps for dim X (x,y,z) for the transform "
+-                   "dialect matmul strategy"),
+-    llvm::cl::init(2));
+-static llvm::cl::opt<int64_t> clNumWarpsY(
+-    "td-matmul-strategy-num-warps-y",
+-    llvm::cl::desc("number of warps for dim Y (x,y,z) for the transform "
+-                   "dialect matmul strategy"),
+-    llvm::cl::init(2));
+-static llvm::cl::opt<int64_t> clNumWarpsZ(
+-    "td-matmul-strategy-num-warps-z",
+-    llvm::cl::desc("number of warps for dim z (x,y,z) for the transform "
++    llvm::cl::list_init(ArrayRef<int64_t>{64, 2, 1}), llvm::cl::CommaSeparated);
++static llvm::cl::list<int64_t> clNumWarps(
++    "td-matmul-strategy-num-warps",
++    llvm::cl::desc("number of warps for dims (x,y,z) for the transform "
+                    "dialect matmul strategy"),
+-    llvm::cl::init(1));
+-
++    llvm::cl::list_init(ArrayRef<int64_t>{2, 2, 1}), llvm::cl::CommaSeparated);
+ static llvm::cl::opt<bool> clUseAsyncCopies(
+     "td-matmul-strategy-use-async-copies",
+     llvm::cl::desc("use mma sync for the transform dialect matmul strategy"),
+     llvm::cl::init(true));
+-
+ static llvm::cl::opt<bool> clUseMmaSync(
+     "td-matmul-strategy-use-mma-sync",
+     llvm::cl::desc("use mma sync for the transform dialect matmul strategy"),
+     llvm::cl::init(false));
+-
+ static llvm::cl::opt<int64_t> clPipelineDepth(
+     "td-matmul-strategy-pipeline-depth",
+     llvm::cl::desc("pipeline depth for the transform dialect matmul strategy"),
+     llvm::cl::init(3));
+ 
+ void MatmulStrategy::initDefaultValues() {
+-  blockTileSizes = {clBlockTileSizeX, clBlockTileSizeY, clBlockTileSizeZ};
++  blockTileSizes =
++      SmallVector<int64_t>{clBlockTileSizes.begin(), clBlockTileSizes.end()};
+   reductionTileSize = clReductionTileSize;
+-  numThreads = {clNumThreadsX, clNumThreadsY, clNumThreadsZ};
+-  numWarps = {clNumWarpsX, clNumWarpsY, clNumWarpsZ};
++  numThreads = SmallVector<int64_t>{clNumThreads.begin(), clNumThreads.end()};
++  numWarps = SmallVector<int64_t>{clNumWarps.begin(), clNumWarps.end()};
+   useAsyncCopies = clUseAsyncCopies;
+   useMmaSync = clUseMmaSync;
+   pipelineDepth = clPipelineDepth;
+
+From f1a921f7356b6d39777352aca26c1587c92ea8f9 Mon Sep 17 00:00:00 2001
+From: Nicolas Vasilache <nicolasvasilache@users.noreply.github.com>
+Date: Sat, 10 Jun 2023 18:51:39 +0000
+Subject: [PATCH 07/11] Turn on mma.sync by default and add some failsafe
+ configurations to avoid bad cases
+
+---
+ .../GPU/MatmulTensorCoreStrategy.cpp          | 15 +++-
+ .../GPU/MatmulTensorCoreStrategy.h            | 12 ++-
+ .../TransformStrategies/GPU/Strategies.cpp    | 73 ++++++++++++++++++-
+ 3 files changed, 93 insertions(+), 7 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.cpp b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.cpp
+index 8c911892a0e6..c7597bdaecf8 100644
+--- a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.cpp
++++ b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.cpp
+@@ -87,7 +87,7 @@ static llvm::cl::opt<bool> clUseAsyncCopies(
+ static llvm::cl::opt<bool> clUseMmaSync(
+     "td-matmul-strategy-use-mma-sync",
+     llvm::cl::desc("use mma sync for the transform dialect matmul strategy"),
+-    llvm::cl::init(false));
++    llvm::cl::init(true));
+ static llvm::cl::opt<int64_t> clPipelineDepth(
+     "td-matmul-strategy-pipeline-depth",
+     llvm::cl::desc("pipeline depth for the transform dialect matmul strategy"),
+@@ -96,9 +96,9 @@ static llvm::cl::opt<int64_t> clPipelineDepth(
+ void MatmulStrategy::initDefaultValues() {
+   blockTileSizes =
+       SmallVector<int64_t>{clBlockTileSizes.begin(), clBlockTileSizes.end()};
+-  reductionTileSize = clReductionTileSize;
+   numThreads = SmallVector<int64_t>{clNumThreads.begin(), clNumThreads.end()};
+   numWarps = SmallVector<int64_t>{clNumWarps.begin(), clNumWarps.end()};
++  reductionTileSize = clReductionTileSize;
+   useAsyncCopies = clUseAsyncCopies;
+   useMmaSync = clUseMmaSync;
+   pipelineDepth = clPipelineDepth;
+@@ -108,6 +108,15 @@ void MatmulStrategy::initDefaultValues() {
+   paddingValues = {0.0f, 0.0f, 0.0f};
+   paddingDimensions = {0, 1, 2};
+   packingDimensions = {1, 1, 1};
++
++  if (!clBlockTileSizes.isDefaultAssigned() ||
++      !clNumThreads.isDefaultAssigned() || !clNumWarps.isDefaultAssigned() ||
++      reductionTileSize != clReductionTileSize.getDefault().getValue() ||
++      useAsyncCopies != clUseAsyncCopies.getDefault().getValue() ||
++      useMmaSync != clUseMmaSync.getDefault().getValue() ||
++      pipelineDepth != clPipelineDepth.getDefault().getValue()) {
++    cliOptionsSpecified = true;
++  }
+ }
+ 
+ LLVM_DUMP_METHOD void MatmulStrategy::dump() const { print(llvm::errs()); }
+@@ -123,6 +132,8 @@ void mlir::iree_compiler::gpu::AbstractGemmLikeStrategy::MappingInfo::print(
+ 
+ void MatmulStrategy::print(llvm::raw_ostream &os) const {
+   os << "\n--- Matmul strategy ---\n";
++  os << "- forced by CLI specification: "
++     << (cliOptionsSpecified ? "true" : "false") << "\n";
+   os << "- block tile sizes: {";
+   bool isFirst = true;
+   for (int64_t blockTileSize : blockTileSizes) {
+diff --git a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.h b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.h
+index 60ccb362addf..110c3c6f8b6f 100644
+--- a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.h
++++ b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.h
+@@ -29,7 +29,10 @@ class MatmulStrategy : public AbstractGemmLikeStrategy {
+  public:
+   MatmulStrategy(MLIRContext *context,
+                  const transform_ext::MatchedMatmulCaptures &captures)
+-      : AbstractGemmLikeStrategy(), ctx(context), captures(captures) {
++      : AbstractGemmLikeStrategy(),
++        ctx(context),
++        captures(captures),
++        cliOptionsSpecified(false) {
+     initDefaultValues();
+   }
+ 
+@@ -40,6 +43,13 @@ class MatmulStrategy : public AbstractGemmLikeStrategy {
+   MLIRContext *ctx;
+   transform_ext::MatchedMatmulCaptures captures;
+ 
++  /// Encodes whether the user has specified any CLI options. When true, the
++  /// strategy should just run what was specified and is not allowed to
++  /// override the user's choices.
++  bool cliOptionsSpecified;
++
++  /// Initialize values from the CLI. Set cliOptionsSpecified to true if the
++  /// default CLI values have been overriden.
+   void initDefaultValues();
+ 
+   LogicalResult verify() const;
+diff --git a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/Strategies.cpp b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/Strategies.cpp
+index 05208acc68d0..57079a522eb4 100644
+--- a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/Strategies.cpp
++++ b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/Strategies.cpp
+@@ -37,6 +37,7 @@
+ #include "mlir/IR/BuiltinTypeInterfaces.h"
+ #include "mlir/IR/ImplicitLocOpBuilder.h"
+ #include "mlir/IR/TypeUtilities.h"
++#include "mlir/Support/MathExtras.h"
+ 
+ using namespace mlir;
+ 
+@@ -63,6 +64,7 @@ using iree_compiler::gpu::GPUModel;
+ using iree_compiler::gpu::kCudaMaxNumThreads;
+ using iree_compiler::gpu::kCudaMaxVectorLoadBitWidth;
+ using iree_compiler::gpu::kCudaWarpSize;
++using iree_compiler::gpu::MatmulStrategy;
+ using iree_compiler::gpu::PadConfig;
+ using iree_compiler::gpu::PadStrategy;
+ using iree_compiler::gpu::ReductionConfig;
+@@ -239,6 +241,68 @@ static LogicalResult matchAndSetReductionStrategy(func::FuncOp entryPoint,
+ //===--------------------------------------------------------------------===//
+ // Matmul strategies.
+ //===--------------------------------------------------------------------===//
++/// Placeholder to encode fixed matmuls that should take finer-grained
++/// precedence over other heuristics. In the future, this could be lifted to
++/// e.g. `gpuModel` or higher up in some transform dialect database summary of
++/// "known good things".
++static FailureOr<MatmulStrategy> applyKnownGoodMatmulConfigurations(
++    const transform_ext::MatchedMatmulCaptures &captures,
++    const GPUModel &gpuModel) {
++  return failure();
++}
++
++static int64_t selectLargestFailsafeValueIfNeeded(
++    int64_t value, int64_t limit, ArrayRef<int64_t> thresholds,
++    ArrayRef<int64_t> failSafeValues) {
++  for (auto [threshold, failSafeValue] :
++       llvm::zip(thresholds, failSafeValues)) {
++    if (limit < threshold && value > failSafeValue) return failSafeValue;
++  }
++  return value;
++}
++
++static void failSafeOverrides(MatmulStrategy &strategy,
++                              const GPUModel &gpuModel) {
++  // Failsafe for blockTileM to avoid tiling by > size (i.e. no tiling).
++  int64_t blockTileM = selectLargestFailsafeValueIfNeeded(
++      strategy.blockTileM(), strategy.m(), {16, 32, 64, 128}, {1, 16, 32, 64});
++  // Failsafe for blockTileN to avoid tiling by > size (i.e. no tiling).
++  int64_t blockTileN = selectLargestFailsafeValueIfNeeded(
++      strategy.blockTileN(), strategy.n(), {16, 32, 64, 128}, {1, 16, 32, 64});
++  // Failsafe for reductionSize to avoid tiling by > size (i.e. no tiling).
++  int64_t reductionTileSize = selectLargestFailsafeValueIfNeeded(
++      strategy.reductionTileSize, strategy.k(), {8, 16, 24, 32, 40, 48, 56, 64},
++      {1, 8, 16, 24, 32, 40, 48, 56});
++  strategy.blockTileSizes = {blockTileM, blockTileN};
++  strategy.reductionTileSize = reductionTileSize;
++  // Avoid too deep pipelines. This should also look at shared memory usage in
++  // the future.
++  if (strategy.pipelineDepth * strategy.reductionTileSize > strategy.k()) {
++    strategy.pipelineDepth =
++        mlir::floorDiv(strategy.k(), strategy.reductionTileSize);
++  }
++}
++
++/// The configurations below have been determined empirically.
++// TODO: Significantly improve these heuristics.
++static MatmulStrategy getMatmulConfig(
++    MLIRContext *context, const transform_ext::MatchedMatmulCaptures &captures,
++    const GPUModel &gpuModel) {
++  MatmulStrategy strategy(context, captures);
++  if (strategy.cliOptionsSpecified) return strategy;
++
++  auto maybeHardcodedConfiguration =
++      applyKnownGoodMatmulConfigurations(captures, gpuModel);
++  if (succeeded(maybeHardcodedConfiguration))
++    return *maybeHardcodedConfiguration;
++
++  // TODO: encode a decision tree of reasonnable heuristics here.
++
++  // Apply failsafe overrides to avoid identified bad corner cases.
++  failSafeOverrides(strategy, gpuModel);
++
++  return strategy;
++}
+ 
+ static LogicalResult matchAndSetMatmulStrategy(func::FuncOp entryPoint,
+                                                linalg::LinalgOp op,
+@@ -310,9 +374,9 @@ static LogicalResult matchAndSetMatmulStrategy(func::FuncOp entryPoint,
+   // tensorcore path, we are better off with a simple simt strategy.
+   // TODO: profitability details can be ironed out in the future when we have a
+   // heuristic to better select strategy parameters.
+-  bool unsupportedSmallCases = (matmulSize[0] > 0 && matmulSize[0] < 8) ||
+-                               (matmulSize[1] > 0 && matmulSize[1] < 8) ||
+-                               (matmulSize[2] > 0 && matmulSize[2] < 8);
++  bool unsupportedSmallCases = (matmulSize[0] > 0 && matmulSize[0] < 16) ||
++                               (matmulSize[1] > 0 && matmulSize[1] < 16) ||
++                               (matmulSize[2] > 0 && matmulSize[2] < 16);
+   if (unsupportedSmallCases) {
+     LDBG("--Matmul strategy small size check failed\n");
+     return failure();
+@@ -321,7 +385,8 @@ static LogicalResult matchAndSetMatmulStrategy(func::FuncOp entryPoint,
+   // 2. Construct the configuration and the strategy builder.
+   // TODO: Generalize along the HW axis.
+   auto strategyBuilder = [&](ImplicitLocOpBuilder &b, Value variant) {
+-    iree_compiler::gpu::MatmulStrategy strategy(op->getContext(), captures);
++    iree_compiler::gpu::MatmulStrategy strategy =
++        getMatmulConfig(op->getContext(), captures, gpuModel);
+     return buildMatmulTensorCoreStrategy(b, variant, strategy);
+   };
+ 
+
+From affe608ddb840cabddc696d5a68831ab85964f69 Mon Sep 17 00:00:00 2001
+From: Nicolas Vasilache <nicolasvasilache@users.noreply.github.com>
+Date: Sat, 10 Jun 2023 19:25:55 +0000
+Subject: [PATCH 08/11] Update test
+
+---
+ .../LLVMGPU/test/set_transform_strategy.mlir       | 14 +++++++-------
+ 1 file changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/Codegen/LLVMGPU/test/set_transform_strategy.mlir b/compiler/src/iree/compiler/Codegen/LLVMGPU/test/set_transform_strategy.mlir
+index f742408b59f9..c331c6dc16b4 100644
+--- a/compiler/src/iree/compiler/Codegen/LLVMGPU/test/set_transform_strategy.mlir
++++ b/compiler/src/iree/compiler/Codegen/LLVMGPU/test/set_transform_strategy.mlir
+@@ -17,8 +17,8 @@
+ // RUN: --iree-codegen-llvmgpu-enable-transform-dialect-aligned-matmul \
+ // RUN: -td-matmul-strategy-blk-sizes=16,16,1 \
+ // RUN: -td-matmul-strategy-reduc-size=16 \
+-// RUN: -td-matmul-strategy-num-threads=32,1,1
+-// RUN: -td-matmul-strategy-num-warps=1,1,1
++// RUN: -td-matmul-strategy-num-threads=32,1,1 \
++// RUN: -td-matmul-strategy-num-warps=1,1,1 \
+ // RUN: -td-matmul-strategy-use-async-copies=true \
+ // RUN: -td-matmul-strategy-use-mma-sync=true \
+ // RUN: -td-matmul-strategy-pipeline-depth=9 \
+@@ -27,7 +27,7 @@
+ // Check that various more exotic strategies apply properly e2e but without otherwise checking their content.
+ // RUN: iree-opt %s --split-input-file --pass-pipeline="builtin.module(hal.executable(hal.executable.variant(iree-llvmgpu-lower-executable-target{test-lowering-configuration})))" --iree-codegen-llvmgpu-enable-transform-dialect-matmul-tensorcore-strategy \
+ // RUN: --iree-codegen-llvmgpu-enable-transform-dialect-aligned-matmul \
+-// RUN: -td-matmul-strategy-blk-sizes=128,64,1
++// RUN: -td-matmul-strategy-blk-sizes=128,64,1 \
+ // RUN: -td-matmul-strategy-reduc-size=16 \
+ // RUN: -td-matmul-strategy-num-threads=128,2,1 \
+ // RUN: -td-matmul-strategy-num-warps=1,8,1 \
+@@ -95,20 +95,20 @@ hal.executable.variant public @cuda_nvptx_fb, target = <"cuda", "cuda-nvptx-fb",
+ // CHECK:   transform.apply_patterns.memref.fold_memref_alias_ops
+ // CHECK: } : !transform.any_op
+ // CHECK: transform.iree.apply_patterns %{{.*}} {extract_address_computations}
+-// CHECK: transform.iree.apply_patterns %{{.*}} {unroll_vectors_gpu_wmma}
++// CHECK: transform.iree.apply_patterns %{{.*}} {unroll_vectors_gpu_mma_sync}
+ // CHECK: transform.structured.match ops{["scf.for"]} in %{{.*}} 
+ // CHECK: transform.iree.synchronize_loop %{{.*}}
+ // CHECK: transform.structured.hoist_redundant_vector_transfers %{{.*}}
+ // CHECK: transform.iree.apply_buffer_optimizations %{{.*}}
+-// CHECK: transform.iree.vector.vector_to_mma_conversion %{{.*}} {use_wmma}
++// CHECK: transform.iree.vector.vector_to_mma_conversion %{{.*}} {use_mma_sync}
+ // CHECK: transform.iree.eliminate_gpu_barriers
+ // CHECK: apply_patterns to %{{.*}} {
+ // CHECK:   transform.apply_patterns.memref.fold_memref_alias_ops
+ // CHECK: } : !transform.any_op
+ // CHECK: transform.memref.multibuffer %{{.*}} {factor = 3 : i64, skip_analysis}
+ // CHECK: transform.apply_patterns.vector.transfer_to_scf max_transfer_rank = 1 full_unroll = true
+-// CHECK: transform.iree.create_async_groups %{{.*}} {use_mma_sync = false}
+-// CHECK: transform.iree.pipeline_shared_memory_copies %{{.*}} {depth = 3 : i64}
++// CHECK: transform.iree.create_async_groups %{{.*}} {use_mma_sync = true}
++// CHECK: transform.iree.pipeline_shared_memory_copies %{{.*}} {depth = 3 : i64, use_mma_sync}
+ // CHECK: transform.apply_patterns.vector.lower_masks
+ // CHECK: transform.apply_patterns.vector.materialize_masks
+ // CHECK: apply_patterns to %{{.*}} {
+
+From 2290f0a4230afd5ef315b31a9f22c813cd56ea0b Mon Sep 17 00:00:00 2001
+From: Nicolas Vasilache <nicolasvasilache@users.noreply.github.com>
+Date: Mon, 12 Jun 2023 10:30:41 +0000
+Subject: [PATCH 09/11] Update test post-rebase
+
+---
+ .../compiler/Codegen/LLVMGPU/test/set_transform_strategy.mlir | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/Codegen/LLVMGPU/test/set_transform_strategy.mlir b/compiler/src/iree/compiler/Codegen/LLVMGPU/test/set_transform_strategy.mlir
+index c331c6dc16b4..3c5d8ed37ee6 100644
+--- a/compiler/src/iree/compiler/Codegen/LLVMGPU/test/set_transform_strategy.mlir
++++ b/compiler/src/iree/compiler/Codegen/LLVMGPU/test/set_transform_strategy.mlir
+@@ -327,7 +327,7 @@ hal.executable.variant public @cuda_nvptx_fb, target = <"cuda", "cuda-nvptx-fb",
+ // CHECK:      transform.scf.take_assumed_branch %{{.*}} take_else_branch
+ // CHECK:      transform.structured.tile_to_forall_op %{{.*}}   num_threads [2, 2] tile_sizes [](mapping = [#gpu.warp<x>, #gpu.warp<y>])
+ // CHECK:      transform.structured.tile_to_forall_op %{{.*}}   num_threads [2, 2] tile_sizes [](mapping = [#gpu.warp<x>, #gpu.warp<y>])
+-// CHECK:      transform.iree.apply_patterns %{{.*}} {canonicalization, cse, licm, tiling_canonicalization}
++// CHECK:      transform.iree.apply_patterns %{{.*}} {canonicalization, cse, licm}
+ 
+ // alignLhs
+ // CHECK:      transform.structured.masked_vectorize %[[TILED_LHS]] vector_sizes [4, 4]
+@@ -391,7 +391,7 @@ hal.executable.variant public @cuda_nvptx_fb, target = <"cuda", "cuda-nvptx-fb",
+ // CHECK:      transform.structured.tile_to_forall_op %[[RHS_COPY]]   num_threads [4, 32] tile_sizes [](mapping = [#gpu.linear<y>, #gpu.linear<x>])
+ // CHECK:      transform.structured.tile_to_forall_op %{{.*}}   num_threads [2, 2] tile_sizes [](mapping = [#gpu.warp<x>, #gpu.warp<y>])
+ // CHECK:      transform.structured.tile_to_forall_op %{{.*}}   num_threads [2, 2] tile_sizes [](mapping = [#gpu.warp<x>, #gpu.warp<y>])
+-// CHECK:      transform.iree.apply_patterns %{{.*}} {canonicalization, cse, licm, tiling_canonicalization}
++// CHECK:      transform.iree.apply_patterns %{{.*}} {canonicalization, cse, licm}
+ 
+ // Verify we don't go down the path without the flag.
+ // WITH_OPTIONS-LABEL: func @aligned_matmul
+
+From c97749a4903fcc05a841291c19c4960c012c46da Mon Sep 17 00:00:00 2001
+From: Nicolas Vasilache <nicolasvasilache@users.noreply.github.com>
+Date: Tue, 13 Jun 2023 07:27:41 +0000
+Subject: [PATCH 10/11] Add a TODO to create a new synchronized transform once
+ upstream refactoring has gone through
+
+---
+ .../iree/compiler/Codegen/TransformStrategies/GPU/Common.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/Common.cpp b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/Common.cpp
+index 4b77e30fa9c3..a4b8a67424fe 100644
+--- a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/Common.cpp
++++ b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/Common.cpp
+@@ -556,6 +556,11 @@ Value mlir::iree_compiler::gpu::buildConvertToTensorCoreOp(
+       /*matchInterfaceEnum=*/transform::MatchInterfaceEnumAttr(),
+       /*opAttrs=*/DictionaryAttr(),
+       /*filterResultType=*/TypeAttr());
++  // TODO: At this time, this synchronization is needed for applying the
++  // HoistRedundantVectorTransfersOp transform correctly. This is because the
++  // transform does not take parallelism into accound.
++  // In the future, HoistRedundantVectorTransfersOp + SynchronizeLoopOp need to
++  // be replaced by a single transform.
+   b.create<SynchronizeLoopOp>(forH);
+ 
+   // TODO: not a functional style transform and avoid returning funcH.
+
+From 3272120726272f4006fdfb4f625e7cf42eaa85c7 Mon Sep 17 00:00:00 2001
+From: Nicolas Vasilache <nicolasvasilache@users.noreply.github.com>
+Date: Tue, 13 Jun 2023 07:44:48 +0000
+Subject: [PATCH 11/11] Fix paths post rebase
+
+---
+ .../TransformStrategies/GPU/MatmulTensorCoreStrategy.cpp       | 3 ---
+ 1 file changed, 3 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.cpp b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.cpp
+index c7597bdaecf8..ad880779d6bb 100644
+--- a/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.cpp
++++ b/compiler/src/iree/compiler/Codegen/TransformStrategies/GPU/MatmulTensorCoreStrategy.cpp
+@@ -12,9 +12,6 @@
+ #include "iree/compiler/Codegen/TransformStrategies/Common/Common.h"
+ #include "iree/compiler/Codegen/TransformStrategies/GPU/Common.h"
+ #include "iree/compiler/Codegen/TransformStrategies/GPU/Strategies.h"
+-#include "iree/compiler/Codegen/TransformDialectStrategies/Common/Common.h"
+-#include "iree/compiler/Codegen/TransformDialectStrategies/GPU/Common.h"
+-#include "iree/compiler/Codegen/TransformDialectStrategies/GPU/Strategies.h"
+ #include "llvm/ADT/STLExtras.h"
+ #include "llvm/Support/CommandLine.h"
+ #include "llvm/Support/Debug.h"

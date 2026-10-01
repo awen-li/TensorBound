@@ -1,0 +1,70 @@
+From e1f73b64dd24ef82b91e608d3f731e6148c4e6c2 Mon Sep 17 00:00:00 2001
+From: Benoit Jacob <benoitjacob@google.com>
+Date: Wed, 6 Jul 2022 19:05:56 +0000
+Subject: [PATCH 1/2] Fix shutdown deadlock
+
+The issue was that iree_task_poller_pump_until_exit only checked
+for IREE_TASK_POLLER_STATE_EXITING at the beginning of each loop
+iteration, then reset wake_event, then called
+iree_task_poller_commit_wait.
+
+Meanwhile, on the main thread, iree_task_poller_request_exit could
+change state to IREE_TASK_POLLER_STATE_EXITING and set wake_event.
+
+So in a race, iree_task_poller_pump_until_exit would reset the
+wake_event set by iree_task_poller_request_exit, and that would leave
+iree_task_poller_commit_wait waiting infinitely.
+
+Fixes #9723
+---
+ runtime/src/iree/task/poller.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/runtime/src/iree/task/poller.c b/runtime/src/iree/task/poller.c
+index ee6465b7fc22..68f98d490fd6 100644
+--- a/runtime/src/iree/task/poller.c
++++ b/runtime/src/iree/task/poller.c
+@@ -420,6 +420,12 @@ static void iree_task_poller_commit_wait(iree_task_poller_t* poller,
+                                          iree_time_t deadline_ns) {
+   IREE_TRACE_ZONE_BEGIN(z0);
+ 
++  if (iree_atomic_load_int32(&poller->state, iree_memory_order_seq_cst) ==
++      IREE_TASK_POLLER_STATE_EXITING) {
++    // Thread exit requested - don't block shutdown.
++    return;
++  }
++
+   // Enter the system wait API.
+   iree_wait_handle_t wake_handle = iree_wait_handle_immediate();
+   iree_status_t status =
+
+From e2eb9172c445f78eb309915c8fda85159c596c26 Mon Sep 17 00:00:00 2001
+From: Benoit Jacob <benoitjacob@google.com>
+Date: Wed, 6 Jul 2022 19:22:55 +0000
+Subject: [PATCH 2/2] review comment
+
+---
+ runtime/src/iree/task/poller.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/runtime/src/iree/task/poller.c b/runtime/src/iree/task/poller.c
+index 68f98d490fd6..12a38d95cec3 100644
+--- a/runtime/src/iree/task/poller.c
++++ b/runtime/src/iree/task/poller.c
+@@ -418,14 +418,14 @@ static void iree_task_poller_wake_task(iree_task_poller_t* poller,
+ // wait handles were resolved.
+ static void iree_task_poller_commit_wait(iree_task_poller_t* poller,
+                                          iree_time_t deadline_ns) {
+-  IREE_TRACE_ZONE_BEGIN(z0);
+-
+   if (iree_atomic_load_int32(&poller->state, iree_memory_order_seq_cst) ==
+       IREE_TASK_POLLER_STATE_EXITING) {
+     // Thread exit requested - don't block shutdown.
+     return;
+   }
+ 
++  IREE_TRACE_ZONE_BEGIN(z0);
++
+   // Enter the system wait API.
+   iree_wait_handle_t wake_handle = iree_wait_handle_immediate();
+   iree_status_t status =

@@ -1,0 +1,684 @@
+From 486baa57a975f59932357a3dc50a40dcea934ca4 Mon Sep 17 00:00:00 2001
+From: Zmicier Prybysh <zprybysh@baylibre.com>
+Date: Thu, 23 Jul 2026 18:04:57 +0200
+Subject: [PATCH 1/3] [Codegen] Use overflow-safe math in the CPU and GPU alloc
+ size checks
+
+`checkStackAllocationSize` accumulates the allocation size in a plain
+int64_t. Allocas sized by the upper bound of an unbounded dynamic
+dimension (the util.assume.int default, 2^53-1) overflow it, the
+wrapped value passes the limit check and the alloca reaches
+ConvertToLLVM, where its element count folds to llvm.mlir.poison and
+the program loads and stores through a garbage pointer at runtime.
+
+The reproduction was reduced from the quantized ResNet downsample
+construct: an ONNX model with a dynamic batch doing DequantizeLinear
+-> 1x1 stride-2 Conv compiles without diagnostics and returns
+completely wrong results.
+
+Move `getStaticShapeSizeInBits` to Codegen/Utils (taken from #24684)
+and use it from both LLVMCPUCheckIRBeforeLLVMConversion and
+GPUCheckResourceUsage. Callers supply the leaf element bit width,
+which lets the GPU check keep its index-bitwidth handling and the
+recursion into shaped element types. On the CPU side the remaining
+scalar steps are overflow-checked in place with `llvm::MulOverflow` /
+`llvm::AddOverflow`. The pre-existing `checkedAdd`/`checkedMul`/
+`checkedAlignTo` wrappers in LLVMCPUAssignWorkgroupLocalMemory.cpp
+are likewise replaced with `llvm::MulOverflow` / `llvm::AddOverflow`.
+
+Signed-off-by: Zmicier Prybysh <zprybysh@baylibre.com>
+---
+ .../Common/GPU/GPUCheckResourceUsage.cpp      | 49 ++++++++-----------
+ .../GPU/test/gpu_check_resource_usage.mlir    | 10 ++++
+ .../LLVMCPUAssignWorkgroupLocalMemory.cpp     | 44 +++++------------
+ .../LLVMCPUCheckIRBeforeLLVMConversion.cpp    | 37 +++++++++-----
+ .../test/check_ir_before_llvm_conversion.mlir |  8 +++
+ .../src/iree/compiler/Codegen/Utils/Utils.cpp | 26 ++++++++++
+ .../src/iree/compiler/Codegen/Utils/Utils.h   | 12 +++++
+ 7 files changed, 114 insertions(+), 72 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/Codegen/Common/GPU/GPUCheckResourceUsage.cpp b/compiler/src/iree/compiler/Codegen/Common/GPU/GPUCheckResourceUsage.cpp
+index 10836994c951..4f17d5d612bd 100644
+--- a/compiler/src/iree/compiler/Codegen/Common/GPU/GPUCheckResourceUsage.cpp
++++ b/compiler/src/iree/compiler/Codegen/Common/GPU/GPUCheckResourceUsage.cpp
+@@ -6,7 +6,9 @@
+ 
+ #include "iree/compiler/Codegen/Common/GPU/Passes.h"
+ #include "iree/compiler/Codegen/Utils/GPUUtils.h"
++#include "iree/compiler/Codegen/Utils/Utils.h"
+ #include "llvm/Support/CommandLine.h"
++#include "llvm/Support/MathExtras.h"
+ #include "mlir/Conversion/LLVMCommon/LoweringOptions.h"
+ #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+ #include "mlir/Interfaces/FunctionInterfaces.h"
+@@ -24,32 +26,6 @@ static unsigned getDatalayoutIndexBitwidth(mlir::FunctionOpInterface func) {
+   return options.getIndexBitwidth();
+ }
+ 
+-static int shapedTypeStaticSize(
+-    memref::AllocOp allocOp, ShapedType shapedType,
+-    std::function<unsigned(mlir::FunctionOpInterface)> getIndexBitwidth) {
+-  int allocSize = 1;
+-  for (auto dimSize : shapedType.getShape()) {
+-    if (ShapedType::isDynamic(dimSize)) {
+-      continue;
+-    }
+-    allocSize *= dimSize;
+-  }
+-  if (auto elementType = dyn_cast<ShapedType>(shapedType.getElementType())) {
+-    allocSize *= shapedTypeStaticSize(allocOp, elementType, getIndexBitwidth);
+-  } else {
+-    auto eltTy = shapedType.getElementType();
+-    if (eltTy.isIndex()) {
+-      auto func = allocOp->getParentOfType<mlir::FunctionOpInterface>();
+-      assert(getIndexBitwidth &&
+-             "getIndexBitwidth should have been set earlier");
+-      allocSize *= getIndexBitwidth(func);
+-    } else {
+-      allocSize *= IREE::Util::getTypeBitWidth(shapedType.getElementType());
+-    }
+-  }
+-  return allocSize;
+-}
+-
+ /// Returns success if the total shared memory allocation size is less than the
+ /// limit.
+ static LogicalResult checkGPUAllocationSize(
+@@ -65,7 +41,7 @@ static LogicalResult checkGPUAllocationSize(
+     return success();
+   }
+ 
+-  int cumSize = 0;
++  int64_t cumSize = 0;
+   for (auto allocOp : allocOps) {
+     auto allocType = cast<MemRefType>(allocOp.getType());
+     if (!hasSharedMemoryAddressSpace(allocType)) {
+@@ -77,7 +53,24 @@ static LogicalResult checkGPUAllocationSize(
+           "has unsupported dynamic shared memory allocations");
+     }
+ 
+-    int allocSize = shapedTypeStaticSize(allocOp, allocType, getIndexBitwidth);
++    auto func = allocOp->getParentOfType<mlir::FunctionOpInterface>();
++    FailureOr<int64_t> allocSizeBits =
++        getStaticShapeSizeInBits(allocType, [&](Type elementType) -> int64_t {
++          if (elementType.isIndex()) {
++            assert(getIndexBitwidth &&
++                   "getIndexBitwidth should have been set earlier");
++            return getIndexBitwidth(func);
++          }
++          return IREE::Util::getTypeBitWidth(elementType);
++        });
++    if (failed(allocSizeBits)) {
++      return emitError(funcOp->getLoc())
++             << "function '" << funcOp.getName()
++             << "' shared memory allocation size overflows the size "
++                "computation; exceeded the limit of "
++             << limit << " bytes";
++    }
++    int64_t allocSize = *allocSizeBits;
+     if (allocOp.getAlignment()) {
+       int64_t alignmentInBits = *allocOp.getAlignment() * 8;
+       allocSize =
+diff --git a/compiler/src/iree/compiler/Codegen/Common/GPU/test/gpu_check_resource_usage.mlir b/compiler/src/iree/compiler/Codegen/Common/GPU/test/gpu_check_resource_usage.mlir
+index f2d7804d7655..2b118a022cc3 100644
+--- a/compiler/src/iree/compiler/Codegen/Common/GPU/test/gpu_check_resource_usage.mlir
++++ b/compiler/src/iree/compiler/Codegen/Common/GPU/test/gpu_check_resource_usage.mlir
+@@ -29,3 +29,13 @@ module {
+     return
+   }
+ }
++
++// -----
++
++module {
++  // expected-error @+1 {{shared memory allocation size overflows the size computation}}
++  func.func @shared_mem_alloc_size_overflow() {
++    memref.alloc() : memref<9007199254740991x1024x14x14xf32, #gpu.address_space<workgroup>>
++    return
++  }
++}
+diff --git a/compiler/src/iree/compiler/Codegen/LLVMCPU/LLVMCPUAssignWorkgroupLocalMemory.cpp b/compiler/src/iree/compiler/Codegen/LLVMCPU/LLVMCPUAssignWorkgroupLocalMemory.cpp
+index d75b100a9372..70929efc78bd 100644
+--- a/compiler/src/iree/compiler/Codegen/LLVMCPU/LLVMCPUAssignWorkgroupLocalMemory.cpp
++++ b/compiler/src/iree/compiler/Codegen/LLVMCPU/LLVMCPUAssignWorkgroupLocalMemory.cpp
+@@ -49,32 +49,6 @@ static bool hasWorkgroupLocalMemorySpace(Type type) {
+                            memRefType.getMemorySpace());
+ }
+ 
+-static LogicalResult checkedAdd(int64_t lhs, int64_t rhs, int64_t &result) {
+-  if (llvm::AddOverflow(lhs, rhs, result)) {
+-    return failure();
+-  }
+-  return success();
+-}
+-
+-static LogicalResult checkedMul(int64_t lhs, int64_t rhs, int64_t &result) {
+-  if (llvm::MulOverflow(lhs, rhs, result)) {
+-    return failure();
+-  }
+-  return success();
+-}
+-
+-static LogicalResult checkedAlignTo(int64_t value, int64_t alignment,
+-                                    int64_t &result) {
+-  assert(value >= 0);
+-  assert(alignment > 0);
+-  int64_t remainder = value % alignment;
+-  if (remainder == 0) {
+-    result = value;
+-    return success();
+-  }
+-  return checkedAdd(value, alignment - remainder, result);
+-}
+-
+ static bool hasZeroElementShape(MemRefType type) {
+   return llvm::is_contained(type.getShape(), 0);
+ }
+@@ -115,15 +89,15 @@ computeStaticElementFootprint(memref::AllocOp allocOp) {
+   int64_t maxElementOffset = offset;
+   for (auto [dim, stride] : llvm::zip_equal(type.getShape(), strides)) {
+     int64_t contribution = 0;
+-    if (failed(checkedMul(dim - 1, stride, contribution)) ||
+-        failed(checkedAdd(maxElementOffset, contribution, maxElementOffset))) {
++    if (llvm::MulOverflow(dim - 1, stride, contribution) ||
++        llvm::AddOverflow(maxElementOffset, contribution, maxElementOffset)) {
+       allocOp.emitOpError("workgroup local memory allocation size overflow");
+       return failure();
+     }
+   }
+ 
+   int64_t footprint = 0;
+-  if (failed(checkedAdd(maxElementOffset, 1, footprint))) {
++  if (llvm::AddOverflow(maxElementOffset, int64_t(1), footprint)) {
+     allocOp.emitOpError("workgroup local memory allocation size overflow");
+     return failure();
+   }
+@@ -154,7 +128,7 @@ computeAllocationSize(memref::AllocOp allocOp) {
+   int64_t elementBytes = static_cast<int64_t>(elementByteSize.getFixedValue());
+ 
+   int64_t totalBytes = 0;
+-  if (failed(checkedMul(*elementFootprint, elementBytes, totalBytes))) {
++  if (llvm::MulOverflow(*elementFootprint, elementBytes, totalBytes)) {
+     allocOp.emitOpError("workgroup local memory allocation size overflow");
+     return failure();
+   }
+@@ -281,7 +255,11 @@ void LLVMCPUAssignWorkgroupLocalMemoryPass::runOnOperation() {
+     if (failed(alignment)) {
+       return signalPassFailure();
+     }
+-    if (failed(checkedAlignTo(currentOffset, *alignment, currentOffset))) {
++    assert(currentOffset >= 0 && *alignment > 0);
++    int64_t misalignment = currentOffset % *alignment;
++    if (misalignment != 0 &&
++        llvm::AddOverflow(currentOffset, *alignment - misalignment,
++                          currentOffset)) {
+       allocOp.emitOpError("workgroup local memory allocation size overflow");
+       return signalPassFailure();
+     }
+@@ -291,8 +269,8 @@ void LLVMCPUAssignWorkgroupLocalMemoryPass::runOnOperation() {
+         /*elementFootprint=*/allocationSize->elementFootprint,
+     });
+ 
+-    if (failed(checkedAdd(currentOffset, allocationSize->byteSize,
+-                          currentOffset))) {
++    if (llvm::AddOverflow(currentOffset, allocationSize->byteSize,
++                          currentOffset)) {
+       allocOp.emitOpError("workgroup local memory allocation size overflow");
+       return signalPassFailure();
+     }
+diff --git a/compiler/src/iree/compiler/Codegen/LLVMCPU/LLVMCPUCheckIRBeforeLLVMConversion.cpp b/compiler/src/iree/compiler/Codegen/LLVMCPU/LLVMCPUCheckIRBeforeLLVMConversion.cpp
+index a06f5077ea94..d8be46100d7d 100644
+--- a/compiler/src/iree/compiler/Codegen/LLVMCPU/LLVMCPUCheckIRBeforeLLVMConversion.cpp
++++ b/compiler/src/iree/compiler/Codegen/LLVMCPU/LLVMCPUCheckIRBeforeLLVMConversion.cpp
+@@ -8,6 +8,7 @@
+ #include "iree/compiler/Codegen/LLVMCPU/Utils.h"
+ #include "iree/compiler/Codegen/Utils/Utils.h"
+ #include "llvm/Support/CommandLine.h"
++#include "llvm/Support/MathExtras.h"
+ #include "mlir/Dialect/MemRef/IR/MemRef.h"
+ #include "mlir/Dialect/Vector/IR/ScalableValueBoundsConstraintSet.h"
+ #include "mlir/Interfaces/ValueBoundsOpInterface.h"
+@@ -71,14 +72,20 @@ checkStackAllocationSize(mlir::FunctionOpInterface funcOp) {
+           "all stack allocations need to be hoisted to the entry block of the "
+           "function");
+     }
+-    int64_t allocaSize = 1;
++    auto emitOverflowError = [&]() {
++      return allocaOp->emitOpError(
++          "stack allocation size overflows 64 bits; the allocation is "
++          "unbounded in practice and cannot live on the stack");
++    };
+     auto allocaType = cast<ShapedType>(allocaOp.getType());
+-    for (auto dimSize : allocaType.getShape()) {
+-      if (ShapedType::isDynamic(dimSize)) {
+-        continue;
+-      }
+-      allocaSize *= dimSize;
++    FailureOr<int64_t> staticSizeBits =
++        getStaticShapeSizeInBits(allocaType, [](Type elementType) -> int64_t {
++          return IREE::Util::getTypeBitWidth(elementType);
++        });
++    if (failed(staticSizeBits)) {
++      return emitOverflowError();
+     }
++    int64_t allocaSize = *staticSizeBits;
+     for (auto operand : allocaOp.getDynamicSizes()) {
+       // Assume vscale is `clAssumedVscaleValue` for determining if the alloca
+       // is within the stack limit. This should always resolve to a constant
+@@ -90,18 +97,26 @@ checkStackAllocationSize(mlir::FunctionOpInterface funcOp) {
+           /*vscaleMin=*/assumedVscale,
+           /*vscaleMax=*/assumedVscale, presburger::BoundType::UB);
+       if (succeeded(ub)) {
+-        allocaSize *= ub->getSize()->baseSize;
++        if (llvm::MulOverflow(allocaSize,
++                              static_cast<int64_t>(ub->getSize()->baseSize),
++                              allocaSize)) {
++          return emitOverflowError();
++        }
+         continue;
+       }
+       return allocaOp.emitOpError("expected no unbounded stack allocations");
+     }
+-    allocaSize *= IREE::Util::getTypeBitWidth(allocaType.getElementType());
+     if (allocaOp.getAlignment()) {
+       int64_t alignmentInBits = *allocaOp.getAlignment() * 8;
+-      allocaSize =
+-          (llvm::divideCeil(allocaSize, alignmentInBits) * alignmentInBits);
++      int64_t alignedUnits = llvm::divideCeil(allocaSize, alignmentInBits);
++      if (llvm::MulOverflow(alignedUnits, alignmentInBits, allocaSize)) {
++        return emitOverflowError();
++      }
++    }
++    if (llvm::AddOverflow(cumSize, allocaSize / 8, cumSize)) {
++      return allocaOp->emitOpError(
++          "cumulative stack allocation size overflows 64 bits");
+     }
+-    cumSize += allocaSize / 8;
+   }
+   if (cumSize > maxAllocationSizeInBytes) {
+     return funcOp.emitOpError("exceeded stack allocation limit of ")
+diff --git a/compiler/src/iree/compiler/Codegen/LLVMCPU/test/check_ir_before_llvm_conversion.mlir b/compiler/src/iree/compiler/Codegen/LLVMCPU/test/check_ir_before_llvm_conversion.mlir
+index 5d52002fd49b..c1ae4d1d9825 100644
+--- a/compiler/src/iree/compiler/Codegen/LLVMCPU/test/check_ir_before_llvm_conversion.mlir
++++ b/compiler/src/iree/compiler/Codegen/LLVMCPU/test/check_ir_before_llvm_conversion.mlir
+@@ -36,6 +36,14 @@ func.func @mix_static_and_dynamic_allocas(%arg0: index) {
+ 
+ // -----
+ 
++func.func @overflowing_static_alloca() {
++  // expected-error @+1 {{stack allocation size overflows 64 bits}}
++  %0 = memref.alloca() {alignment = 64 : i64} : memref<9007199254740991x1024x14x14xf32>
++  return
++}
++
++// -----
++
+ func.func @non_entry_bb_allocas() {
+   cf.br ^bb1
+  ^bb1() :
+diff --git a/compiler/src/iree/compiler/Codegen/Utils/Utils.cpp b/compiler/src/iree/compiler/Codegen/Utils/Utils.cpp
+index 1e30292795a0..1652f2e32e5c 100644
+--- a/compiler/src/iree/compiler/Codegen/Utils/Utils.cpp
++++ b/compiler/src/iree/compiler/Codegen/Utils/Utils.cpp
+@@ -22,6 +22,7 @@
+ #include "llvm/ADT/TypeSwitch.h"
+ #include "llvm/Support/Casting.h"
+ #include "llvm/Support/DebugLog.h"
++#include "llvm/Support/MathExtras.h"
+ #include "mlir/Analysis/DataFlow/IntegerRangeAnalysis.h"
+ #include "mlir/Analysis/DataFlowFramework.h"
+ #include "mlir/Analysis/SliceAnalysis.h"
+@@ -94,6 +95,31 @@ bool isEntryPoint(mlir::FunctionOpInterface func) {
+   return func.isPublic() && getEntryPoint(func);
+ }
+ 
++FailureOr<int64_t>
++getStaticShapeSizeInBits(ShapedType shapedType,
++                         llvm::function_ref<int64_t(Type)> getElementBitWidth) {
++  int64_t size = 1;
++  for (int64_t dimSize : shapedType.getShape()) {
++    if (ShapedType::isDynamic(dimSize)) {
++      continue;
++    }
++    if (llvm::MulOverflow(size, dimSize, size)) {
++      return failure();
++    }
++  }
++  Type elementType = shapedType.getElementType();
++  if (auto shapedElementType = dyn_cast<ShapedType>(elementType)) {
++    FailureOr<int64_t> elementBits =
++        getStaticShapeSizeInBits(shapedElementType, getElementBitWidth);
++    if (failed(elementBits) || llvm::MulOverflow(size, *elementBits, size)) {
++      return failure();
++    }
++  } else if (llvm::MulOverflow(size, getElementBitWidth(elementType), size)) {
++    return failure();
++  }
++  return size;
++}
++
+ std::optional<StringRef> getConfigCpuFeatures(DictionaryAttr targetConfig) {
+   auto attr = targetConfig.getAs<StringAttr>(kCpuFeaturesAttrName);
+   if (attr) {
+diff --git a/compiler/src/iree/compiler/Codegen/Utils/Utils.h b/compiler/src/iree/compiler/Codegen/Utils/Utils.h
+index a6a32f17aa74..782cee2331f6 100644
+--- a/compiler/src/iree/compiler/Codegen/Utils/Utils.h
++++ b/compiler/src/iree/compiler/Codegen/Utils/Utils.h
+@@ -46,6 +46,18 @@ bool isEntryPoint(mlir::FunctionOpInterface func);
+ std::optional<IREE::HAL::ExecutableExportOp>
+ getEntryPoint(mlir::FunctionOpInterface funcOp);
+ 
++/// Returns the static size in bits of `shapedType` -- the product of its
++/// static extents and the element size -- accumulated with 64-bit overflow
++/// checking. Dynamic dimensions are skipped; callers apply their own policy
++/// for those. `getElementBitWidth` returns the bit width of a leaf
++/// (non-shaped) element type, letting callers control e.g. the target's
++/// index-type width. Returns failure on integer overflow: such an allocation
++/// necessarily exceeds any real resource limit, so callers should treat
++/// failure as "over the limit".
++FailureOr<int64_t>
++getStaticShapeSizeInBits(ShapedType shapedType,
++                         llvm::function_ref<int64_t(Type)> getElementBitWidth);
++
+ /// Returns the dispatch_config op for the `funcOp` by looking up the parent
+ /// module for a matching function_ref. Returns nullptr if not found.
+ IREE::Codegen::DispatchConfigOp
+
+From 00fbc6b6c83deee796f00d2b71676a452c07818a Mon Sep 17 00:00:00 2001
+From: Zmicier Prybysh <zprybysh@baylibre.com>
+Date: Thu, 27 Aug 2026 17:06:36 +0200
+Subject: [PATCH 2/3] Address review comments on the alloc size checks
+
+- GPUCheckResourceUsage: refactor, add overflow check for the alignment
+  round-up and the accumulation + add tests for corner cases.
+- LLVMCPUCheckIRBeforeLLVMConversion: refactor, remove the "unbouned in
+  practice" message, add more tests for corner cases.
+
+Signed-off-by: Zmicier Prybysh <zprybysh@baylibre.com>
+---
+ .../Common/GPU/GPUCheckResourceUsage.cpp      | 30 ++++----
+ .../GPU/test/gpu_check_resource_usage.mlir    | 70 ++++++++++++++++++-
+ .../LLVMCPUCheckIRBeforeLLVMConversion.cpp    | 17 ++---
+ .../test/check_ir_before_llvm_conversion.mlir | 44 +++++++++++-
+ 4 files changed, 135 insertions(+), 26 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/Codegen/Common/GPU/GPUCheckResourceUsage.cpp b/compiler/src/iree/compiler/Codegen/Common/GPU/GPUCheckResourceUsage.cpp
+index 4f17d5d612bd..153c09318c33 100644
+--- a/compiler/src/iree/compiler/Codegen/Common/GPU/GPUCheckResourceUsage.cpp
++++ b/compiler/src/iree/compiler/Codegen/Common/GPU/GPUCheckResourceUsage.cpp
+@@ -53,30 +53,32 @@ static LogicalResult checkGPUAllocationSize(
+           "has unsupported dynamic shared memory allocations");
+     }
+ 
+-    auto func = allocOp->getParentOfType<mlir::FunctionOpInterface>();
+-    FailureOr<int64_t> allocSizeBits =
+-        getStaticShapeSizeInBits(allocType, [&](Type elementType) -> int64_t {
++    FailureOr<int64_t> allocSizeBits = getStaticShapeSizeInBits(
++        allocType, [funcOp, getIndexBitwidth](Type elementType) -> int64_t {
+           if (elementType.isIndex()) {
+-            assert(getIndexBitwidth &&
+-                   "getIndexBitwidth should have been set earlier");
+-            return getIndexBitwidth(func);
++            assert(getIndexBitwidth && "getIndexBitwidth must not be null");
++            return getIndexBitwidth(funcOp);
+           }
+           return IREE::Util::getTypeBitWidth(elementType);
+         });
+     if (failed(allocSizeBits)) {
+-      return emitError(funcOp->getLoc())
+-             << "function '" << funcOp.getName()
+-             << "' shared memory allocation size overflows the size "
+-                "computation; exceeded the limit of "
+-             << limit << " bytes";
++      return allocOp.emitOpError(
++          "shared memory allocation size overflows 64 bits");
+     }
+     int64_t allocSize = *allocSizeBits;
+     if (allocOp.getAlignment()) {
+       int64_t alignmentInBits = *allocOp.getAlignment() * 8;
+-      allocSize =
+-          (llvm::divideCeil(allocSize, alignmentInBits) * alignmentInBits);
++      int64_t alignedUnits = llvm::divideCeil(allocSize, alignmentInBits);
++      if (llvm::MulOverflow(alignedUnits, alignmentInBits, allocSize)) {
++        return allocOp.emitOpError(
++            "shared memory allocation size overflows 64 bits");
++      }
++    }
++    int64_t allocSizeBytes = llvm::divideCeil(allocSize, 8);
++    if (llvm::AddOverflow(cumSize, allocSizeBytes, cumSize)) {
++      return allocOp.emitOpError(
++          "cumulative shared memory allocation size overflows 64 bits");
+     }
+-    cumSize += allocSize / 8;
+   }
+   if (cumSize > limit) {
+     return emitError(funcOp->getLoc())
+diff --git a/compiler/src/iree/compiler/Codegen/Common/GPU/test/gpu_check_resource_usage.mlir b/compiler/src/iree/compiler/Codegen/Common/GPU/test/gpu_check_resource_usage.mlir
+index 2b118a022cc3..bad97db2ece8 100644
+--- a/compiler/src/iree/compiler/Codegen/Common/GPU/test/gpu_check_resource_usage.mlir
++++ b/compiler/src/iree/compiler/Codegen/Common/GPU/test/gpu_check_resource_usage.mlir
+@@ -33,9 +33,77 @@ module {
+ // -----
+ 
+ module {
+-  // expected-error @+1 {{shared memory allocation size overflows the size computation}}
++  // expected-error @+1 {{uses 65600 bytes of shared memory; exceeded the limit of 65536 bytes}}
++  func.func @shared_mem_alloc_nested_shaped_element() {
++    memref.alloc() : memref<1025xvector<16xf32>, #gpu.address_space<workgroup>>
++    return
++  }
++}
++
++// -----
++
++module {
++  // expected-error @+1 {{uses 65537 bytes of shared memory; exceeded the limit of 65536 bytes}}
++  func.func @shared_mem_alloc_sub_byte_rounds_up() {
++    memref.alloc() : memref<524289xi1, #gpu.address_space<workgroup>>
++    return
++  }
++}
++
++// -----
++
++module {
+   func.func @shared_mem_alloc_size_overflow() {
++    // expected-error @+1 {{shared memory allocation size overflows 64 bits}}
+     memref.alloc() : memref<9007199254740991x1024x14x14xf32, #gpu.address_space<workgroup>>
+     return
+   }
+ }
++
++// -----
++
++module {
++  func.func @shared_mem_alloc_index_overflow() {
++    // expected-error @+1 {{shared memory allocation size overflows 64 bits}}
++    memref.alloc() : memref<144115188075855872xindex, #gpu.address_space<workgroup>>
++    return
++  }
++}
++
++// -----
++
++module {
++  func.func @shared_mem_alloc_nested_shaped_element_overflow() {
++    // expected-error @+1 {{shared memory allocation size overflows 64 bits}}
++    memref.alloc() : memref<9007199254740991xvector<1024x14x14xf32>, #gpu.address_space<workgroup>>
++    return
++  }
++}
++
++// -----
++
++module {
++  func.func @shared_mem_alloc_alignment_overflow() {
++    // expected-error @+1 {{shared memory allocation size overflows 64 bits}}
++    memref.alloc() {alignment = 64 : i64} : memref<1152921504606846975xi8, #gpu.address_space<workgroup>>
++    return
++  }
++}
++
++// -----
++
++module {
++  func.func @shared_mem_alloc_cumulative_overflow() {
++    memref.alloc() : memref<1152921504606846975xi8, #gpu.address_space<workgroup>>
++    memref.alloc() : memref<1152921504606846975xi8, #gpu.address_space<workgroup>>
++    memref.alloc() : memref<1152921504606846975xi8, #gpu.address_space<workgroup>>
++    memref.alloc() : memref<1152921504606846975xi8, #gpu.address_space<workgroup>>
++    memref.alloc() : memref<1152921504606846975xi8, #gpu.address_space<workgroup>>
++    memref.alloc() : memref<1152921504606846975xi8, #gpu.address_space<workgroup>>
++    memref.alloc() : memref<1152921504606846975xi8, #gpu.address_space<workgroup>>
++    memref.alloc() : memref<1152921504606846975xi8, #gpu.address_space<workgroup>>
++    // expected-error @+1 {{cumulative shared memory allocation size overflows 64 bits}}
++    memref.alloc() : memref<1152921504606846975xi8, #gpu.address_space<workgroup>>
++    return
++  }
++}
+diff --git a/compiler/src/iree/compiler/Codegen/LLVMCPU/LLVMCPUCheckIRBeforeLLVMConversion.cpp b/compiler/src/iree/compiler/Codegen/LLVMCPU/LLVMCPUCheckIRBeforeLLVMConversion.cpp
+index d8be46100d7d..024ac596f610 100644
+--- a/compiler/src/iree/compiler/Codegen/LLVMCPU/LLVMCPUCheckIRBeforeLLVMConversion.cpp
++++ b/compiler/src/iree/compiler/Codegen/LLVMCPU/LLVMCPUCheckIRBeforeLLVMConversion.cpp
+@@ -72,18 +72,13 @@ checkStackAllocationSize(mlir::FunctionOpInterface funcOp) {
+           "all stack allocations need to be hoisted to the entry block of the "
+           "function");
+     }
+-    auto emitOverflowError = [&]() {
+-      return allocaOp->emitOpError(
+-          "stack allocation size overflows 64 bits; the allocation is "
+-          "unbounded in practice and cannot live on the stack");
+-    };
+     auto allocaType = cast<ShapedType>(allocaOp.getType());
+     FailureOr<int64_t> staticSizeBits =
+         getStaticShapeSizeInBits(allocaType, [](Type elementType) -> int64_t {
+           return IREE::Util::getTypeBitWidth(elementType);
+         });
+     if (failed(staticSizeBits)) {
+-      return emitOverflowError();
++      return allocaOp.emitOpError("stack allocation size overflows 64 bits");
+     }
+     int64_t allocaSize = *staticSizeBits;
+     for (auto operand : allocaOp.getDynamicSizes()) {
+@@ -100,7 +95,8 @@ checkStackAllocationSize(mlir::FunctionOpInterface funcOp) {
+         if (llvm::MulOverflow(allocaSize,
+                               static_cast<int64_t>(ub->getSize()->baseSize),
+                               allocaSize)) {
+-          return emitOverflowError();
++          return allocaOp.emitOpError(
++              "stack allocation size overflows 64 bits");
+         }
+         continue;
+       }
+@@ -110,11 +106,12 @@ checkStackAllocationSize(mlir::FunctionOpInterface funcOp) {
+       int64_t alignmentInBits = *allocaOp.getAlignment() * 8;
+       int64_t alignedUnits = llvm::divideCeil(allocaSize, alignmentInBits);
+       if (llvm::MulOverflow(alignedUnits, alignmentInBits, allocaSize)) {
+-        return emitOverflowError();
++        return allocaOp.emitOpError("stack allocation size overflows 64 bits");
+       }
+     }
+-    if (llvm::AddOverflow(cumSize, allocaSize / 8, cumSize)) {
+-      return allocaOp->emitOpError(
++    int64_t allocaSizeBytes = llvm::divideCeil(allocaSize, 8);
++    if (llvm::AddOverflow(cumSize, allocaSizeBytes, cumSize)) {
++      return allocaOp.emitOpError(
+           "cumulative stack allocation size overflows 64 bits");
+     }
+   }
+diff --git a/compiler/src/iree/compiler/Codegen/LLVMCPU/test/check_ir_before_llvm_conversion.mlir b/compiler/src/iree/compiler/Codegen/LLVMCPU/test/check_ir_before_llvm_conversion.mlir
+index c1ae4d1d9825..8e53f7e005f1 100644
+--- a/compiler/src/iree/compiler/Codegen/LLVMCPU/test/check_ir_before_llvm_conversion.mlir
++++ b/compiler/src/iree/compiler/Codegen/LLVMCPU/test/check_ir_before_llvm_conversion.mlir
+@@ -36,9 +36,51 @@ func.func @mix_static_and_dynamic_allocas(%arg0: index) {
+ 
+ // -----
+ 
++// expected-error @+1 {{exceeded stack allocation limit of 32768 bytes for function. Got 32769 bytes}}
++func.func @sub_byte_alloca_rounds_up() {
++  %0 = memref.alloca() : memref<262145xi1>
++  return
++}
++
++// -----
++
+ func.func @overflowing_static_alloca() {
+   // expected-error @+1 {{stack allocation size overflows 64 bits}}
+-  %0 = memref.alloca() {alignment = 64 : i64} : memref<9007199254740991x1024x14x14xf32>
++  %0 = memref.alloca() : memref<9007199254740991x1024x14x14xf32>
++  return
++}
++
++// -----
++
++func.func @overflowing_dynamic_alloca(%arg0: index) {
++  %0 = util.assume.int %arg0<umin = 0, umax = 9007199254740991> : index
++  // expected-error @+1 {{stack allocation size overflows 64 bits}}
++  %1 = memref.alloca(%0) : memref<?x1024x14x14xf32>
++  return
++}
++
++// -----
++
++// 9 x (2^63-8 bits = 2^60-1 bytes) > 2^63-1 bytes
++func.func @cumulative_overflowing_allocas() {
++  %0 = memref.alloca() : memref<1152921504606846975xi8>
++  %1 = memref.alloca() : memref<1152921504606846975xi8>
++  %2 = memref.alloca() : memref<1152921504606846975xi8>
++  %3 = memref.alloca() : memref<1152921504606846975xi8>
++  %4 = memref.alloca() : memref<1152921504606846975xi8>
++  %5 = memref.alloca() : memref<1152921504606846975xi8>
++  %6 = memref.alloca() : memref<1152921504606846975xi8>
++  %7 = memref.alloca() : memref<1152921504606846975xi8>
++  // expected-error @+1 {{cumulative stack allocation size overflows 64 bits}}
++  %8 = memref.alloca() : memref<1152921504606846975xi8>
++  return
++}
++
++// -----
++
++func.func @overflowing_aligned_alloca() {
++  // expected-error @+1 {{stack allocation size overflows 64 bits}}
++  %0 = memref.alloca() {alignment = 64 : i64} : memref<1152921504606846975xi8>
+   return
+ }
+ 
+
+From 5ed467214c422373a4d2aaa8422d11825a639896 Mon Sep 17 00:00:00 2001
+From: Zmicier Prybysh <zprybysh@baylibre.com>
+Date: Fri, 4 Sep 2026 11:13:32 +0200
+Subject: [PATCH 3/3] Use the alignment clause syntax for memref.alloc/alloca
+ in tests
+
+Signed-off-by: Zmicier Prybysh <zprybysh@baylibre.com>
+---
+ .../Codegen/Common/GPU/test/gpu_check_resource_usage.mlir       | 2 +-
+ .../Codegen/LLVMCPU/test/check_ir_before_llvm_conversion.mlir   | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/compiler/src/iree/compiler/Codegen/Common/GPU/test/gpu_check_resource_usage.mlir b/compiler/src/iree/compiler/Codegen/Common/GPU/test/gpu_check_resource_usage.mlir
+index bad97db2ece8..ffb8b15ce483 100644
+--- a/compiler/src/iree/compiler/Codegen/Common/GPU/test/gpu_check_resource_usage.mlir
++++ b/compiler/src/iree/compiler/Codegen/Common/GPU/test/gpu_check_resource_usage.mlir
+@@ -85,7 +85,7 @@ module {
+ module {
+   func.func @shared_mem_alloc_alignment_overflow() {
+     // expected-error @+1 {{shared memory allocation size overflows 64 bits}}
+-    memref.alloc() {alignment = 64 : i64} : memref<1152921504606846975xi8, #gpu.address_space<workgroup>>
++    memref.alloc() alignment = 64 : memref<1152921504606846975xi8, #gpu.address_space<workgroup>>
+     return
+   }
+ }
+diff --git a/compiler/src/iree/compiler/Codegen/LLVMCPU/test/check_ir_before_llvm_conversion.mlir b/compiler/src/iree/compiler/Codegen/LLVMCPU/test/check_ir_before_llvm_conversion.mlir
+index 8e53f7e005f1..fb9e014c730f 100644
+--- a/compiler/src/iree/compiler/Codegen/LLVMCPU/test/check_ir_before_llvm_conversion.mlir
++++ b/compiler/src/iree/compiler/Codegen/LLVMCPU/test/check_ir_before_llvm_conversion.mlir
+@@ -80,7 +80,7 @@ func.func @cumulative_overflowing_allocas() {
+ 
+ func.func @overflowing_aligned_alloca() {
+   // expected-error @+1 {{stack allocation size overflows 64 bits}}
+-  %0 = memref.alloca() {alignment = 64 : i64} : memref<1152921504606846975xi8>
++  %0 = memref.alloca() alignment = 64 : memref<1152921504606846975xi8>
+   return
+ }
+ 

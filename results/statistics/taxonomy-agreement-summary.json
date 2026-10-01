@@ -1,0 +1,86 @@
+{
+  "fields": {
+    "failure_mode": {
+      "agreements": 112,
+      "cohens_kappa": 0.6956665746618824,
+      "disagreements": 37,
+      "largest_disagreement_pairs": {
+        "incorrect mapping or translation | lost or omitted relation": 6,
+        "incorrect mapping or translation | unsound assumption or inference": 8,
+        "lost or omitted relation | omitted operation": 3,
+        "lost or omitted relation | premature or unordered transition": 1,
+        "lost or omitted relation | unsound assumption or inference": 4,
+        "missing eligibility check | unsound assumption or inference": 6,
+        "missing ordering or enforcement | premature or unordered transition": 2,
+        "premature or unordered transition | unsound assumption or inference": 4
+      },
+      "raw_agreement": 0.7516778523489933
+    },
+    "obligation_family": {
+      "agreements": 123,
+      "cohens_kappa": 0.8098463652873902,
+      "disagreements": 26,
+      "largest_disagreement_pairs": {
+        "completion and progress | happens-before ordering": 2,
+        "happens-before ordering | transformation equivalence": 2,
+        "identity correspondence | index and offset preservation": 5,
+        "identity correspondence | placement and context consistency": 1,
+        "identity correspondence | resource and capability agreement": 1,
+        "identity correspondence | transformation equivalence": 2,
+        "index and offset preservation | transformation equivalence": 1,
+        "representation fidelity | transformation equivalence": 4
+      },
+      "raw_agreement": 0.825503355704698
+    },
+    "relation_family": {
+      "agreements": 133,
+      "cohens_kappa": 0.8734271303424477,
+      "disagreements": 16,
+      "largest_disagreement_pairs": {
+        "logical value--storage content | operation--execution context": 1,
+        "operation--completion | operation--execution context": 1,
+        "operation--completion | storage--ownership/lifetime": 1,
+        "operation--completion | value--shared storage": 3,
+        "operation--execution context | value--operation/identity": 1,
+        "storage--ownership/lifetime | value--operation/identity": 1,
+        "storage--ownership/lifetime | value--shared storage": 2,
+        "value--operation/identity | value--storage/layout": 2
+      },
+      "raw_agreement": 0.8926174496644296
+    },
+    "repair_strategy": {
+      "agreements": 119,
+      "cohens_kappa": 0.7459216733928267,
+      "disagreements": 30,
+      "largest_disagreement_pairs": {
+        "constrain unsafe transformation | correct mapping or representation": 2,
+        "constrain unsafe transformation | preserve or propagate relation": 3,
+        "constrain unsafe transformation | restore ordering or synchronization": 2,
+        "constrain unsafe transformation | strengthen eligibility check": 4,
+        "correct mapping or representation | preserve or propagate relation": 10,
+        "correct mapping or representation | strengthen eligibility check": 2,
+        "perform omitted operation | preserve or propagate relation": 2,
+        "preserve or propagate relation | strengthen eligibility check": 2
+      },
+      "raw_agreement": 0.7986577181208053
+    },
+    "transition_family": {
+      "agreements": 129,
+      "cohens_kappa": 0.8372296263928337,
+      "disagreements": 20,
+      "largest_disagreement_pairs": {
+        "identity or index remapping | ownership or lifetime change": 2,
+        "identity or index remapping | placement or context change": 2,
+        "identity or index remapping | representation or layout change": 4,
+        "initialization or content update | representation or layout change": 1,
+        "ordering or completion handoff | ownership or lifetime change": 1,
+        "ordering or completion handoff | placement or context change": 1,
+        "ownership or lifetime change | storage, alias, or mutation change": 2,
+        "placement or context change | representation or layout change": 1
+      },
+      "raw_agreement": 0.8657718120805369
+    }
+  },
+  "schema_version": "1.0.0",
+  "units": 149
+}

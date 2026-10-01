@@ -1,0 +1,34 @@
+From b0adcaf3529363509dcdf3f680b31f874803e27b Mon Sep 17 00:00:00 2001
+From: Ben Vanik <ben.vanik@gmail.com>
+Date: Wed, 6 May 2020 10:31:47 -0700
+Subject: [PATCH] Use proper register masks during register allocation.
+
+This was missed during the uint8->uint16 register space expansion. I blame beer. By masking incorrectly the allocator was releasing the wrong registers and allowing for their reuse even while the value they were backing was still alive. This issue would only kick in with functions with more than 3F live ref values (though int registers would suffer the same issues, just much harder to track down because we don't have a nice type checker error like we do with refs).
+
+Fixes #1620.
+Fixes #1660.
+
+Closes https://github.com/google/iree/pull/1807
+
+COPYBARA_INTEGRATE_REVIEW=https://github.com/google/iree/pull/1807 from google:benvanik-simple-reg-alloc b893d40e7db57b18a69a78e67fbf26f77a1ffab1
+PiperOrigin-RevId: 310179955
+---
+ iree/compiler/Dialect/VM/Analysis/RegisterAllocation.cpp | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/iree/compiler/Dialect/VM/Analysis/RegisterAllocation.cpp b/iree/compiler/Dialect/VM/Analysis/RegisterAllocation.cpp
+index a3aca137a492..4504457918ea 100644
+--- a/iree/compiler/Dialect/VM/Analysis/RegisterAllocation.cpp
++++ b/iree/compiler/Dialect/VM/Analysis/RegisterAllocation.cpp
+@@ -149,9 +149,9 @@ struct RegisterUsage {
+ 
+   void releaseRegister(uint16_t reg) {
+     if (isRefRegister(reg)) {
+-      refRegisters.reset(reg & 0x3F);
++      refRegisters.reset(reg & kRefRegisterCount);
+     } else {
+-      intRegisters.reset(reg & 0x7F);
++      intRegisters.reset(reg & kIntRegisterCount);
+     }
+   }
+ };

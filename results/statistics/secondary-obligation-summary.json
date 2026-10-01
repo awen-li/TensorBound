@@ -1,0 +1,231 @@
+{
+  "binary_label_decisions": 2235,
+  "cause_units": 149,
+  "causes_with_consensus_secondary": 68,
+  "cohens_kappa": 0.5665008960921075,
+  "consensus_secondary_labels": 72,
+  "exact_set_agreements": 73,
+  "label_vocabulary": [
+    "alias independence",
+    "completion and progress",
+    "happens-before ordering",
+    "identity correspondence",
+    "index and offset preservation",
+    "initialization before publication",
+    "layout compatibility",
+    "ownership and lifetime",
+    "placement and context consistency",
+    "policy and configuration propagation",
+    "range and alignment safety",
+    "representation fidelity",
+    "resource and capability agreement",
+    "transformation equivalence",
+    "value semantics preservation"
+  ],
+  "pair_counts": {
+    "absent|absent": 2063,
+    "absent|present": 50,
+    "present|absent": 50,
+    "present|present": 72
+  },
+  "primary_secondary_pairs": [
+    {
+      "count": 7,
+      "primary": "layout compatibility",
+      "secondary": "index and offset preservation"
+    },
+    {
+      "count": 6,
+      "primary": "happens-before ordering",
+      "secondary": "completion and progress"
+    },
+    {
+      "count": 5,
+      "primary": "index and offset preservation",
+      "secondary": "layout compatibility"
+    },
+    {
+      "count": 4,
+      "primary": "completion and progress",
+      "secondary": "happens-before ordering"
+    },
+    {
+      "count": 4,
+      "primary": "happens-before ordering",
+      "secondary": "alias independence"
+    },
+    {
+      "count": 4,
+      "primary": "placement and context consistency",
+      "secondary": "identity correspondence"
+    },
+    {
+      "count": 3,
+      "primary": "index and offset preservation",
+      "secondary": "identity correspondence"
+    },
+    {
+      "count": 3,
+      "primary": "ownership and lifetime",
+      "secondary": "happens-before ordering"
+    },
+    {
+      "count": 2,
+      "primary": "alias independence",
+      "secondary": "value semantics preservation"
+    },
+    {
+      "count": 2,
+      "primary": "happens-before ordering",
+      "secondary": "transformation equivalence"
+    },
+    {
+      "count": 2,
+      "primary": "ownership and lifetime",
+      "secondary": "completion and progress"
+    },
+    {
+      "count": 2,
+      "primary": "policy and configuration propagation",
+      "secondary": "representation fidelity"
+    },
+    {
+      "count": 2,
+      "primary": "range and alignment safety",
+      "secondary": "layout compatibility"
+    },
+    {
+      "count": 1,
+      "primary": "alias independence",
+      "secondary": "identity correspondence"
+    },
+    {
+      "count": 1,
+      "primary": "alias independence",
+      "secondary": "layout compatibility"
+    },
+    {
+      "count": 1,
+      "primary": "alias independence",
+      "secondary": "ownership and lifetime"
+    },
+    {
+      "count": 1,
+      "primary": "alias independence",
+      "secondary": "transformation equivalence"
+    },
+    {
+      "count": 1,
+      "primary": "completion and progress",
+      "secondary": "ownership and lifetime"
+    },
+    {
+      "count": 1,
+      "primary": "happens-before ordering",
+      "secondary": "identity correspondence"
+    },
+    {
+      "count": 1,
+      "primary": "happens-before ordering",
+      "secondary": "initialization before publication"
+    },
+    {
+      "count": 1,
+      "primary": "happens-before ordering",
+      "secondary": "ownership and lifetime"
+    },
+    {
+      "count": 1,
+      "primary": "identity correspondence",
+      "secondary": "index and offset preservation"
+    },
+    {
+      "count": 1,
+      "primary": "identity correspondence",
+      "secondary": "ownership and lifetime"
+    },
+    {
+      "count": 1,
+      "primary": "index and offset preservation",
+      "secondary": "representation fidelity"
+    },
+    {
+      "count": 1,
+      "primary": "initialization before publication",
+      "secondary": "resource and capability agreement"
+    },
+    {
+      "count": 1,
+      "primary": "layout compatibility",
+      "secondary": "alias independence"
+    },
+    {
+      "count": 1,
+      "primary": "layout compatibility",
+      "secondary": "placement and context consistency"
+    },
+    {
+      "count": 1,
+      "primary": "ownership and lifetime",
+      "secondary": "identity correspondence"
+    },
+    {
+      "count": 1,
+      "primary": "ownership and lifetime",
+      "secondary": "range and alignment safety"
+    },
+    {
+      "count": 1,
+      "primary": "policy and configuration propagation",
+      "secondary": "completion and progress"
+    },
+    {
+      "count": 1,
+      "primary": "policy and configuration propagation",
+      "secondary": "ownership and lifetime"
+    },
+    {
+      "count": 1,
+      "primary": "range and alignment safety",
+      "secondary": "identity correspondence"
+    },
+    {
+      "count": 1,
+      "primary": "representation fidelity",
+      "secondary": "identity correspondence"
+    },
+    {
+      "count": 1,
+      "primary": "representation fidelity",
+      "secondary": "value semantics preservation"
+    },
+    {
+      "count": 1,
+      "primary": "resource and capability agreement",
+      "secondary": "policy and configuration propagation"
+    },
+    {
+      "count": 1,
+      "primary": "transformation equivalence",
+      "secondary": "happens-before ordering"
+    },
+    {
+      "count": 1,
+      "primary": "transformation equivalence",
+      "secondary": "index and offset preservation"
+    },
+    {
+      "count": 1,
+      "primary": "transformation equivalence",
+      "secondary": "value semantics preservation"
+    },
+    {
+      "count": 1,
+      "primary": "value semantics preservation",
+      "secondary": "identity correspondence"
+    }
+  ],
+  "raw_label_agreement": 0.9552572706935123,
+  "resolution_rule": "A label is published as secondary only when both independent reviewers selected it after the reconciled primary label is removed from each set.",
+  "schema_version": "1.0.0"
+}

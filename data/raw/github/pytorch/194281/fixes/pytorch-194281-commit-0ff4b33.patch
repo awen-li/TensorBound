@@ -1,0 +1,87 @@
+From 0ff4b33e3d38cb3d3671c9ac20bf9ef32e8bbe15 Mon Sep 17 00:00:00 2001
+From: Carter Schonwald <carter.schonwald@gmail.com>
+Date: Mon, 17 Aug 2026 22:56:55 +0000
+Subject: [PATCH] =?UTF-8?q?fix=20for=20silent=20data=20corruption=20optimi?=
+ =?UTF-8?q?zation=E2=80=94-Inductor:=20freeze=20layout=20before=20nonconti?=
+ =?UTF-8?q?guous=20reshape=20view=20(#192575)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+i was hitting a very strange blowup on reverse gradient calcs, after a lot of bisections i was able to pin it down to a one line fix.
+
+roughly: bad buffer reuse in fused code plus strided slices that are not powers of two are way more likely to tickle it.
+
+id like to emphasize this bug will silently cause quite large relative or absolute errors on programs that trigger it.  im quite fortunate to have even caught the problem!
+
+Pull Request resolved: https://github.com/pytorch/pytorch/pull/192575
+Approved by: https://github.com/eellison
+---
+ test/inductor/test_torchinductor.py | 38 +++++++++++++++++++++++++++++
+ torch/_inductor/ir.py               |  4 ++-
+ 2 files changed, 41 insertions(+), 1 deletion(-)
+
+diff --git a/test/inductor/test_torchinductor.py b/test/inductor/test_torchinductor.py
+index 175bcd0d36cd1..a2f8a3e89c2f7 100644
+--- a/test/inductor/test_torchinductor.py
++++ b/test/inductor/test_torchinductor.py
+@@ -19609,6 +19609,44 @@ class GPUTests(TestCase):
+         common = check_model_gpu
+         device = GPU_TYPE
+ 
++        @requires_cuda_and_triton
++        def test_noncontiguous_reshape_cat_backward(self):
++            # Cross the 1024-element padding threshold with a non-aligned width.
++            width = 342
++
++            def fn(x, offset, weight):
++                query, key, value = (
++                    part.view(2, 3, 1, width) + offset
++                    for part in (x @ weight.T).chunk(3, -1)
++                )
++                query_sigmoid = torch.sigmoid(query).transpose(1, 2)
++                query_tanh = torch.tanh(query).transpose(1, 2)
++                key_sigmoid = torch.sigmoid(key).transpose(1, 2)
++                key_tanh = torch.tanh(key).transpose(1, 2)
++                scores = (
++                    query_sigmoid @ key_sigmoid.transpose(-2, -1)
++                    + query_tanh @ key_tanh.transpose(-2, -1)
++                    - query_sigmoid @ key_tanh.transpose(-2, -1)
++                )
++                return scores @ value.transpose(1, 2)
++
++            torch.manual_seed(0xC0FFEE)
++            self.common(
++                fn,
++                (
++                    torch.randn(2, 3, 1, requires_grad=True),
++                    torch.randn(2, 3, 1, width, requires_grad=True),
++                    torch.randn(3 * width, 1, requires_grad=True),
++                ),
++                atol=1e-4,
++                check_gradient=True,
++                check_lowp=False,
++                grad_atol=2e-3,
++                grad_rtol=1e-5,
++                reference_in_float=False,
++                rtol=1e-4,
++            )
++
+         @requires_cuda_and_triton
+         def test_special_bessel_inf_matches_eager(self):
+             ops = (
+diff --git a/torch/_inductor/ir.py b/torch/_inductor/ir.py
+index 2ca22234e1187..df4238c465e72 100644
+--- a/torch/_inductor/ir.py
++++ b/torch/_inductor/ir.py
+@@ -3975,7 +3975,9 @@ def fake_reindex(index: Any) -> tuple[int, ...]:
+             return handle_unbacked_or_dynamic_reshape(x)
+ 
+         # Try to compute valid output strides.
+-        storage, old_layout = as_storage_and_layout(x, freeze=False)
++        # ReinterpretView stores an index map derived from this layout, so the
++        # backing storage must not remain flexible after the view is created.
++        storage, old_layout = as_storage_and_layout(x)
+ 
+         old_stride = old_layout.stride
+ 

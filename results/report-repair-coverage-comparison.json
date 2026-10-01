@@ -1,0 +1,89 @@
+{
+  "cohort_reports": 264,
+  "groups": {
+    "no_traceable_landed_repair": {
+      "by_repository": {
+        "iree-org/iree": 25,
+        "jax-ml/jax": 33,
+        "openxla/xla": 8,
+        "pytorch/pytorch": 26,
+        "triton-lang/triton": 10
+      },
+      "closed": {
+        "count": 32,
+        "percent": 31.37
+      },
+      "median_days_to_close_among_closed": 91.0,
+      "median_opened_year": 2026.0,
+      "opened_2025_2026": {
+        "count": 69,
+        "percent": 67.65
+      },
+      "opened_by_year": {
+        "2020": 2,
+        "2021": 3,
+        "2022": 3,
+        "2023": 11,
+        "2024": 14,
+        "2025": 16,
+        "2026": 53
+      },
+      "primary_observed_consequence": {
+        "hang or deadlock": 5,
+        "incorrect result or state": 62,
+        "memory-access violation": 8,
+        "other observable failure": 3,
+        "resource leak or exhaustion": 5,
+        "runtime rejection or crash": 19
+      },
+      "reports": 102,
+      "security_relevant_technical_condition": {
+        "count": 20,
+        "percent": 19.61
+      }
+    },
+    "repair_linked": {
+      "by_repository": {
+        "iree-org/iree": 49,
+        "jax-ml/jax": 44,
+        "openxla/xla": 6,
+        "pytorch/pytorch": 45,
+        "triton-lang/triton": 18
+      },
+      "closed": {
+        "count": 142,
+        "percent": 87.65
+      },
+      "median_days_to_close_among_closed": 9.1,
+      "median_opened_year": 2025.0,
+      "opened_2025_2026": {
+        "count": 83,
+        "percent": 51.23
+      },
+      "opened_by_year": {
+        "2020": 11,
+        "2021": 7,
+        "2022": 21,
+        "2023": 26,
+        "2024": 14,
+        "2025": 29,
+        "2026": 54
+      },
+      "primary_observed_consequence": {
+        "data race": 5,
+        "hang or deadlock": 7,
+        "incorrect result or state": 106,
+        "memory-access violation": 15,
+        "resource leak or exhaustion": 7,
+        "runtime rejection or crash": 22
+      },
+      "reports": 162,
+      "security_relevant_technical_condition": {
+        "count": 40,
+        "percent": 24.69
+      }
+    }
+  },
+  "interpretation": "The comparison describes documentary repair coverage within the confirmed cohort; it does not reclassify either group or treat absence of a linked repair as absence of a repair in project history.",
+  "schema_version": "1.0.0"
+}

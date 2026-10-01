@@ -1,0 +1,169 @@
+From 0aaf3956514cc5079e62eeb8026d8d860e7c0b72 Mon Sep 17 00:00:00 2001
+From: Liqiang Lu <liqiangxl@gmail.com>
+Date: Fri, 1 May 2026 23:58:23 +0000
+Subject: [PATCH] Fix Inductor scheduler reordering random ops (#181136)
+ (#181245)
+
+Fix #181136 when `fallback_random = True`
+
+The Inductor scheduler reorders `torch.randn` calls based on data dependencies, causing them to consume global RNG state out of program order. This produces silent numerical mismatches vs eager mode.
+
+Add `_add_random_dep_chain()` to chain nodes with the `nondeterministic_seeded tag via WeakDep`, preserving program order.
+
+Pull Request resolved: https://github.com/pytorch/pytorch/pull/181245
+Approved by: https://github.com/jansel
+---
+ test/inductor/test_torchinductor.py    | 53 ++++++++++++++++++++++++++
+ torch/_inductor/fx_passes/post_grad.py | 34 +++++++++++++++++
+ torch/_inductor/lowering.py            | 15 +++++---
+ 3 files changed, 96 insertions(+), 6 deletions(-)
+
+diff --git a/test/inductor/test_torchinductor.py b/test/inductor/test_torchinductor.py
+index 0484b308fcc78..97359798a38aa 100644
+--- a/test/inductor/test_torchinductor.py
++++ b/test/inductor/test_torchinductor.py
+@@ -10544,6 +10544,59 @@ def fn(a, b):
+             ),
+         )
+ 
++    @parametrize(
++        "fallback_random",
++        [
++            subtest(True, name="fallback"),
++            subtest(False, name="inductor", decorators=[unittest.expectedFailure]),
++        ],
++    )
++    def test_randn_order_preserved(self, fallback_random):
++        if self.device == "cpu":
++            raise unittest.SkipTest("conv2d randn ordering requires CUDA")
++
++        def fn():
++            a = torch.randn(2, 4, 4, 4, device=self.device)
++            b = torch.randn(2, 3, 4, 4, device=self.device)
++            c = torch.randn(4, 3, 3, 3, device=self.device)
++            y = torch.nn.functional.conv2d(b, c, padding=1)
++            z = a + y
++            return z
++
++        with config.patch(fallback_random=fallback_random):
++            compiled = torch.compile(fn)
++
++            torch.manual_seed(42)
++            eager_out = fn()
++
++            torch.manual_seed(42)
++            compiled_out = compiled()
++
++            self.assertEqual(compiled_out, eager_out)
++
++    @config.patch(fallback_random=True)
++    def test_tuple_output_rng_order_preserved(self):
++        if self.device == "cpu":
++            raise unittest.SkipTest("conv2d randn ordering requires CUDA")
++
++        def fn(x):
++            dropped, _ = torch.ops.aten.native_dropout.default(x, 0.5, True)
++            b = torch.randn(2, 3, 4, 4, device=x.device)
++            c = torch.randn(4, 3, 3, 3, device=x.device)
++            y = torch.nn.functional.conv2d(b, c, padding=1)
++            return dropped + y
++
++        x = torch.ones(2, 4, 4, 4, device=self.device)
++        compiled = torch.compile(fn)
++
++        torch.manual_seed(42)
++        eager_out = fn(x)
++
++        torch.manual_seed(42)
++        compiled_out = compiled(x)
++
++        self.assertEqual(compiled_out, eager_out)
++
+     def test_randn_like_empty(self):
+         class Model(torch.nn.Module):
+             def __init__(
+diff --git a/torch/_inductor/fx_passes/post_grad.py b/torch/_inductor/fx_passes/post_grad.py
+index 9a7281ff7b13b..7277e4f0ce8d5 100644
+--- a/torch/_inductor/fx_passes/post_grad.py
++++ b/torch/_inductor/fx_passes/post_grad.py
+@@ -57,6 +57,7 @@
+ )
+ from ..virtualized import V
+ from .b2b_gemm import B2B_GEMM_PASS
++from .control_dependencies import preserve_node_ordering
+ from .ddp_fusion import fuse_ddp_communication
+ from .group_batch_fusion import group_batch_fusion_passes, POST_GRAD_FUSIONS
+ from .micro_pipeline_tp import micro_pipeline_tp_pass
+@@ -109,6 +110,34 @@ def _remove_profiler_ops(graph: torch.fx.Graph) -> None:
+         graph.erase_node(node)
+ 
+ 
++def _is_nondeterministic_seeded_node(node: torch.fx.Node) -> bool:
++    return (
++        node.op == "call_function"
++        and isinstance(node.target, torch._ops.OpOverload)
++        and torch.Tag.nondeterministic_seeded in node.target.tags
++    )
++
++
++def _chain_random_ops_for_ordering(graph: torch.fx.Graph) -> None:
++    """Chain nondeterministic_seeded ops with control_deps to preserve program order.
++
++    When fallback_random=True, random ops use the global CUDA RNG and must
++    execute in their original program order.
++    """
++    if not config.fallback_random:
++        return
++
++    random_nodes = [n for n in graph.nodes if _is_nondeterministic_seeded_node(n)]
++    if len(random_nodes) < 2:
++        return
++
++    additional_deps_map: dict[torch.fx.Node, OrderedSet[torch.fx.Node]] = {}
++    for i in range(1, len(random_nodes)):
++        additional_deps_map[random_nodes[i]] = OrderedSet([random_nodes[i - 1]])
++
++    preserve_node_ordering(graph, additional_deps_map)
++
++
+ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
+     """
+     Passes that run on after grad.  This is called once on the forwards
+@@ -225,6 +254,11 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
+             post_grad_custom_post_pass
+         )
+ 
++    if config.fallback_random:
++        GraphTransformObserver(gm, "chain_random_ops_ordering").apply_graph_pass(
++            _chain_random_ops_for_ordering
++        )
++
+     GraphTransformObserver(gm, "stable_sort").apply_graph_pass(stable_topological_sort)
+ 
+     GraphTransformObserver(gm, "move_constructors_to_cuda").apply_graph_pass(
+diff --git a/torch/_inductor/lowering.py b/torch/_inductor/lowering.py
+index ccc05cfb86887..b31201ca718df 100644
+--- a/torch/_inductor/lowering.py
++++ b/torch/_inductor/lowering.py
+@@ -8364,12 +8364,15 @@ def control_deps_op_lowering(additional_deps, subgraph_fn, *args):
+ 
+     dep_names = []
+     for dep, orig_node in zip(additional_deps, original_dep_nodes, strict=True):
+-        if isinstance(dep, IRNode):
+-            dep.realize()
+-            dep_names.append(dep.get_name())
+-        elif isinstance(orig_node, torch.fx.Node):
+-            # Void op (e.g. record_event returns None): look up the buffer
+-            # names stored when it was previously lowered.
++        dep_ir_nodes = [
++            dep_leaf
++            for dep_leaf in pytree.tree_leaves(dep)
++            if isinstance(dep_leaf, IRNode)
++        ]
++        for dep_ir_node in dep_ir_nodes:
++            dep_ir_node.realize()
++            dep_names.append(dep_ir_node.get_name())
++        if isinstance(orig_node, torch.fx.Node):
+             found = V.graph._void_ctrl_dep_op_names.get(orig_node, [])
+             dep_names.extend(found)
+ 

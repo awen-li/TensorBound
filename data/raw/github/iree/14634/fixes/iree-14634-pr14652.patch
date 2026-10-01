@@ -1,0 +1,151 @@
+From dddee28d05ecd25195fc0f58315441c1df175508 Mon Sep 17 00:00:00 2001
+From: Lei Zhang <antiagainst@google.com>
+Date: Sat, 12 Aug 2023 19:12:13 -0700
+Subject: [PATCH 1/4] [spirv] Cherry-pick MLIR commits to fix i4 emulation
+ correctness
+
+This commit cherry-picks the following MLIR commits:
+* llvm/llvm-project@81c326ccdd9b8475b6b7180da36b24bb29ce4f42
+* llvm/llvm-project@2b066501b1bcb21c408310e6cfca31ba02068736
+* llvm/llvm-project@69a3c9cddf1919b7caaa625efa1829cd5628bf10
+
+The above commits fixes integer extension/truncation.
+---
+ third_party/llvm-project | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/third_party/llvm-project b/third_party/llvm-project
+index 54065fd329a4..f22325077ce5 160000
+--- a/third_party/llvm-project
++++ b/third_party/llvm-project
+@@ -1 +1 @@
+-Subproject commit 54065fd329a48406f3eec79512378fa3e386e9f2
++Subproject commit f22325077ce5af7e1b6ca9838dead47043ed7232
+
+From 8f59e51b5e835d118dd965fee6439e3a546d4542 Mon Sep 17 00:00:00 2001
+From: Lei Zhang <antiagainst@google.com>
+Date: Sat, 12 Aug 2023 19:35:57 -0700
+Subject: [PATCH 2/4] Add regression test for i4 dequant
+
+---
+ tests/e2e/regression/BUILD.bazel     |  5 ++++-
+ tests/e2e/regression/CMakeLists.txt  |  2 ++
+ tests/e2e/regression/ui4_to_f32.mlir | 25 +++++++++++++++++++++++++
+ 3 files changed, 31 insertions(+), 1 deletion(-)
+ create mode 100644 tests/e2e/regression/ui4_to_f32.mlir
+
+diff --git a/tests/e2e/regression/BUILD.bazel b/tests/e2e/regression/BUILD.bazel
+index 11fd2368e223..4a6134ac9347 100644
+--- a/tests/e2e/regression/BUILD.bazel
++++ b/tests/e2e/regression/BUILD.bazel
+@@ -78,6 +78,7 @@ iree_check_single_backend_test_suite(
+         "layernorm.mlir",
+         "lowering_config.mlir",
+         "pack_pad_transpose_1x9_into_2x4x8x4_issue_12546.mlir",
++        "ui4_to_f32.mlir",
+     ] + BACKEND_TESTS,
+     compiler_flags = ["--iree-input-type=stablehlo"],
+     driver = "local-task",
+@@ -110,7 +111,9 @@ iree_check_single_backend_test_suite(
+ iree_check_single_backend_test_suite(
+     name = "check_regression_vulkan-spirv",
+     # TODO(#10024): Fix layernorm.mlir on Pixel 6 and put in BACKEND_TESTS.
+-    srcs = BACKEND_TESTS,
++    srcs = [
++      "ui4_to_f32.mlir",
++    ] + BACKEND_TESTS,
+     compiler_flags = ["--iree-input-type=stablehlo"],
+     driver = "vulkan",
+     target_backend = "vulkan-spirv",
+diff --git a/tests/e2e/regression/CMakeLists.txt b/tests/e2e/regression/CMakeLists.txt
+index cb6b2d155a10..99642e5d4aab 100644
+--- a/tests/e2e/regression/CMakeLists.txt
++++ b/tests/e2e/regression/CMakeLists.txt
+@@ -68,6 +68,7 @@ iree_check_single_backend_test_suite(
+     "softmax.mlir"
+     "strided_slice.mlir"
+     "transpose.mlir"
++    "ui4_to_f32.mlir"
+   TARGET_BACKEND
+     "llvm-cpu"
+   DRIVER
+@@ -136,6 +137,7 @@ iree_check_single_backend_test_suite(
+     "softmax.mlir"
+     "strided_slice.mlir"
+     "transpose.mlir"
++    "ui4_to_f32.mlir"
+   TARGET_BACKEND
+     "vulkan-spirv"
+   DRIVER
+diff --git a/tests/e2e/regression/ui4_to_f32.mlir b/tests/e2e/regression/ui4_to_f32.mlir
+new file mode 100644
+index 000000000000..516ea7ea3063
+--- /dev/null
++++ b/tests/e2e/regression/ui4_to_f32.mlir
+@@ -0,0 +1,25 @@
++#map = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
++
++func.func @forward() {
++  %cst = util.unfoldable_constant dense<[
++    [0, 1, 2, 3, 4, 5, 6, 7], [8, 9, 10, 11, 12, 13, 14, 15],
++    [0, 1, 2, 3, 4, 5, 6, 7], [8, 9, 10, 11, 12, 13, 14, 15],
++    [0, 1, 2, 3, 4, 5, 6, 7], [8, 9, 10, 11, 12, 13, 14, 15],
++    [0, 1, 2, 3, 4, 5, 6, 7], [8, 9, 10, 11, 12, 13, 14, 15]
++  ]> : tensor<8x8xi4>
++  %expanded_4 = tensor.expand_shape %cst [[0], [1, 2]] : tensor<8x8xi4> into tensor<8x4x2xi4>
++  %0 = tensor.empty() : tensor<8x4x2xf32>
++  %5 = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel", "parallel", "parallel"]} ins(%expanded_4 : tensor<8x4x2xi4>) outs(%0 : tensor<8x4x2xf32>) {
++  ^bb0(%in: i4, %out: f32):
++    %6 = arith.extui %in : i4 to i32
++    %7 = arith.uitofp %6 : i32 to f32
++    linalg.yield %7 : f32
++  } -> tensor<8x4x2xf32>
++  check.expect_almost_eq_const(%5, dense<[
++    [[0., 1.], [2., 3.], [4., 5.], [6., 7.]], [[8., 9.], [10., 11.], [12., 13.], [14., 15.]],
++    [[0., 1.], [2., 3.], [4., 5.], [6., 7.]], [[8., 9.], [10., 11.], [12., 13.], [14., 15.]],
++    [[0., 1.], [2., 3.], [4., 5.], [6., 7.]], [[8., 9.], [10., 11.], [12., 13.], [14., 15.]],
++    [[0., 1.], [2., 3.], [4., 5.], [6., 7.]], [[8., 9.], [10., 11.], [12., 13.], [14., 15.]]
++  ]> : tensor<8x4x2xf32>) : tensor<8x4x2xf32>
++  return
++}
+
+From dfb640bab58708488aa9b4a661514d615482fdf8 Mon Sep 17 00:00:00 2001
+From: Lei Zhang <antiagainst@google.com>
+Date: Sat, 12 Aug 2023 19:39:46 -0700
+Subject: [PATCH 3/4] Fix BUILD format
+
+---
+ tests/e2e/regression/BUILD.bazel | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/tests/e2e/regression/BUILD.bazel b/tests/e2e/regression/BUILD.bazel
+index 4a6134ac9347..834905299fcb 100644
+--- a/tests/e2e/regression/BUILD.bazel
++++ b/tests/e2e/regression/BUILD.bazel
+@@ -112,7 +112,7 @@ iree_check_single_backend_test_suite(
+     name = "check_regression_vulkan-spirv",
+     # TODO(#10024): Fix layernorm.mlir on Pixel 6 and put in BACKEND_TESTS.
+     srcs = [
+-      "ui4_to_f32.mlir",
++        "ui4_to_f32.mlir",
+     ] + BACKEND_TESTS,
+     compiler_flags = ["--iree-input-type=stablehlo"],
+     driver = "vulkan",
+
+From bd5c78fb853684ac09dbbcc430ae34a7cc829232 Mon Sep 17 00:00:00 2001
+From: Lei Zhang <antiagainst@google.com>
+Date: Sat, 12 Aug 2023 20:01:08 -0700
+Subject: [PATCH 4/4] Cherry-pick BUILD fix
+
+* llvm/llvm-project@1a38843f86df67e28b5aa2080195ab955cafb94e
+---
+ third_party/llvm-project | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/third_party/llvm-project b/third_party/llvm-project
+index f22325077ce5..bd4c6d586a10 160000
+--- a/third_party/llvm-project
++++ b/third_party/llvm-project
+@@ -1 +1 @@
+-Subproject commit f22325077ce5af7e1b6ca9838dead47043ed7232
++Subproject commit bd4c6d586a103615e5e09d4c35bddc225225b48c

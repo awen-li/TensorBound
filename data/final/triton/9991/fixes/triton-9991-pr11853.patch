@@ -1,0 +1,239 @@
+From 4b594ad9fa89c4fb9b1e3bf955bbaa5d928bed0a Mon Sep 17 00:00:00 2001
+From: Mingfei Guo <1800012773@pku.edu.cn>
+Date: Thu, 13 Aug 2026 19:53:56 -0700
+Subject: [PATCH 1/2] [FRONTEND] Fix int-to-bool conversion in tl.store
+
+TritonSemantic.store rewrites a pointer_type<int1> to pointer_type<int8>
+because i1 is stored as a byte, but it did so before coercing the value.
+cast() then saw an int8 destination rather than a boolean one, missed the
+is_bool branch that emits val != 0, and truncated instead. Storing 256 to a
+bool pointer produced False.
+
+Keep an is_bool flag and cast through tl.int1 first, mirroring what the load
+path already does. Non-bool narrowing stores are unaffected.
+
+Fixes #9991.
+---
+ python/test/unit/language/test_core.py | 54 ++++++++++++++++++++++++++
+ python/triton/language/semantic.py     | 10 ++++-
+ 2 files changed, 62 insertions(+), 2 deletions(-)
+
+diff --git a/python/test/unit/language/test_core.py b/python/test/unit/language/test_core.py
+index dc0221812b3f..23174d659e0e 100644
+--- a/python/test/unit/language/test_core.py
++++ b/python/test/unit/language/test_core.py
+@@ -2322,6 +2322,60 @@ def kernel(output_ptr, n_elements, BLOCK_SIZE: tl.constexpr, CONSTANT_FIELD: tl.
+         assert torch.all(output == 0)
+ 
+ 
++@pytest.mark.interpreter
++@pytest.mark.parametrize("value", [0, 1, 2, 127, 128, 255, 256, 257, 512, 65536, -1, -256])
++def test_store_int_to_bool(value, device):
++    # Storing an integer through a `bool` pointer must convert with `value != 0`.
++    # Previously the value was truncated to the i8 storage type, so any value
++    # whose low byte was zero (e.g. 256) was silently stored as `False`.
++    # See https://github.com/triton-lang/triton/issues/9991
++
++    @triton.jit
++    def kernel(output_ptr, value):
++        tl.store(output_ptr, value)
++
++    output = torch.zeros([1], dtype=torch.bool, device=device)
++    kernel[(1, )](output, value)
++    assert output[0].item() == (value != 0)
++
++
++@pytest.mark.interpreter
++def test_store_bool_reduction(device):
++    # `tl.sum` over a bool tensor reduces in int32; storing that result into a
++    # bool output must not truncate. 256 `True` values used to yield `False`.
++    # See https://github.com/triton-lang/triton/issues/9991
++
++    @triton.jit
++    def kernel(input_ptr, output_ptr, BLOCK_SIZE: tl.constexpr):
++        offsets = tl.arange(0, BLOCK_SIZE)
++        x = tl.load(input_ptr + offsets)
++        tl.store(output_ptr, tl.sum(x, 0))
++
++    for block_size in [1, 2, 128, 256, 512]:
++        x = torch.ones([block_size], dtype=torch.bool, device=device)
++        output = torch.zeros([1], dtype=torch.bool, device=device)
++        kernel[(1, )](x, output, BLOCK_SIZE=block_size)
++        assert output[0].item() is True
++
++
++@pytest.mark.interpreter
++@pytest.mark.parametrize("dtype_str", ["int8", "int16"])
++@pytest.mark.parametrize("value", [0, 1, 127, 256, 257, 300, 65536, 65537, -1])
++def test_store_int_truncates(dtype_str, value, device):
++    # Narrowing stores to non-bool integer types must keep truncating; only a
++    # `bool` destination compares against zero.
++
++    @triton.jit
++    def kernel(output_ptr, value):
++        tl.store(output_ptr, value)
++
++    dtype = getattr(torch, dtype_str)
++    output = torch.zeros([1], dtype=dtype, device=device)
++    kernel[(1, )](output, value)
++    ref = torch.tensor([value], dtype=torch.int32, device=device).to(dtype)
++    assert output[0].item() == ref[0].item()
++
++
+ def test_load_store_same_ptr(device):
+ 
+     @triton.jit()
+diff --git a/python/triton/language/semantic.py b/python/triton/language/semantic.py
+index a10238ace184..a2d547c950ed 100644
+--- a/python/triton/language/semantic.py
++++ b/python/triton/language/semantic.py
+@@ -1212,12 +1212,18 @@ def store(self, ptr: TensorTy, val: TensorTy, mask: Optional[TensorTy], cache_mo
+         elt_ty = ptr_ty.element_ty
+ 
+         # Treat `pointer_type<tl.int1>` as `pointer_type<tl.int8>`
+-        if elt_ty == tl.int1:
++        is_bool = elt_ty == tl.int1
++        if is_bool:
+             elt_ty = tl.int8
+             ptr_ty = tl.pointer_type(elt_ty, ptr_ty.address_space)
+             ptr = self.cast(ptr, ptr_ty)
+ 
+-        # Cast to target data type
++        # Cast to target data type. For a bool destination the conversion must go
++        # through `tl.int1` first (i.e. `val != 0`) so that values whose low byte
++        # is zero -- e.g. 256 -- do not silently become `False`. Casting straight
++        # to the `tl.int8` storage type would truncate instead of comparing.
++        if is_bool:
++            val = self.cast(val, tl.int1)
+         val = self.cast(val, elt_ty)
+ 
+         # Build IR
+
+From 820d29028df4f8b84e4e776b15ffd8898d417998 Mon Sep 17 00:00:00 2001
+From: Peter Bell <peterbell10@openai.com>
+Date: Fri, 18 Sep 2026 18:54:31 +0100
+Subject: [PATCH 2/2] [Frontend] Simplify bool store conversion and regression
+ test
+
+---
+ python/test/unit/language/test_core.py     | 54 ----------------------
+ python/test/unit/language/test_frontend.py | 10 ++++
+ python/triton/language/semantic.py         | 15 ++----
+ 3 files changed, 15 insertions(+), 64 deletions(-)
+
+diff --git a/python/test/unit/language/test_core.py b/python/test/unit/language/test_core.py
+index 0850c566cab6..955197ec1776 100644
+--- a/python/test/unit/language/test_core.py
++++ b/python/test/unit/language/test_core.py
+@@ -2563,60 +2563,6 @@ def kernel(output_ptr, n_elements, BLOCK_SIZE: tl.constexpr, CONSTANT_FIELD: tl.
+         assert torch.all(output == 0)
+ 
+ 
+-@pytest.mark.interpreter
+-@pytest.mark.parametrize("value", [0, 1, 2, 127, 128, 255, 256, 257, 512, 65536, -1, -256])
+-def test_store_int_to_bool(value, device):
+-    # Storing an integer through a `bool` pointer must convert with `value != 0`.
+-    # Previously the value was truncated to the i8 storage type, so any value
+-    # whose low byte was zero (e.g. 256) was silently stored as `False`.
+-    # See https://github.com/triton-lang/triton/issues/9991
+-
+-    @triton.jit
+-    def kernel(output_ptr, value):
+-        tl.store(output_ptr, value)
+-
+-    output = torch.zeros([1], dtype=torch.bool, device=device)
+-    kernel[(1, )](output, value)
+-    assert output[0].item() == (value != 0)
+-
+-
+-@pytest.mark.interpreter
+-def test_store_bool_reduction(device):
+-    # `tl.sum` over a bool tensor reduces in int32; storing that result into a
+-    # bool output must not truncate. 256 `True` values used to yield `False`.
+-    # See https://github.com/triton-lang/triton/issues/9991
+-
+-    @triton.jit
+-    def kernel(input_ptr, output_ptr, BLOCK_SIZE: tl.constexpr):
+-        offsets = tl.arange(0, BLOCK_SIZE)
+-        x = tl.load(input_ptr + offsets)
+-        tl.store(output_ptr, tl.sum(x, 0))
+-
+-    for block_size in [1, 2, 128, 256, 512]:
+-        x = torch.ones([block_size], dtype=torch.bool, device=device)
+-        output = torch.zeros([1], dtype=torch.bool, device=device)
+-        kernel[(1, )](x, output, BLOCK_SIZE=block_size)
+-        assert output[0].item() is True
+-
+-
+-@pytest.mark.interpreter
+-@pytest.mark.parametrize("dtype_str", ["int8", "int16"])
+-@pytest.mark.parametrize("value", [0, 1, 127, 256, 257, 300, 65536, 65537, -1])
+-def test_store_int_truncates(dtype_str, value, device):
+-    # Narrowing stores to non-bool integer types must keep truncating; only a
+-    # `bool` destination compares against zero.
+-
+-    @triton.jit
+-    def kernel(output_ptr, value):
+-        tl.store(output_ptr, value)
+-
+-    dtype = getattr(torch, dtype_str)
+-    output = torch.zeros([1], dtype=dtype, device=device)
+-    kernel[(1, )](output, value)
+-    ref = torch.tensor([value], dtype=torch.int32, device=device).to(dtype)
+-    assert output[0].item() == ref[0].item()
+-
+-
+ def test_load_store_same_ptr(device):
+ 
+     @triton.jit()
+diff --git a/python/test/unit/language/test_frontend.py b/python/test/unit/language/test_frontend.py
+index 3774921aefec..f83202f4d265 100644
+--- a/python/test/unit/language/test_frontend.py
++++ b/python/test/unit/language/test_frontend.py
+@@ -58,6 +58,16 @@ def kernel(X, SCALAR: tl.constexpr, DTYPE: tl.constexpr):
+     run_filecheck_test(kernel, args=(MockTensor(src_dtype), scalar, dst_dtype))
+ 
+ 
++def test_store_int_to_bool():
++
++    @triton.jit
++    def kernel(output_ptr, value):
++        # CHECK: arith.cmpi ne, %arg1, %c0_i32 : i32
++        tl.store(output_ptr, value)
++
++    run_filecheck_test(kernel, args=(MockTensor(tl.int1), 256))
++
++
+ @pytest.mark.parametrize("dtype",
+                          [tl.float16, tl.bfloat16, tl.float32, tl.float64, tl.float8e4nv, tl.float8e5, tl.float8e4b15],
+                          ids=str)
+diff --git a/python/triton/language/semantic.py b/python/triton/language/semantic.py
+index af5600717bd7..c4ef972cf690 100644
+--- a/python/triton/language/semantic.py
++++ b/python/triton/language/semantic.py
+@@ -1221,20 +1221,15 @@ def store(self, ptr: TensorTy, val: TensorTy, mask: Optional[TensorTy], cache_po
+         ptr_ty = ptr.type.scalar
+         elt_ty = ptr_ty.element_ty
+ 
++        # Cast to target data type
++        val = self.cast(val, elt_ty)
++
+         # Treat `pointer_type<tl.int1>` as `pointer_type<tl.int8>`
+-        is_bool = elt_ty == tl.int1
+-        if is_bool:
++        if elt_ty == tl.int1:
+             elt_ty = tl.int8
+             ptr_ty = tl.pointer_type(elt_ty, ptr_ty.address_space)
+             ptr = self.cast(ptr, ptr_ty)
+-
+-        # Cast to target data type. For a bool destination the conversion must go
+-        # through `tl.int1` first (i.e. `val != 0`) so that values whose low byte
+-        # is zero -- e.g. 256 -- do not silently become `False`. Casting straight
+-        # to the `tl.int8` storage type would truncate instead of comparing.
+-        if is_bool:
+-            val = self.cast(val, tl.int1)
+-        val = self.cast(val, elt_ty)
++            val = self.cast(val, elt_ty)
+ 
+         # Build IR
+         if mask is None:

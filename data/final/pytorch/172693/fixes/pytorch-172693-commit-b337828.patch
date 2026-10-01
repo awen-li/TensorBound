@@ -1,0 +1,242 @@
+From b337828b4b1793b0ec786400b80e7f4cdf0494d4 Mon Sep 17 00:00:00 2001
+From: Laith Sakka <lsakka@meta.com>
+Date: Thu, 5 Feb 2026 11:49:04 -0800
+Subject: [PATCH]  Fix : Proper handling of non-contiguous valid reshape for
+ dynamic shapes in inductor (#173062)
+
+Fix https://github.com/pytorch/pytorch/issues/172693
+A  mismatch in output strides between eager and compiled execution.
+
+The solution is to symbolically check whether a view is valid by reusing the existing _compute_stride function. If _compute_stride succeeds, we use the layout it computes.
+
+Note that _compute_stride expects SymInt inputs, so I added a small utility to convert SymPy expressions to SymInt. This avoids having to rewrite the function to operate directly on SymPy. Longer term, the vision is to use SymNodes everywhere, but that is not yet a priority.
+
+Note2: this function is still not perfect for unbacked but that a different issue i will handle separately.
+
+Pull Request resolved: https://github.com/pytorch/pytorch/pull/173062
+Approved by: https://github.com/jansel
+---
+ test/test_dynamic_shapes.py |  24 +++++++++
+ torch/_inductor/ir.py       | 100 ++++++++++++++++++++++++++++++------
+ torch/_inductor/sizevars.py |  28 ++++++++++
+ 3 files changed, 136 insertions(+), 16 deletions(-)
+
+diff --git a/test/test_dynamic_shapes.py b/test/test_dynamic_shapes.py
+index 76eec54eff9a9..11f64c78bf0b8 100644
+--- a/test/test_dynamic_shapes.py
++++ b/test/test_dynamic_shapes.py
+@@ -4977,6 +4977,30 @@ def fuzzed_program(arg_0, arg_1, arg_2, sentinel):
+         result_compiled = compiled_program(*args)
+         self.assertTrue(torch.allclose(result_compiled, result_original))
+ 
++    def test_inductor_view_issue_172693(self):
++        class MinimalBugModule(torch.nn.Module):
++            def __init__(self, num_heads: int = 8):
++                super().__init__()
++                self.num_heads = num_heads
++
++            def forward(self, key):
++                reshaped_key = key.reshape(key.shape[0], self.num_heads, -1)
++                torch._dynamo.graph_break()
++                return reshaped_key + 1
++
++        num_heads = 8
++
++        bug_module = MinimalBugModule(num_heads=num_heads)
++
++        key = torch.empty_strided((2, 16, 9), (288, 9, 1)).normal_()
++
++        with torch.inference_mode():
++            eager_result = bug_module(key)
++            bug_module.compile(dynamic=True)
++            compiled_result = bug_module(key)
++
++        self.assertEqual(compiled_result, eager_result)
++
+ 
+ instantiate_parametrized_tests(TestUnbacked)
+ 
+diff --git a/torch/_inductor/ir.py b/torch/_inductor/ir.py
+index e92a98d80013e..3b7145d7ca67b 100644
+--- a/torch/_inductor/ir.py
++++ b/torch/_inductor/ir.py
+@@ -3180,6 +3180,11 @@ def get_size(self) -> Sequence[Expr]:
+ 
+ @ir_dataclass
+ class View(GenericView):
++    """
++    This class handles tensor reshaping by computing appropriate index transformations
++    to map the new shape back to the original storage layout.
++    """
++
+     @staticmethod
+     def handle_negative_index(idx: Expr, size: Expr) -> Expr:
+         idx = sympy.expand(idx)
+@@ -3190,6 +3195,7 @@ def handle_negative_index(idx: Expr, size: Expr) -> Expr:
+         return idx
+ 
+     @classmethod
++    @override
+     def create(cls, x: IRNode, new_size: Sequence[Expr]) -> IRNode:  # type: ignore[override]
+         assert isinstance(new_size, Sequence), type(new_size)
+         old_size, new_size = cls.resolve_negative_size(x.get_size(), new_size)
+@@ -3198,12 +3204,45 @@ def create(cls, x: IRNode, new_size: Sequence[Expr]) -> IRNode:  # type: ignore[
+         if V.graph.sizevars.statically_known_list_equals(old_size, new_size):
+             return x
+ 
+-        unbacked_symbols_in_sizes = False
+-        if (
++        unbacked_symbols_in_sizes = (
+             len(free_unbacked_symbols(old_size)) > 0
+             or len(free_unbacked_symbols(new_size)) > 0
+-        ):
+-            unbacked_symbols_in_sizes = True
++        )
++        is_contiguous = is_contiguous_storage_and_layout(x)
++
++        def create_reinterpret_view(
++            inp: IRNode, new_size: Sequence[Expr], new_stride: Sequence[Expr]
++        ) -> ReinterpretView:
++            storage, old_layout = as_storage_and_layout(inp, want_contiguous=True)
++            new_layout = FixedLayout(
++                old_layout.device,
++                old_layout.dtype,
++                new_size,
++                new_stride,
++                old_layout.offset,
++                old_layout.is_pinned,
++            )
++            return ReinterpretView(data=storage, layout=new_layout)
++
++        def handle_unbacked_or_dynamic_reshape(
++            x: IRNode,
++        ) -> IRNode:
++            """
++            Handle the case where view is not possible with current strides.
++            For unbacked symbols, make contiguous; otherwise use dynamic_reshape_indexer.
++            """
++            nonlocal old_size, new_size, unbacked_symbols_in_sizes
++            if unbacked_symbols_in_sizes:
++                # For unbacked symbols, we must require contiguous
++                # dynamic_reshape_indexer cannot handle unbacked SymInts
++                # https://github.com/pytorch/pytorch/issues/145561
++                x = ExternKernel.require_contiguous(x)
++                return create_reinterpret_view(
++                    x, new_size, FlexibleLayout.contiguous_strides(new_size)
++                )
++            # For backed symbols, fall back to dynamic_reshape_indexer
++            reindex = cls.dynamic_reshape_indexer(old_size, new_size)
++            return cls(data=x, size=list(new_size), reindex=reindex)
+ 
+         if 0 in new_size:
+ 
+@@ -3211,29 +3250,58 @@ def fake_reindex(index: Any) -> tuple[int, ...]:
+                 return tuple([0] * len(old_size))
+ 
+             return cls(data=x, size=list(new_size), reindex=fake_reindex)
++
+         # TODO: a new class for FixedTransferLayout that output layout is constrained by input layout
+-        elif is_contiguous_storage_and_layout(x) or unbacked_symbols_in_sizes:
+-            if unbacked_symbols_in_sizes and (not is_contiguous_storage_and_layout(x)):
+-                # realize x; otherwise, the dynamic_reshape_indexer below will fail
+-                # due to the size_hint's inability to process unbacked SymInts
+-                # TODO: unbacked should not diverge from backed in determining striding
+-                # Need to require contiguous here instead of realize, see:
+-                # https://github.com/pytorch/pytorch/issues/145561
+-                x = ExternKernel.require_contiguous(x)
++        elif is_contiguous:
++            # Input is contiguous, output can use contiguous strides
++            return create_reinterpret_view(
++                x, new_size, FlexibleLayout.contiguous_strides(new_size)
++            )
++
++        # Input is non-contiguous. Check if we can get storage/layout.
++        if not is_storage_and_layout(x):
++            # Can't get storage/layout (e.g., for Pointwise nodes)
++            return handle_unbacked_or_dynamic_reshape(x)
++
++        # Try to compute valid output strides.
++        storage, old_layout = as_storage_and_layout(x, freeze=False)
+ 
+-            storage, old_layout = as_storage_and_layout(x, want_contiguous=True)
++        old_stride = old_layout.stride
++
++        # Convert sympy exprs to SymInt for _compute_stride, then convert back
++        old_size_symint = V.graph.sizevars.to_symints_or_ints(old_size)
++        old_stride_symint = V.graph.sizevars.to_symints_or_ints(old_stride)
++        new_size_symint = V.graph.sizevars.to_symints_or_ints(new_size)
++
++        from torch._subclasses.fake_impls import _compute_stride
++
++        # Use size_oblivious=True for unbacked symbols to avoid DDE errors
++        new_stride_symint = _compute_stride(
++            old_size_symint,
++            old_stride_symint,
++            new_size_symint,
++            size_oblivious=unbacked_symbols_in_sizes,
++        )
++
++        if new_stride_symint is not None:
++            # Convert SymInt back to sympy expressions
++            new_stride = [
++                s.node.expr if hasattr(s, "node") else sympy.Integer(s)
++                for s in new_stride_symint
++            ]
++            # View is possible with computed strides
+             new_layout = FixedLayout(
+                 old_layout.device,
+                 old_layout.dtype,
+                 new_size,
+-                FlexibleLayout.contiguous_strides(new_size),
++                new_stride,
+                 old_layout.offset,
+                 old_layout.is_pinned,
+             )
+             return ReinterpretView(data=storage, layout=new_layout)
+ 
+-        reindex = cls.dynamic_reshape_indexer(old_size, new_size)
+-        return cls(data=x, size=list(new_size), reindex=reindex)
++        # View not possible with current strides
++        return handle_unbacked_or_dynamic_reshape(x)
+ 
+     @staticmethod
+     def resolve_negative_size(
+diff --git a/torch/_inductor/sizevars.py b/torch/_inductor/sizevars.py
+index 4c5f2bb8103df..740e87f230f37 100644
+--- a/torch/_inductor/sizevars.py
++++ b/torch/_inductor/sizevars.py
+@@ -591,6 +591,34 @@ def symbolic_hint(
+ 
+         return sympy_subs(expr, self.backed_var_to_val)
+ 
++    def to_symint_or_int(self, expr: Union[Expr, int]) -> Union[SymInt, int]:
++        """Convert a sympy expression to SymInt, or return int as is."""
++        if isinstance(expr, int):
++            return expr
++
++        from torch.fx.experimental.sym_node import SymNode
++
++        expr = self.simplify(expr)
++        if isinstance(expr, (int, sympy.Integer)):
++            return int(expr)
++
++        # Remove precomputed replacements to get canonical form
++        # (consistent with symbolic_hint behavior)
++        expr = self.remove_precomputed_replacements(expr)
++
++        try:
++            hint = self.size_hint(expr)
++        except Exception:
++            hint = None
++        node = SymNode(expr, self.shape_env, int, hint)
++        return SymInt(node)
++
++    def to_symints_or_ints(
++        self, exprs: Sequence[Union[Expr, int]]
++    ) -> list[Union[SymInt, int]]:
++        """Convert a sequence of sympy expressions to SymInts, or return ints as is."""
++        return [self.to_symint_or_int(e) for e in exprs]
++
+     def size_hint(
+         self,
+         expr: Union[Expr, int],
