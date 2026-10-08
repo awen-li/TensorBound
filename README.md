@@ -31,6 +31,7 @@ Without Make, run `python3 scripts/verify_artifact.py` and
 | `data/raw/` | Archived GitHub evidence and CVE List records |
 | `data/final/` | 264 case reports, their index, and archived repair patches |
 | `results/` | Final RQ tables, source paths, codebooks, selection, and sensitivity results |
+| `results/causal-selection-audit.csv` | Final decision, primary-obligation status, selection basis, and evidence links for 149 repaired causes |
 | `results/statistics/` | Published agreement summaries and final exclusion-audit data |
 | `results/artifact-manifest.json` | Data inventory with sizes, hashes, and source revision |
 | `tensorbound/` | GitHub/CVE collection code and supporting storage utilities |
@@ -50,9 +51,17 @@ The development repository is maintained separately.
 - [results/README.md](results/README.md) explains the final outputs and their scope.
 
 The offline checks recompute distributions and sensitivity results from final
-records. The published agreement summaries are preserved statistics; this
+records. They also verify that the 162 repair-linked reports map to 149 final
+cause selections and 13 duplicates, with zero unresolved final decisions or
+primary obligations. The published agreement summaries are preserved statistics; this
 artifact does not rerun the historical review process or establish independent
 causal-localization reliability.
+
+The 102 report-only cases establish an in-scope failure and observed effect,
+but every record lacks an archived landed patch and public fix URL for the
+pre-fix/repaired causal contrast. Seventy remain open, 32 are closed, and 100
+contain a proposal or workaround. These reports remain in report-level
+analyses.
 
 ## License and data use
 

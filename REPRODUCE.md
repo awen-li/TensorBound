@@ -18,12 +18,19 @@ It makes no changes to the data and requires no network access.
 | Full versus 136-cause stronger-evidence distributions | `results/historical-alignment.csv`, `results/evidence-sensitivity.json` |
 | 167 indexed repair patches | `results/repair-patch-index.jsonl` and the referenced patches |
 | 45 taxonomy definitions and examples | `results/taxonomy-codebook.json` |
+| 149 final causal selections and zero unresolved final fields | `results/causal-selection-audit.csv`, `results/causal-selection-audit-summary.json` |
 
 The manifest verifies the packaged data inventory and file contents. The
 collection totals are checked against the declared frame; this is not a new
 enumeration of GitHub's changing index or verification of historical search
 completeness. Source paths and case records preserve the available archived
 evidence.
+
+The causal-selection audit joins the cohort, cause analysis, and historical
+alignment tables. It verifies the final repair-linked denominator and publishes
+the obligation-selection basis for each cause. Pre-adjudication candidate
+lists are absent from the archive, so counts of initially competing operations
+or obligations remain unavailable.
 
 The agreement summaries in `results/statistics/` are final reported outputs.
 They are hash-checked, not regenerated from intermediate reviewer decisions.

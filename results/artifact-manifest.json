@@ -15800,9 +15800,19 @@
       "sha256": "7b5d3a0e49166eb14c81a10473eab744440c73f7741e20827bd2993ad8361e80"
     },
     {
-      "bytes": 1926,
+      "bytes": 3098,
       "path": "results/README.md",
-      "sha256": "ab6a992ecacfda032275584899aefb946a3cdcc84785a6d813dccddeeab213a5"
+      "sha256": "bdcdf5678f9d3a1fb5267822d5ef595b8faa457c3422f7f669487e9f1e6e149a"
+    },
+    {
+      "bytes": 1742,
+      "path": "results/causal-selection-audit-summary.json",
+      "sha256": "b16c18915739f100e0d0d9a6b2d9260bbd84e62aaec1f2020ec506481e32ed4b"
+    },
+    {
+      "bytes": 119184,
+      "path": "results/causal-selection-audit.csv",
+      "sha256": "a671cb1c7bff80f16429628440bfec812ee81ac34ee0451188238e7a32829778"
     },
     {
       "bytes": 3285,
@@ -15830,9 +15840,9 @@
       "sha256": "89413f97ae7ba1dbedee39896afefe39ff4b6ca203b9fe8b382ed611e5a44ad2"
     },
     {
-      "bytes": 2764,
+      "bytes": 3605,
       "path": "results/repair-evidence-policy.md",
-      "sha256": "6283b0ea37abc9912dcda722a9bf0c50f97710e6ed118dd7d17421a3a1e23209"
+      "sha256": "474c9354ae1814915a47f1b671194117da55642561c69d4ff52119a0e3da09c3"
     },
     {
       "bytes": 70795,

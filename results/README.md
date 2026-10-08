@@ -27,6 +27,26 @@ causal evidence. `evidence-sensitivity.json` compares all 45 families with the
 points, and the leading repair family changes. The 19 audit omissions support
 report-level sensitivity and remain outside the repaired-cause distributions.
 
+`causal-selection-audit.csv` contains one row for each repaired cause. It joins
+the final first-invalid-decision site and primary obligation to patch, source-
+contrast, regression, diagnosis, reproduction, and case-path evidence. Each
+row also reproduces the case report's concrete causal basis. The 149 row-level
+report counts sum to 162 repair-linked reports. The summary records
+149 unique final decisions, 149 unique final primary obligations, and zero
+unresolved final fields. It represents unavailable pre-adjudication candidate
+counts as JSON `null` with status `not_recorded`.
+
+The 13 causes outside the 136-cause stronger-evidence subset retain a landed
+patch and pre-fix/repaired source contrast. Seven have one coded obligation;
+six have secondary obligations and a row-level explanation of how the semantic
+repair selects the primary condition. Six of the 13 also have public
+reproduction evidence.
+
+For the 102 report-only cases, `causal-selection-audit-summary.json` records 70
+open and 32 closed reports. Every case lacks a patch and public fix URL for the
+source contrast required by the cause-level analysis. One hundred record a
+proposal or workaround.
+
 `artifact-manifest.json` records the size and hash of every released data and
 result file, excluding the manifest itself. The validator checks these hashes
 and recomputes the main distributions. Source data and final labels are

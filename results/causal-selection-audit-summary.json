@@ -1,0 +1,46 @@
+{
+  "cohort_accounting": {
+    "confirmed_reports": 264,
+    "distinct_repaired_causes": 149,
+    "duplicate_reports": 13,
+    "primary_cause_reports": 149,
+    "repair_linked_reports": 162,
+    "reports_without_traceable_landed_repair": 102
+  },
+  "final_causal_selection": {
+    "unique_first_invalid_decisions": 149,
+    "unique_primary_obligations": 149,
+    "unresolved_first_invalid_decisions": 0,
+    "unresolved_primary_obligations": 0
+  },
+  "historical_candidate_accounting": {
+    "initial_multiple_obligation_candidates": null,
+    "initial_multiple_operation_candidates": null,
+    "reason": "The archive preserves final consensus reconstructions but not pre-adjudication operation or obligation candidate lists.",
+    "resolved_from_initial_multiple_candidates": null,
+    "status": "not_recorded"
+  },
+  "reports_without_traceable_repair": {
+    "closed": 32,
+    "interpretation": "These reports establish an in-scope failure and observed effect, but the archived public evidence contains no landed patch and fix URL for a pre-fix/repaired causal contrast. Proposals and workarounds do not satisfy that cause-level evidence requirement.",
+    "missing_fields": {
+      "fix_patch": 102,
+      "fix_url": 102,
+      "semantic_repair": 102
+    },
+    "open": 70,
+    "reports": 102,
+    "with_observed_decision": 102,
+    "with_reported_proposal_or_workaround": 100
+  },
+  "schema_version": "1.0.0",
+  "status": "complete",
+  "stronger_evidence_accounting": {
+    "also_regression_or_developer_diagnosis": 136,
+    "landed_patch_and_source_contrast": 149,
+    "weaker_compound_obligation": 6,
+    "weaker_single_obligation": 7,
+    "weaker_with_public_reproduction": 6,
+    "without_regression_or_developer_diagnosis": 13
+  }
+}

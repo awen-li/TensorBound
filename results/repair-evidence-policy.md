@@ -23,6 +23,14 @@ site is the semantic decision changed by the fix; the patch site is an edited
 source location. These locations need not coincide. Existing site fields vary
 in granularity and are not substitutes for an independent exact-operation audit.
 
+The final denominator audit combines these locations with the cause and report
+tables. All 162 repair-linked reports map to 149 causes and 13 duplicate
+reports. Every cause has one final first-invalid-decision site and one primary
+obligation; the final cause table contains zero unresolved records. The archive
+does not retain pre-adjudication candidate lists, so initial competing-
+candidate counts remain unavailable. `causal-selection-audit.csv` records each
+final selection and its source evidence.
+
 For a multi-hunk repair, classify the semantic action that restores the violated
 obligation, not the largest edit. Keep build changes, tests, and other supporting
 edits in the complete patch. The patch index lists all changed files; it does
@@ -45,3 +53,9 @@ and percentage-point changes. The leading relation, transition, obligation,
 and failure families remain unchanged. The leading repair changes from mapping
 correction to stronger eligibility checks. The largest absolute family-share
 change is 2.44 percentage points.
+
+The other 13 causes still have a landed patch and pre-fix/fixed source
+contrast. Seven have one coded obligation. Six have a primary and at least one
+secondary obligation; their rows in `causal-selection-audit.csv` state how the
+semantic repair distinguishes the primary condition. Six of the 13 also have
+public reproduction evidence.

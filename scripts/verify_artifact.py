@@ -6,6 +6,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import re
 import sys
 from collections import Counter
 from pathlib import Path
@@ -137,6 +138,121 @@ def verify_analysis_outputs() -> dict[str, int]:
         "report-impact table does not cover 264 unique reports",
     )
     return observed
+
+
+def verify_causal_selection() -> dict[str, object]:
+    cases = read_csv("data/final/cases.csv")
+    causes = {row["cause_id"]: row for row in read_csv("results/rq-cause-analysis.csv")}
+    support = {row["cause_id"]: row for row in read_csv("results/historical-alignment.csv")}
+    audit = read_csv("results/causal-selection-audit.csv")
+    summary = read_json("results/causal-selection-audit-summary.json")
+    repair_linked = [row for row in cases if row["analysis_status"].startswith("repair_backed_")]
+    report_only = [row for row in cases
+                   if row["analysis_status"] == "reviewed_no_traceable_landed_repair"]
+    statuses = Counter(row["analysis_status"] for row in cases)
+    report_counts = Counter(row["cause_id"] for row in repair_linked)
+
+    require(len(repair_linked) == 162 and len(report_only) == 102,
+            "causal-selection cohort partition differs")
+    require(statuses["repair_backed_primary"] == 149 and statuses["repair_backed_duplicate"] == 13,
+            "causal-selection primary or duplicate count differs")
+    require(len(audit) == 149 and {row["cause_id"] for row in audit} == set(causes) == set(support),
+            "causal-selection audit cause coverage differs")
+
+    for row in audit:
+        cause_id = row["cause_id"]
+        cause = causes[cause_id]
+        evidence = support[cause_id]
+        expected = {
+            "primary_report_id": cause["primary_report_id"],
+            "repair_linked_report_count": str(report_counts[cause_id]),
+            "first_invalid_decision_site": evidence["first_invalid_decision_site"],
+            "primary_obligation": cause["obligation_family"],
+            "secondary_obligations": cause["secondary_obligation_families"],
+            "landed_patch": evidence["landed_patch"],
+            "source_contrast": evidence["source_contrast"],
+            "regression_test": evidence["regression_test"],
+            "developer_diagnosis": evidence["developer_diagnosis"],
+            "public_reproduction_evidence": evidence["public_reproduction_evidence"],
+            "support_basis": evidence["support_basis"],
+            "case_path": cause["case_path"],
+        }
+        require(all(row[field] == value for field, value in expected.items()),
+                f"causal-selection evidence differs: {cause_id}")
+        require(row["final_decision_status"] == "resolved_unique"
+                and row["final_primary_obligation_status"] == "resolved_unique",
+                f"unresolved final causal selection: {cause_id}")
+        require(bool(row["primary_obligation_basis"].strip()),
+                f"missing primary-obligation basis: {cause_id}")
+        case_path = ROOT / row["case_path"]
+        require(case_path.is_file(), f"missing causal-selection case: {cause_id}")
+        match = re.search(r"^## Causal basis\s*$\n+(.*?)(?=\n## |\Z)",
+                          case_path.read_text(encoding="utf-8"), re.MULTILINE | re.DOTALL)
+        require(match is not None, f"missing causal basis in case report: {cause_id}")
+        causal_basis = re.sub(r"\s+", " ", match.group(1)).strip()
+        require(row["causal_basis"] == causal_basis,
+                f"causal-selection basis differs from case report: {cause_id}")
+
+    final = {
+        "unique_first_invalid_decisions": len(audit),
+        "unresolved_first_invalid_decisions": 0,
+        "unique_primary_obligations": len(audit),
+        "unresolved_primary_obligations": 0,
+    }
+    require(summary["final_causal_selection"] == final, "final causal-selection counts differ")
+    require(summary["cohort_accounting"] == {
+        "confirmed_reports": 264,
+        "repair_linked_reports": 162,
+        "primary_cause_reports": 149,
+        "duplicate_reports": 13,
+        "distinct_repaired_causes": 149,
+        "reports_without_traceable_landed_repair": 102,
+    }, "causal-selection cohort summary differs")
+
+    historical = summary["historical_candidate_accounting"]
+    require(historical["status"] == "not_recorded"
+            and historical["initial_multiple_operation_candidates"] is None
+            and historical["initial_multiple_obligation_candidates"] is None
+            and historical["resolved_from_initial_multiple_candidates"] is None,
+            "historical candidate availability differs")
+
+    weaker = [row for row in audit
+              if row["regression_test"] == "no" and row["developer_diagnosis"] == "no"]
+    weaker_compound = [row for row in weaker if row["secondary_obligations"]]
+    require(len(weaker) == 13 and len(weaker_compound) == 6,
+            "weaker causal-selection evidence counts differ")
+    require(sum(not row["secondary_obligations"] for row in weaker) == 7
+            and sum(row["public_reproduction_evidence"] == "yes" for row in weaker) == 6,
+            "weaker causal-selection support differs")
+    require(summary["stronger_evidence_accounting"] == {
+        "landed_patch_and_source_contrast": 149,
+        "also_regression_or_developer_diagnosis": 136,
+        "without_regression_or_developer_diagnosis": 13,
+        "weaker_single_obligation": 7,
+        "weaker_compound_obligation": 6,
+        "weaker_with_public_reproduction": 6,
+    }, "stronger-evidence causal-selection summary differs")
+
+    no_repair = summary["reports_without_traceable_repair"]
+    require(no_repair["reports"] == 102
+            and no_repair["open"] == sum(not row["closed_at"].strip() for row in report_only) == 70
+            and no_repair["closed"] == sum(bool(row["closed_at"].strip()) for row in report_only) == 32,
+            "report-only open or closed counts differ")
+    require(no_repair["with_observed_decision"] == sum(bool(row["observed_decision"].strip()) for row in report_only) == 102
+            and no_repair["with_reported_proposal_or_workaround"]
+            == sum(bool(row["reported_repair_or_workaround"].strip()) for row in report_only) == 100,
+            "report-only evidence counts differ")
+    missing = {
+        "fix_patch": sum(not row["fix_patches"].strip() for row in report_only),
+        "fix_url": sum(not row["fix_urls"].strip() for row in report_only),
+        "semantic_repair": sum(not row["repair"].strip() for row in report_only),
+    }
+    require(no_repair["missing_fields"] == missing == {
+        "fix_patch": 102, "fix_url": 102, "semantic_repair": 102,
+    }, "report-only missing-field counts differ")
+    require(summary["schema_version"] == "1.0.0" and summary["status"] == "complete",
+            "causal-selection summary status differs")
+    return final
 
 
 def verify_manifest() -> int:
@@ -275,6 +391,7 @@ def verify() -> dict[str, object]:
         "collection": verify_collection_frame(),
         "cohort": verify_cohort(),
         "analysis_rows": verify_analysis_outputs(),
+        "causal_selection": verify_causal_selection(),
         "data_manifest_files": verify_manifest(),
         "results": verify_results(),
         "sensitivity": verify_sensitivity(),
