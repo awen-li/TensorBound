@@ -1,0 +1,40 @@
+{
+  "coverage": {
+    "cause_records": 149,
+    "cause_records_reviewed_by_each_human": 149,
+    "duplicate_report_links": 13,
+    "evidence_inspected": [
+      "archived report and assembled case dossier",
+      "affected, pre-fix, and fixed revisions",
+      "cited source paths and operations",
+      "linked commits and repair patches",
+      "available regression tests, developer diagnoses, and reproduction evidence"
+    ],
+    "fields_checked": [
+      "first invalid decision",
+      "relation family",
+      "transition family",
+      "primary validity obligation",
+      "secondary obligations",
+      "failure family",
+      "repair strategy and repair site",
+      "physical effect and observed consequence",
+      "provenance origin and consumer endpoints",
+      "duplicate links"
+    ],
+    "repair_linked_report_assignments": 162
+  },
+  "documentation_basis": "Author-confirmed description of the completed human review recorded on 2026-10-08.",
+  "interpretation": {
+    "measures": "Complete two-human evidence-based confirmation of the final source-linked cause records and their coding.",
+    "separate_unmeasured_quantity": "Independent pre-adjudication agreement on source-operation localization."
+  },
+  "outcome": {
+    "both_reviewers_confirmed_all_final_records": true,
+    "issues_resolved_by_evidence_based_correction": true,
+    "unresolved_final_cause_records": 0
+  },
+  "review_mode": "iterative evidence-based confirmation of assembled cause dossiers",
+  "reviewers": 2,
+  "schema_version": "1.0.0"
+}

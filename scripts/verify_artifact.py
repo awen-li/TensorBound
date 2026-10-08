@@ -255,6 +255,51 @@ def verify_causal_selection() -> dict[str, object]:
     return final
 
 
+def verify_human_validation_coverage() -> dict[str, object]:
+    coverage_record = read_json("results/human-validation-coverage.json")
+    coverage = coverage_record["coverage"]
+    outcome = coverage_record["outcome"]
+    cases = read_csv("data/final/cases.csv")
+    causes = read_csv("results/rq-cause-analysis.csv")
+    repair_linked = [row for row in cases if row["analysis_status"].startswith("repair_backed_")]
+    duplicates = [row for row in cases if row["analysis_status"] == "repair_backed_duplicate"]
+    required_fields = {
+        "first invalid decision",
+        "relation family",
+        "transition family",
+        "primary validity obligation",
+        "secondary obligations",
+        "failure family",
+        "repair strategy and repair site",
+        "physical effect and observed consequence",
+        "provenance origin and consumer endpoints",
+        "duplicate links",
+    }
+    require(coverage_record["schema_version"] == "1.0.0", "human-validation schema differs")
+    require(coverage_record["reviewers"] == 2, "human reviewer count differs")
+    require(coverage["cause_records"] == coverage["cause_records_reviewed_by_each_human"] == len(causes) == 149,
+            "human cause-record coverage differs")
+    require(coverage["repair_linked_report_assignments"] == len(repair_linked) == 162,
+            "human repair-linked coverage differs")
+    require(coverage["duplicate_report_links"] == len(duplicates) == 13,
+            "human duplicate-link coverage differs")
+    require(set(coverage["fields_checked"]) == required_fields,
+            "human validation field coverage differs")
+    require(len(coverage["evidence_inspected"]) == 5,
+            "human validation evidence coverage differs")
+    require(outcome["both_reviewers_confirmed_all_final_records"] is True
+            and outcome["issues_resolved_by_evidence_based_correction"] is True
+            and outcome["unresolved_final_cause_records"] == 0,
+            "human validation outcome differs")
+    return {
+        "reviewers": coverage_record["reviewers"],
+        "cause_records_reviewed_by_each": coverage["cause_records_reviewed_by_each_human"],
+        "repair_linked_report_assignments": coverage["repair_linked_report_assignments"],
+        "duplicate_report_links": coverage["duplicate_report_links"],
+        "unresolved_final_cause_records": outcome["unresolved_final_cause_records"],
+    }
+
+
 def verify_manifest() -> int:
     manifest = read_json("results/artifact-manifest.json")
     expected = set()
@@ -392,6 +437,7 @@ def verify() -> dict[str, object]:
         "cohort": verify_cohort(),
         "analysis_rows": verify_analysis_outputs(),
         "causal_selection": verify_causal_selection(),
+        "human_validation": verify_human_validation_coverage(),
         "data_manifest_files": verify_manifest(),
         "results": verify_results(),
         "sensitivity": verify_sensitivity(),

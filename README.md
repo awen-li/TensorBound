@@ -32,6 +32,7 @@ Without Make, run `python3 scripts/verify_artifact.py` and
 | `data/final/` | 264 case reports, their index, and archived repair patches |
 | `results/` | Final RQ tables, source paths, codebooks, selection, and sensitivity results |
 | `results/causal-selection-audit.csv` | Final decision, primary-obligation status, selection basis, and evidence links for 149 repaired causes |
+| `results/human-validation-coverage.json` | Scope, evidence, coded fields, and outcome of the completed two-human review |
 | `results/statistics/` | Published agreement summaries and final exclusion-audit data |
 | `results/artifact-manifest.json` | Data inventory with sizes, hashes, and source revision |
 | `tensorbound/` | GitHub/CVE collection code and supporting storage utilities |
@@ -62,6 +63,13 @@ but every record lacks an archived landed patch and public fix URL for the
 pre-fix/repaired causal contrast. Seventy remain open, 32 are closed, and 100
 contain a proposal or workaround. These reports remain in report-level
 analyses.
+
+Both human reviewers inspected all 149 final cause records and their underlying
+source and repair evidence. Their review covered primary labels, secondary
+obligations, provenance endpoints, and duplicate links. Identified issues were
+corrected against the evidence, and both reviewers agreed on the final records.
+This iterative confirmation is documented separately from unmeasured blinded
+pre-adjudication localization agreement.
 
 ## License and data use
 

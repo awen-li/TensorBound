@@ -15800,9 +15800,9 @@
       "sha256": "7b5d3a0e49166eb14c81a10473eab744440c73f7741e20827bd2993ad8361e80"
     },
     {
-      "bytes": 3098,
+      "bytes": 3630,
       "path": "results/README.md",
-      "sha256": "bdcdf5678f9d3a1fb5267822d5ef595b8faa457c3422f7f669487e9f1e6e149a"
+      "sha256": "74450bc9fdfc02d3de6afdbdcd2f0766caa43baa12681833b09ce236b26a7f57"
     },
     {
       "bytes": 1742,
@@ -15838,6 +15838,11 @@
       "bytes": 162589,
       "path": "results/historical-alignment.csv",
       "sha256": "89413f97ae7ba1dbedee39896afefe39ff4b6ca203b9fe8b382ed611e5a44ad2"
+    },
+    {
+      "bytes": 1534,
+      "path": "results/human-validation-coverage.json",
+      "sha256": "22711af5b0aecab7d5dd4135b5094c958ca1283607930d05f855ff132cec010f"
     },
     {
       "bytes": 3605,

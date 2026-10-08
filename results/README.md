@@ -47,6 +47,14 @@ open and 32 closed reports. Every case lacks a patch and public fix URL for the
 source contrast required by the cause-level analysis. One hundred record a
 proposal or workaround.
 
+`human-validation-coverage.json` records the completed human review. Both
+reviewers inspected all 149 final cause records against the archived reports,
+source revisions, operations, commits, patches, and available corroborating
+evidence. Their review covered primary and secondary coding, provenance
+endpoints, and the 13 duplicate links across 162 repair-linked reports. The
+record documents final consensus after evidence-based correction; independent
+pre-adjudication localization agreement remains a separate unmeasured value.
+
 `artifact-manifest.json` records the size and hash of every released data and
 result file, excluding the manifest itself. The validator checks these hashes
 and recomputes the main distributions. Source data and final labels are
