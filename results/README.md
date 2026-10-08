@@ -9,6 +9,12 @@ published records and aggregate results.
 `selection-summary.json` preserves the published cohort-flow totals. Intermediate
 per-pass selection columns are omitted.
 
+`scope-boundary-examples.csv` links three included/excluded pairs to archived
+source evidence and states the decisive construct distinction for each pair.
+Its seventh row illustrates a separate selection limit: the record establishes
+a symptom, while the proximal mechanism remains unresolved. The final
+membership field is checked against `selection.csv`.
+
 `statistics/` contains final agreement summaries, final exclusion-audit
 decisions and weights, the 19 observed omissions, and report-level sensitivity
 results. The artifact omits intermediate A/B coding files, review scripts,

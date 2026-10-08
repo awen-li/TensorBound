@@ -300,6 +300,50 @@ def verify_human_validation_coverage() -> dict[str, object]:
     }
 
 
+def verify_scope_boundary_examples() -> dict[str, object]:
+    examples = read_csv("results/scope-boundary-examples.csv")
+    selection = {row["record_id"]: row["final_membership"]
+                 for row in read_csv("results/selection.csv")}
+    cases = {
+        f"github-{row['repository'].replace('/', '-')}-{row['case_id']}"
+        for row in read_csv("data/final/cases.csv")
+    }
+    paired_groups = {"offset-semantics", "numeric-semantics", "compiler-state-ownership"}
+
+    require(len(examples) == 7, "scope-boundary example count differs")
+    for row in examples:
+        require(selection.get(row["record_id"]) == row["membership"],
+                f"scope-boundary membership differs: {row['record_id']}")
+        require(bool(row["decisive_evidence"].strip()) and bool(row["selection_reason"].strip()),
+                f"scope-boundary explanation is empty: {row['record_id']}")
+        evidence_paths = [item.strip() for item in row["evidence_paths"].split(";") if item.strip()]
+        require(evidence_paths, f"scope-boundary evidence is empty: {row['record_id']}")
+        require(all((ROOT / item).is_file() for item in evidence_paths),
+                f"scope-boundary evidence path is missing: {row['record_id']}")
+
+    for group in paired_groups:
+        pair = [row for row in examples if row["example_group"] == group]
+        require(len(pair) == 2 and {row["role"] for row in pair} == {"included", "excluded"},
+                f"scope-boundary pair differs: {group}")
+        require({row["membership"] for row in pair} == {"retained", "excluded"}
+                and {row["evidence_status"] for row in pair} == {"mechanism_established"},
+                f"scope-boundary pair status differs: {group}")
+        retained = next(row for row in pair if row["membership"] == "retained")
+        require(retained["record_id"] in cases, f"scope-boundary retained case is absent: {group}")
+
+    limited = [row for row in examples if row["example_group"] == "documentation-limitation"]
+    require(len(limited) == 1
+            and limited[0]["role"] == "evidence_limited"
+            and limited[0]["membership"] == "excluded"
+            and limited[0]["evidence_status"] == "mechanism_not_established",
+            "mechanism-documentation example differs")
+    return {
+        "paired_construct_boundaries": len(paired_groups),
+        "paired_records": 2 * len(paired_groups),
+        "evidence_limited_records": len(limited),
+    }
+
+
 def verify_manifest() -> int:
     manifest = read_json("results/artifact-manifest.json")
     expected = set()
@@ -438,6 +482,7 @@ def verify() -> dict[str, object]:
         "analysis_rows": verify_analysis_outputs(),
         "causal_selection": verify_causal_selection(),
         "human_validation": verify_human_validation_coverage(),
+        "scope_boundaries": verify_scope_boundary_examples(),
         "data_manifest_files": verify_manifest(),
         "results": verify_results(),
         "sensitivity": verify_sensitivity(),

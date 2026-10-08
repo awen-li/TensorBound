@@ -33,6 +33,7 @@ Without Make, run `python3 scripts/verify_artifact.py` and
 | `results/` | Final RQ tables, source paths, codebooks, selection, and sensitivity results |
 | `results/causal-selection-audit.csv` | Final decision, primary-obligation status, selection basis, and evidence links for 149 repaired causes |
 | `results/human-validation-coverage.json` | Scope, evidence, coded fields, and outcome of the completed two-human review |
+| `results/scope-boundary-examples.csv` | Three paired construct-boundary examples and one mechanism-documentation example, each linked to archived evidence |
 | `results/statistics/` | Published agreement summaries and final exclusion-audit data |
 | `results/artifact-manifest.json` | Data inventory with sizes, hashes, and source revision |
 | `tensorbound/` | GitHub/CVE collection code and supporting storage utilities |
@@ -70,6 +71,12 @@ obligations, provenance endpoints, and duplicate links. Identified issues were
 corrected against the evidence, and both reviewers agreed on the final records.
 This iterative confirmation is documented separately from unmeasured blinded
 pre-adjudication localization agreement.
+
+The paired scope examples contrast operation semantics with storage-offset
+preservation, numerical semantics with external representation, and compiler
+metadata with runtime ownership. A separate evidence-limited example records a
+reproducible symptom whose causal operation remains unidentified. These records
+distinguish construct exclusion from insufficient mechanism documentation.
 
 ## License and data use
 

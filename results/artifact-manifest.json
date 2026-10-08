@@ -15800,9 +15800,9 @@
       "sha256": "7b5d3a0e49166eb14c81a10473eab744440c73f7741e20827bd2993ad8361e80"
     },
     {
-      "bytes": 3630,
+      "bytes": 3988,
       "path": "results/README.md",
-      "sha256": "74450bc9fdfc02d3de6afdbdcd2f0766caa43baa12681833b09ce236b26a7f57"
+      "sha256": "c4bc5f3abeb5d6b7b0aa69c7df15d6c94cf2af1803aff91cb3f10761ae8fbe76"
     },
     {
       "bytes": 1742,
@@ -15918,6 +15918,11 @@
       "bytes": 9873,
       "path": "results/rq6-summary.json",
       "sha256": "944cb248014d9321aa3726ca25c11509362535c5149e8bb43418bcf3af80b2e2"
+    },
+    {
+      "bytes": 3224,
+      "path": "results/scope-boundary-examples.csv",
+      "sha256": "2a990cf78c61d72742e946ba6a90c4a010b1adc736b8b4e33ed9f304ac49f1f1"
     },
     {
       "bytes": 302,

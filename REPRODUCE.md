@@ -20,6 +20,7 @@ It makes no changes to the data and requires no network access.
 | 45 taxonomy definitions and examples | `results/taxonomy-codebook.json` |
 | 149 final causal selections and zero unresolved final fields | `results/causal-selection-audit.csv`, `results/causal-selection-audit-summary.json` |
 | Complete two-human review coverage for final cause records | `results/human-validation-coverage.json` |
+| Three paired scope boundaries and one evidence-limited exclusion | `results/scope-boundary-examples.csv` and its archived evidence paths |
 
 The manifest verifies the packaged data inventory and file contents. The
 collection totals are checked against the declared frame; this is not a new
