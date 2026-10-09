@@ -202,7 +202,7 @@ Scatter reinplacing is allowed only when its source storage is independent of th
 
 ## Invalid decision
 
-The in-place safety test considered future consumers of the destination but omitted the storage identity of another operand used by the mutation itself.
+The pre-fix in-place safety test considered later uses of `inp` but omitted the comparison between `get_node_storage(inp)` and `get_node_storage(src)`.
 
 ## Physical effect
 

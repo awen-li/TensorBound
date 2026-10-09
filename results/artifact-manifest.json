@@ -15,9 +15,9 @@
       "sha256": "b61c31c2668eb2cc5b90cb41a010e0bea24d812822477340483e1371325ee084"
     },
     {
-      "bytes": 387062,
+      "bytes": 387060,
       "path": "data/final/cases.csv",
-      "sha256": "7b2e8d2b76df948df9a1f07c90488309748623de1c7bf1770d71e7d87becc52d"
+      "sha256": "51a1a668692b4abe633df4f81112ccb2ab6eefc3e5e4fa96dfa22c142e107a1e"
     },
     {
       "bytes": 5002,
@@ -1790,9 +1790,9 @@
       "sha256": "1e4af4eda8373adec0d2fc156ebab828b4a7d9d6f5be3f82bf3c4fc9d32cdcd6"
     },
     {
-      "bytes": 11156,
+      "bytes": 11155,
       "path": "data/final/pytorch/197829/report.md",
-      "sha256": "918acf1cb2084aaa495792297efda95b32983daf6144976d07ed9aad9dc23bb0"
+      "sha256": "3f68d8f340f8ac22abd5d3932e8abe9d551b76651c8e9c477ae40b286c0ba2b1"
     },
     {
       "bytes": 8497,
@@ -15875,9 +15875,9 @@
       "sha256": "1fde7b0056108b1f2ac538fc09d68d6a54dcca012b84294263b9ba57f40201a5"
     },
     {
-      "bytes": 169245,
+      "bytes": 169244,
       "path": "results/rq-cause-analysis.csv",
-      "sha256": "9cfd83c5d10a51cfe30e170a576fa0202316d5c13c2889fe29cb3adfa1e5438d"
+      "sha256": "c6c05d9580f1ca07d478eb292ba061303ac5e2b1de90ea449b537b5fa8ca965d"
     },
     {
       "bytes": 283806,
@@ -15910,9 +15910,9 @@
       "sha256": "c48eeb1e20559668d019c61808a819292fcf958b2a4fc2d0e424654e0ae0f73d"
     },
     {
-      "bytes": 119002,
+      "bytes": 119009,
       "path": "results/rq6-repair-relevant-facts.csv",
-      "sha256": "ea1d9f2a49330ffa4a904a2e646519503fcaad238029b9d3bfa13b8891005b76"
+      "sha256": "79b40bd0ea90912914a1cecb8c0c06f96b9fd93ce2c7948aef57384e54d7cf58"
     },
     {
       "bytes": 9873,
