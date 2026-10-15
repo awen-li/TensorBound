@@ -34,6 +34,22 @@ decisions. The targeted recheck does not estimate population recall. The
 artifact omits intermediate A/B coding files, review scripts, prompts, and
 blank audit templates.
 
+Every row in `statistics/omitted-positive-sensitivity.csv` includes an
+`evidence_path` to an archived report snapshot. The three positives drawn from
+screening exclusions are archived alongside the 16 positives whose reports
+were already retained for detailed review. The release records final decisions
+for all 142 rechecks; it lacks raw snapshots for 63 screen-excluded negatives.
+The three added snapshots record their 2026-10-15 retrieval time and GitHub
+response metadata. They support evidence inspection; they do not recreate the
+historical screening run.
+
+`statistics/construct-boundary-sensitivity.json` removes all 23 causes in the
+value--operation/identity relation family from a secondary calculation while
+leaving their final scope labels unchanged. The remaining 126 causes preserve
+the three leading failure families, with a different order. The repository-level
+consequence counts in `rq5-impact-summary.json` keep the five query frames
+visible instead of interpreting the pooled count as a common population rate.
+
 The authors report that two human reviewers confirmed all final repair-centered
 accounts after iterative review and correction. Item-level reviewer logs are
 unavailable. Archived A/B agreement is descriptive: original actor identities

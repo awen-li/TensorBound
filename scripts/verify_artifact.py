@@ -435,8 +435,23 @@ def verify_results():
         require(dict(Counter(r[field] for r in provenance)) == ps[field], f"RQ2 differs: {field}")
     impacts = read_csv("results/rq5-report-impacts.csv")
     consequence = Counter(r["primary_observed_consequence"] for r in impacts)
-    require(dict(consequence) == read_json("results/rq5-impact-summary.json")["primary_observed_consequence"],
+    impact_summary = read_json("results/rq5-impact-summary.json")
+    require(dict(consequence) == impact_summary["primary_observed_consequence"],
             "report consequence counts differ")
+    published_by_repository = impact_summary["primary_observed_consequence_by_repository"]
+    repositories = {r["repository"] for r in impacts}
+    consequence_families = set(impact_summary["primary_observed_consequence"])
+    require(set(published_by_repository) == repositories,
+            "repository consequence frames differ")
+    for repository, published in published_by_repository.items():
+        repository_rows = [r for r in impacts if r["repository"] == repository]
+        observed = Counter(r["primary_observed_consequence"] for r in repository_rows)
+        require(set(published) == consequence_families | {"reports"},
+                f"repository consequence families differ: {repository}")
+        expected = {family: published[family] for family in consequence_families}
+        require(published["reports"] == len(repository_rows) and
+                expected == {family: observed.get(family, 0) for family in consequence_families},
+                f"repository consequence counts differ: {repository}")
     pairs = Counter()
     secondary_causes = secondary_labels = 0
     for row in causes:
@@ -488,6 +503,14 @@ def verify_sensitivity():
     require({r["record_id"] for r in omissions} == {r["record_id"] for r in positives}, "omission IDs differ")
     require(all("sampling_weight" not in row for row in omissions),
             "omission export contains unsupported sampling weights")
+    for row in omissions:
+        evidence_path = ROOT / row["evidence_path"]
+        require(evidence_path.resolve().is_relative_to(ROOT)
+                and evidence_path.is_file(),
+                f"omission evidence is missing: {row['record_id']}")
+        evidence_record = json.loads(evidence_path.read_text(encoding="utf-8"))
+        require(evidence_record["record_id"] == row["record_id"],
+                f"omission evidence ID differs: {row['record_id']}")
     published = read_json("results/statistics/selection-sensitivity-summary.json")
     primary = Counter(r["primary_observed_consequence"] for r in read_csv("results/rq5-report-impacts.csv"))
     observed = primary + Counter(r["primary_consequence"] for r in omissions)
@@ -497,6 +520,23 @@ def verify_sensitivity():
             and published["known_in_scope_reports"] == len(cases) + len(omissions)
             and published["population_recall"] is None,
             "selection-sensitivity accounting differs")
+    omission_distributions = published["observed_omitted_report_distributions"]
+    for name, field in {
+        "primary_consequence": "primary_consequence",
+        "relation_family": "relation_family",
+        "repository": "repository",
+        "review_evidence_status": "review_evidence_status",
+        "stack": "stack",
+        "transition_family": "transition_family",
+    }.items():
+        require(dict(Counter(r[field] for r in omissions)) == omission_distributions[name],
+                f"omission distribution differs: {name}")
+    cause_sensitivity = published["cause_level_sensitivity"]
+    primary_report_ids = {r["primary_report_id"] for r in read_csv("results/rq-cause-analysis.csv")}
+    require(cause_sensitivity["completed_repair_linked_reconstructions"] == 0
+            and cause_sensitivity["status"] == "not estimated"
+            and not ({r["record_id"] for r in omissions} & primary_report_ids),
+            "omission cause-level reconstruction status differs")
     require(dict(observed) == published["combined_observed_report_consequences"],
             "observed consequence sensitivity differs")
     evidence = read_json("results/evidence-sensitivity.json")
@@ -524,6 +564,30 @@ def verify_sensitivity():
                     f"sensitivity count differs: {family}")
             require(abs(row["change_percentage_points"] - 100 * (subset[family]/136 - full[family]/149)) < 1e-9,
                     f"sensitivity percentage differs: {family}")
+    boundary = read_json("results/statistics/construct-boundary-sensitivity.json")
+    require(boundary["boundary_family"] == "value--operation/identity",
+            "construct-boundary family differs")
+    restricted = [r for r in causes if r["relation_family"] != boundary["boundary_family"]]
+    full_failures = dict(Counter(r["failure_mode"] for r in causes))
+    restricted_failures = dict(Counter(r["failure_mode"] for r in restricted))
+    require(boundary["full_causes"] == len(causes)
+            and boundary["boundary_family_causes"] == len(causes) - len(restricted)
+            and boundary["restricted_causes"] == len(restricted)
+            and boundary["failure_mode"]["full"] == full_failures
+            and boundary["failure_mode"]["restricted"] == restricted_failures,
+            "construct-boundary sensitivity differs")
+    leading = boundary["leading_three_restricted"]
+    actual_leading = sorted(restricted_failures,
+                            key=lambda family: (-restricted_failures[family], family))[:3]
+    require(leading["families"] == actual_leading == [
+        "missing eligibility check",
+        "lost or omitted relation",
+        "incorrect mapping or translation",
+    ], "construct-boundary leading families differ")
+    leading_count = sum(restricted_failures[family] for family in leading["families"])
+    require(leading["causes"] == leading_count
+            and abs(leading["percent"] - 100 * leading_count / len(restricted)) < 1e-9,
+            "construct-boundary leading-family sensitivity differs")
     patches = jsonl("results/repair-patch-index.jsonl")
     require(len(patches) == 167 and {p["cause_id"] for p in patches} == set(support), "patch coverage differs")
     for patch in patches:
@@ -535,7 +599,9 @@ def verify_sensitivity():
     return {"final_codebook_rechecks": len(audit), "carried_prior_decisions": 2374,
             "observed_omissions": len(omissions), "known_in_scope": sum(observed.values()),
             "population_recall": None,
-            "stronger_evidence_causes": len(stronger), "archived_patches": len(patches)}
+            "stronger_evidence_causes": len(stronger),
+            "construct_boundary_restricted_causes": len(restricted),
+            "archived_patches": len(patches)}
 
 
 def verify() -> dict[str, object]:

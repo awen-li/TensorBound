@@ -13,9 +13,11 @@ It makes no changes to the data and requires no network access.
 | RQ2 origin and consumer layers; 71 differing endpoint pairs | `results/rq2-provenance-analysis.csv` |
 | RQ4 secondary obligations: 68 causes, 72 labels | `results/rq-cause-analysis.csv` |
 | RQ5 consequences for 264 reports | `results/rq5-report-impacts.csv` |
+| RQ5 consequences by five repository query frames | `results/rq5-report-impacts.csv`, `results/rq5-impact-summary.json` |
 | A/B and reconciled failure-family marginals | `results/statistics/taxonomy-agreement-summary.json` |
 | RQ6 four diagnostic attempts | `results/rq6-diagnostic-attempts.csv` |
 | 142 final-codebook rechecks and 19 observed omissions | `results/statistics/exclusion-audit.jsonl`, `omitted-positive-sensitivity.csv` |
+| Construct-boundary sensitivity excluding 23 value--operation/identity causes | `results/rq-cause-analysis.csv`, `results/statistics/construct-boundary-sensitivity.json` |
 | Full versus 136-cause stronger-evidence distributions | `results/historical-alignment.csv`, `results/evidence-sensitivity.json` |
 | 167 indexed repair patches | `results/repair-patch-index.jsonl` and the referenced patches |
 | 45 taxonomy definitions and examples | `results/taxonomy-codebook.json` |

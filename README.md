@@ -61,6 +61,17 @@ decisions or primary obligations. The checks verify packaged results; they do
 not rerun the historical review process or measure independent localization
 agreement.
 
+The sensitivity outputs also separate primary-cohort consequences by the five
+repository query frames and recompute failure-family counts after
+removing the 23 value--operation/identity causes closest to the construct
+boundary.
+
+Each of the 19 recheck-positive rows links to an archived report snapshot.
+Sixteen snapshots were already part of the 780 reports advanced to detailed
+review; the release also archives the three positives found among screening
+exclusions. The recheck table retains final decisions for all 142 records, while
+raw report snapshots for 63 screen-excluded negatives are outside the release.
+
 The 102 report-only cases establish an in-scope failure and observed effect,
 but every record lacks an archived landed patch and public fix URL for the
 pre-fix/repaired causal contrast. Seventy remain open, 32 are closed, and 100

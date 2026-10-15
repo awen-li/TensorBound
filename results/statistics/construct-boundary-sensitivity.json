@@ -1,0 +1,39 @@
+{
+  "schema_version": "1.0.0",
+  "boundary_family": "value--operation/identity",
+  "full_causes": 149,
+  "boundary_family_causes": 23,
+  "restricted_causes": 126,
+  "interpretation": "This sensitivity removes the relation family closest to the construct boundary while keeping the final scope labels unchanged. It tests whether the leading failure-family concentration depends on those cases.",
+  "failure_mode": {
+    "full": {
+      "incorrect mapping or translation": 35,
+      "lost or omitted relation": 32,
+      "missing eligibility check": 37,
+      "missing ordering or enforcement": 8,
+      "omitted operation": 5,
+      "premature invalidation or stale state": 3,
+      "premature or unordered transition": 10,
+      "unsound assumption or inference": 19
+    },
+    "restricted": {
+      "incorrect mapping or translation": 25,
+      "lost or omitted relation": 28,
+      "missing eligibility check": 34,
+      "missing ordering or enforcement": 8,
+      "omitted operation": 4,
+      "premature invalidation or stale state": 2,
+      "premature or unordered transition": 10,
+      "unsound assumption or inference": 15
+    }
+  },
+  "leading_three_restricted": {
+    "families": [
+      "missing eligibility check",
+      "lost or omitted relation",
+      "incorrect mapping or translation"
+    ],
+    "causes": 87,
+    "percent": 69.04761904761905
+  }
+}

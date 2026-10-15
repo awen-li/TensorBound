@@ -10,6 +10,59 @@
     "resource leak or exhaustion": 12,
     "other observable failure": 3
   },
+  "primary_observed_consequence_by_repository": {
+    "iree-org/iree": {
+      "reports": 74,
+      "incorrect result or state": 33,
+      "runtime rejection or crash": 14,
+      "memory-access violation": 11,
+      "data race": 4,
+      "hang or deadlock": 5,
+      "resource leak or exhaustion": 5,
+      "other observable failure": 2
+    },
+    "jax-ml/jax": {
+      "reports": 77,
+      "incorrect result or state": 41,
+      "runtime rejection or crash": 21,
+      "memory-access violation": 2,
+      "data race": 1,
+      "hang or deadlock": 4,
+      "resource leak or exhaustion": 7,
+      "other observable failure": 1
+    },
+    "openxla/xla": {
+      "reports": 14,
+      "incorrect result or state": 8,
+      "runtime rejection or crash": 4,
+      "memory-access violation": 1,
+      "data race": 0,
+      "hang or deadlock": 1,
+      "resource leak or exhaustion": 0,
+      "other observable failure": 0
+    },
+    "pytorch/pytorch": {
+      "reports": 71,
+      "incorrect result or state": 65,
+      "runtime rejection or crash": 2,
+      "memory-access violation": 4,
+      "data race": 0,
+      "hang or deadlock": 0,
+      "resource leak or exhaustion": 0,
+      "other observable failure": 0
+    },
+    "triton-lang/triton": {
+      "reports": 28,
+      "incorrect result or state": 21,
+      "runtime rejection or crash": 0,
+      "memory-access violation": 5,
+      "data race": 0,
+      "hang or deadlock": 2,
+      "resource leak or exhaustion": 0,
+      "other observable failure": 0
+    }
+  },
+  "frame_interpretation": "Five repository query frames feed three study stacks. PyTorch requires both an Inductor label and a silent-correctness label; IREE, JAX, XLA, and Triton use their stated bug predicates. Repository-level counts preserve this difference; a PyTorch/Triton aggregate would mix predicates.",
   "nonexclusive_security_relevant_signals": {
     "memory_access_signal": 23,
     "concurrency_signal": 14,
