@@ -37,7 +37,7 @@ Without Make, run `python3 scripts/verify_artifact.py` and
 | `results/human-validation-coverage.json` | Scope, evidence, coded fields, and outcome of the completed two-human review |
 | `results/scope-boundary-examples.csv` | Three paired construct-boundary examples and one mechanism-documentation example, each linked to archived evidence |
 | `results/statistics/` | Agreement summaries, 142 final-codebook rechecks, and the 19 observed omissions |
-| `results/artifact-manifest.json` | Data inventory with sizes, hashes, and source revision |
+| `results/artifact-manifest.json` | Data inventory with sizes and hashes |
 | `tensorbound/` | GitHub/CVE collection code and supporting storage utilities |
 | `scripts/verify_artifact.py` | Read-only result and integrity checks |
 | `tests/` | Offline collector and artifact tests |

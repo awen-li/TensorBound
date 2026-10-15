@@ -16000,6 +16000,5 @@
       "sha256": "acf22dafe57ad2a8e6d57d406d49e3b239516dc4eb4d2beaa1bece8adfe777ea"
     }
   ],
-  "schema_version": "1.0.0",
-  "source_revision": "7bca222868c35ea6abf0372f1956d8e014cec5d5"
+  "schema_version": "1.0.0"
 }
