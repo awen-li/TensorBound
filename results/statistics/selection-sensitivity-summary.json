@@ -1,16 +1,11 @@
 {
-  "assumptions": [
-    "The frozen 264-report cohort is unchanged.",
-    "All 19 observed omissions remain report-level units; treating them as separate reports places an upper bound on the number of distinct mechanisms they could represent.",
-    "Relation and transition fields are coarse report-level descriptions from the audit and are not pooled with the 149 repaired-cause distributions.",
-    "Cause-level sensitivity requires a traceable landed repair, pre-fix/fixed reconstruction, and deduplication by invalid decision and repair."
-  ],
+  "analysis_cohort_reports": 264,
   "cause_level_sensitivity": {
     "completed_repair_linked_reconstructions": 0,
-    "reason": "The 19 audit positives have not completed the repair-linked reconstruction and deduplication applied to the 149 cause units.",
+    "reason": "The 19 observed positives have not undergone the repair-centered reconstruction and cause deduplication used for the 149 cause records.",
     "status": "not estimated"
   },
-  "combined_exact_report_consequence_scenario": {
+  "combined_observed_report_consequences": {
     "data race": 5,
     "hang or deadlock": 13,
     "incorrect result or state": 176,
@@ -19,55 +14,8 @@
     "resource leak or exhaustion": 14,
     "runtime rejection or crash": 48
   },
-  "combined_weighted_report_consequence_scenario": {
-    "data race": 5.0,
-    "hang or deadlock": 13.0,
-    "incorrect result or state": 178.36418511066398,
-    "memory-access violation": 26.364185110663982,
-    "other observable failure": 3.0,
-    "resource leak or exhaustion": 14.0,
-    "runtime rejection or crash": 50.36418511066398
-  },
-  "estimated_omitted_positive_reports": 26.092555331991953,
-  "estimated_omitted_report_distributions": {
-    "primary_consequence": {
-      "hang or deadlock": 1.0,
-      "incorrect result or state": 10.364185110663984,
-      "memory-access violation": 3.3641851106639837,
-      "resource leak or exhaustion": 2.0,
-      "runtime rejection or crash": 9.364185110663984
-    },
-    "relation_family": {
-      "operation--completion": 4.0,
-      "operation--execution context": 4.0,
-      "storage--ownership/lifetime": 2.0,
-      "value--operation/identity": 4.364185110663984,
-      "value--representation": 4.364185110663984,
-      "value--shared storage": 2.0,
-      "value--storage/layout": 5.364185110663984
-    },
-    "stack": {
-      "iree": 18.092555331991953,
-      "pytorch-inductor-triton": 2.0,
-      "xla-jax-pjrt": 6.0
-    },
-    "transition_family": {
-      "identity or index remapping": 7.7283702213279675,
-      "ordering or completion handoff": 4.0,
-      "ownership or lifetime change": 2.0,
-      "placement or context change": 4.0,
-      "representation or layout change": 6.364185110663984,
-      "storage, alias, or mutation change": 2.0
-    }
-  },
-  "estimated_positive_recall": 0.9100543779824659,
-  "estimated_positive_recall_simultaneous_95": [
-    0.6839378238341969,
-    0.9328621908127208
-  ],
-  "estimated_total_positive_reports": 290.09255533199195,
-  "frozen_main_cohort_reports": 264,
-  "observed_known_positive_frame": 283,
+  "interpretation": "The 283 records are the union of the 264-report analysis cohort and 19 in-scope reports found by a targeted recheck. This observed union is not a recall estimate.",
+  "known_in_scope_reports": 283,
   "observed_omitted_positive_reports": 19,
   "observed_omitted_report_distributions": {
     "primary_consequence": {
@@ -110,6 +58,6 @@
       "storage, alias, or mutation change": 2
     }
   },
-  "retained_share_of_observed_known_positives": 0.9328621908127208,
-  "schema_version": "2.0.0"
+  "population_recall": null,
+  "schema_version": "3.0.0"
 }

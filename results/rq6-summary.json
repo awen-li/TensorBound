@@ -3,24 +3,24 @@
   "diagnostic_attempt_denominator": 4,
   "diagnostic_cause_denominator": 3,
   "diagnostic_outcomes": {
-    "causal_explanation": {
+    "cause_explanation": {
       "no": 2,
       "not_evaluated": 2
     },
-    "failure_signal": {
+    "effect_detection": {
       "not_evaluated": 2,
       "yes": 2
     },
-    "invalid_decision_localization": {
+    "cause_localization": {
       "no": 1,
       "not_evaluated": 2,
       "yes": 1
     },
-    "relevant_path_execution": {
+    "failing_path_coverage": {
       "no": 2,
       "yes": 2
     },
-    "symptom_localization": {
+    "effect_localization": {
       "not_evaluated": 2,
       "yes": 2
     }
@@ -333,6 +333,6 @@
       }
     ],
     "raw_label_agreement": 0.9552572706935123,
-    "resolution_rule": "A label is published as secondary only when both independent reviewers selected it after the reconciled primary label is removed from each set."
+    "resolution_rule": "A label is published as secondary only when both archived coding passes selected it after the reconciled primary label is removed from each set."
   }
 }

@@ -1,6 +1,6 @@
 {
   "collected_records": 7509,
-  "final_membership": {
+  "frozen_primary_cohort_membership": {
     "excluded": 7245,
     "retained": 264
   },

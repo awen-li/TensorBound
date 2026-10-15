@@ -5,27 +5,43 @@ The primary analysis contains 264 reports and 149 distinct repaired causes.
 stores the source-linked paths. The RQ-specific CSV and JSON files contain the
 published records and aggregate results.
 
-`selection.csv` contains the final membership of all 7,509 collected records.
-`selection-summary.json` preserves the published cohort-flow totals. Intermediate
-per-pass selection columns are omitted.
+`rq6-diagnostic-attempts.csv` uses the manuscript's five diagnostic fields:
+failing-path coverage, effect detection, effect localization, cause
+localization, and cause explanation.
+
+`selection.csv` contains the frozen primary-cohort membership of all 7,509
+collected records. `selection-summary.json` preserves the published cohort-flow
+totals. Intermediate per-pass selection columns are omitted. The 19 positives
+found by the later recheck remain outside this frozen cohort and appear in the
+separate sensitivity files.
 
 `scope-boundary-examples.csv` links three included/excluded pairs to archived
 source evidence and states the decisive construct distinction for each pair.
 Its seventh row illustrates a separate selection limit: the record establishes
 a symptom, while the proximal mechanism remains unresolved. The final
-membership field is checked against `selection.csv`.
+cohort-membership field is checked against `selection.csv`.
 
-`statistics/` contains final agreement summaries, final exclusion-audit
-decisions and weights, the 19 observed omissions, and report-level sensitivity
-results. The artifact omits intermediate A/B coding files, review scripts,
-prompts, and blank audit templates. The original aggregate statistics are
-preserved without treating them as new independent measurements.
+Validity-obligation labels are assigned only after a record passes this scope
+test. In particular, `transformation equivalence` and `value semantics
+preservation` do not admit a transformation-local or numerical defect without
+an established value--operation, storage, representation, ownership, or
+execution relation.
 
-Two human reviewers confirmed the final causal reconstructions after iterative
-review and correction. Archived A/B agreement is descriptive: original actor
-identities and a complete pre-comparison definition freeze remain unverified.
-Pre-adjudication agreement on exact source operations remains unmeasured.
-The taxonomy codebook is a dated documentation snapshot.
+`statistics/` contains final agreement summaries, the 142 records that received
+a final-codebook recheck, the 19 observed omissions, and exact report-level
+sensitivity results. Another 2,374 examined exclusions retain earlier negative
+decisions. The targeted recheck does not estimate population recall. The
+artifact omits intermediate A/B coding files, review scripts, prompts, and
+blank audit templates.
+
+The authors report that two human reviewers confirmed all final repair-centered
+accounts after iterative review and correction. Item-level reviewer logs are
+unavailable. Archived A/B agreement is descriptive: original actor identities
+and a complete pre-comparison definition freeze remain unverified.
+Pre-adjudication agreement on exact source operations remains unmeasured. The
+taxonomy agreement summary retains the A, B, and reconciled failure-family
+marginals used for the ranking-sensitivity result. The taxonomy codebook is a
+dated documentation snapshot.
 
 `historical-alignment.csv` records revisions, source locations, and available
 causal evidence. `evidence-sensitivity.json` compares all 45 families with the
@@ -38,8 +54,9 @@ the final first-invalid-decision site and primary obligation to patch, source-
 contrast, regression, diagnosis, reproduction, and case-path evidence. Each
 row also reproduces the case report's concrete causal basis. The 149 row-level
 report counts sum to 162 repair-linked reports. The summary records
-149 unique final decisions, 149 unique final primary obligations, and zero
-unresolved final fields. It represents unavailable pre-adjudication candidate
+149 selected final decisions, 149 selected final primary obligations, and zero
+unresolved final fields. These are repair-supported coding outcomes, not an
+independent causal-localization result. It represents unavailable pre-adjudication candidate
 counts as JSON `null` with status `not_recorded`.
 
 The 13 causes outside the 136-cause stronger-evidence subset retain a landed
@@ -53,15 +70,15 @@ open and 32 closed reports. Every case lacks a patch and public fix URL for the
 source contrast required by the cause-level analysis. One hundred record a
 proposal or workaround.
 
-`human-validation-coverage.json` records the completed human review. Both
-reviewers inspected all 149 final cause records against the archived reports,
-source revisions, operations, commits, patches, and available corroborating
-evidence. Their review covered primary and secondary coding, provenance
-endpoints, and the 13 duplicate links across 162 repair-linked reports. The
-record documents final consensus after evidence-based correction; independent
-pre-adjudication localization agreement remains a separate unmeasured value.
+`human-validation-coverage.json` records the authors' account of the completed
+human review. Both reviewers inspected all 149 final cause records against the
+archived reports, source revisions, operations, commits, patches, and available
+corroborating evidence. Their review covered primary and secondary coding,
+provenance endpoints, and the 13 duplicate links across 162 repair-linked
+reports. Independent pre-adjudication localization agreement remains
+unmeasured.
 
 `artifact-manifest.json` records the size and hash of every released data and
 result file, excluding the manifest itself. The validator checks these hashes
 and recomputes the main distributions. Source data and final labels are
-unchanged; selection and audit exports omit intermediate-review fields.
+final; selection and audit exports omit intermediate-review fields.

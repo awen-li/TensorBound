@@ -1,26 +1,12 @@
 {
-  "candidate_rechecks": 142,
-  "estimated_false_omission_rate": 0.0036014569126282888,
-  "estimated_false_omissions": 26.092555331991953,
-  "estimated_false_omissions_simultaneous_95": [
-    19,
-    122
-  ],
-  "estimated_positive_recall": 0.9100543779824659,
-  "estimated_positive_recall_simultaneous_95": [
-    0.6839378238341969,
-    0.9328621908127208
-  ],
-  "final_excluded_population": 7245,
-  "full_audit_sample": 2516,
-  "interval_method": {
-    "familywise_confidence": 0.95,
-    "name": "Bonferroni-simultaneous exact hypergeometric inversion",
-    "per_stratum_confidence": 0.9916666666666667,
-    "sampled_strata": 6,
-    "sampling_design": "independent simple random sampling without replacement within each sampled stratum; censused strata fixed",
-    "tail_probability": 0.004166666666666667
-  },
+  "carried_prior_negative_decisions": 2374,
+  "excluded_records_examined": 2516,
+  "final_codebook_rechecks": 142,
+  "interpretation": "The targeted recheck found 19 omitted in-scope reports. Because 2,374 earlier negative decisions were carried forward and the 142 rechecks were not a probability sample, these counts do not estimate recall for the 7,509-record frame.",
+  "observed_in_scope_rechecks": 19,
+  "observed_out_of_scope_rechecks": 123,
+  "population_recall": null,
+  "recheck_design": "targeted nonprobability subset",
   "review_agreement": {
     "agreements": 123,
     "cohens_kappa": 0.2918635170603671,
@@ -33,97 +19,5 @@
     },
     "raw_agreement": 0.8661971830985915
   },
-  "schema_version": "2.0.0",
-  "strata": {
-    "refinement_excluded_census": {
-      "estimated_missed": 7.0,
-      "observed_in_scope": 7,
-      "population": 270,
-      "sample": 270,
-      "simultaneous_population_interval": [
-        7,
-        7
-      ]
-    },
-    "refinement_unresolved_census": {
-      "estimated_missed": 9.0,
-      "observed_in_scope": 9,
-      "population": 77,
-      "sample": 77,
-      "simultaneous_population_interval": [
-        9,
-        9
-      ]
-    },
-    "retained_census": {
-      "estimated_missed": 0.0,
-      "observed_in_scope": 0,
-      "population": 169,
-      "sample": 169,
-      "simultaneous_population_interval": [
-        0,
-        0
-      ]
-    },
-    "screen_excluded:cve-list:iree": {
-      "estimated_missed": 0.0,
-      "observed_in_scope": 0,
-      "population": 75,
-      "sample": 22,
-      "simultaneous_population_interval": [
-        0,
-        14
-      ]
-    },
-    "screen_excluded:cve-list:pytorch-inductor-triton": {
-      "estimated_missed": 0.0,
-      "observed_in_scope": 0,
-      "population": 291,
-      "sample": 87,
-      "simultaneous_population_interval": [
-        0,
-        14
-      ]
-    },
-    "screen_excluded:cve-list:xla-jax-pjrt": {
-      "estimated_missed": 0.0,
-      "observed_in_scope": 0,
-      "population": 327,
-      "sample": 97,
-      "simultaneous_population_interval": [
-        0,
-        15
-      ]
-    },
-    "screen_excluded:github-issue:iree": {
-      "estimated_missed": 10.092555331991951,
-      "observed_in_scope": 3,
-      "population": 1672,
-      "sample": 497,
-      "simultaneous_population_interval": [
-        3,
-        33
-      ]
-    },
-    "screen_excluded:github-issue:pytorch-inductor-triton": {
-      "estimated_missed": 0.0,
-      "observed_in_scope": 0,
-      "population": 603,
-      "sample": 179,
-      "simultaneous_population_interval": [
-        0,
-        15
-      ]
-    },
-    "screen_excluded:github-issue:xla-jax-pjrt": {
-      "estimated_missed": 0.0,
-      "observed_in_scope": 0,
-      "population": 3761,
-      "sample": 1118,
-      "simultaneous_population_interval": [
-        0,
-        15
-      ]
-    }
-  }
+  "schema_version": "3.0.0"
 }

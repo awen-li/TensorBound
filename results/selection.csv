@@ -1,4 +1,4 @@
-record_id,final_membership
+record_id,frozen_primary_cohort_membership
 CVE-2001-0366,excluded
 CVE-2004-0346,excluded
 CVE-2004-2735,excluded

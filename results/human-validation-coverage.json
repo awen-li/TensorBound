@@ -24,9 +24,9 @@
     ],
     "repair_linked_report_assignments": 162
   },
-  "documentation_basis": "Author-confirmed description of the completed human review recorded on 2026-10-08.",
+  "documentation_basis": "Author-reported description of the completed human review recorded on 2026-10-08; item-level reviewer logs are unavailable.",
   "interpretation": {
-    "measures": "Complete two-human evidence-based confirmation of the final source-linked cause records and their coding.",
+    "measures": "Author-reported two-human evidence-based confirmation of the final source-linked cause records and their coding.",
     "separate_unmeasured_quantity": "Independent pre-adjudication agreement on source-operation localization."
   },
   "outcome": {

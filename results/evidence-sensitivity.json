@@ -9,49 +9,41 @@
   "consequence_sensitivity": [
     {
       "consequence": "data race",
-      "observed_addition": 5,
-      "primary": 5,
-      "weighted": 5
+      "analysis_cohort": 5,
+      "known_in_scope": 5
     },
     {
       "consequence": "hang or deadlock",
-      "observed_addition": 13,
-      "primary": 12,
-      "weighted": 13
+      "analysis_cohort": 12,
+      "known_in_scope": 13
     },
     {
       "consequence": "incorrect result or state",
-      "observed_addition": 176,
-      "primary": 168,
-      "weighted": 178.36418511066398
+      "analysis_cohort": 168,
+      "known_in_scope": 176
     },
     {
       "consequence": "memory-access violation",
-      "observed_addition": 24,
-      "primary": 23,
-      "weighted": 26.364185110663982
+      "analysis_cohort": 23,
+      "known_in_scope": 24
     },
     {
       "consequence": "other observable failure",
-      "observed_addition": 3,
-      "primary": 3,
-      "weighted": 3
+      "analysis_cohort": 3,
+      "known_in_scope": 3
     },
     {
       "consequence": "resource leak or exhaustion",
-      "observed_addition": 14,
-      "primary": 12,
-      "weighted": 14
+      "analysis_cohort": 12,
+      "known_in_scope": 14
     },
     {
       "consequence": "runtime rejection or crash",
-      "observed_addition": 48,
-      "primary": 41,
-      "weighted": 50.36418511066398
+      "analysis_cohort": 41,
+      "known_in_scope": 48
     }
   ],
-  "estimated_in_scope_records": 290.09255533199195,
-  "observed_in_scope_records": 283,
+  "known_in_scope_records": 283,
   "repair_evidence": {
     "archived_patches": 167,
     "causes": 149,

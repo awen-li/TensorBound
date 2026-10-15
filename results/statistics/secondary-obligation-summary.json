@@ -226,6 +226,6 @@
     }
   ],
   "raw_label_agreement": 0.9552572706935123,
-  "resolution_rule": "A label is published as secondary only when both independent reviewers selected it after the reconciled primary label is removed from each set.",
+  "resolution_rule": "A label is published as secondary only when both archived coding passes selected it after the reconciled primary label is removed from each set.",
   "schema_version": "1.0.0"
 }

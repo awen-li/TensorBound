@@ -7,16 +7,16 @@
     "repair_linked_reports": 162,
     "reports_without_traceable_landed_repair": 102
   },
-  "final_causal_selection": {
-    "unique_first_invalid_decisions": 149,
-    "unique_primary_obligations": 149,
+  "final_repair_centered_coding": {
+    "selected_first_invalid_decisions": 149,
+    "selected_primary_obligations": 149,
     "unresolved_first_invalid_decisions": 0,
     "unresolved_primary_obligations": 0
   },
   "historical_candidate_accounting": {
     "initial_multiple_obligation_candidates": null,
     "initial_multiple_operation_candidates": null,
-    "reason": "The archive preserves final consensus reconstructions but not pre-adjudication operation or obligation candidate lists.",
+    "reason": "The archive preserves final consensus repair-centered accounts but not pre-adjudication operation or obligation candidate lists.",
     "resolved_from_initial_multiple_candidates": null,
     "status": "not_recorded"
   },

@@ -6,6 +6,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ArtifactPackageTests(unittest.TestCase):
+    def test_raw_exports_have_no_notification_capability_links(self):
+        prefix = b"https://github.com/notifications/unsubscribe-auth/"
+        marker = prefix + b"[REDACTED]"
+        for path in (ROOT / "data" / "raw").rglob("*"):
+            if path.is_file():
+                self.assertNotIn(prefix, path.read_bytes().replace(marker, b""), str(path))
+
     def test_package_has_no_intermediate_results_or_review_scripts(self):
         allowed_scripts = {"verify_artifact.py"}
         self.assertEqual({p.name for p in (ROOT / "scripts").glob("*.py")}, allowed_scripts)

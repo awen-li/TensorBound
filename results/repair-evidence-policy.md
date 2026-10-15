@@ -1,8 +1,8 @@
 # Repair-grounded evidence and interpretation
 
-A landed change is evidence for a causal reconstruction, not proof of a unique
+A landed change supports a repair-centered account; it does not prove a unique
 root cause. The study is retrospective: the patch guides source inspection,
-so tracing must also follow the pre-fix path upstream of the edited lines.
+and tracing also follows the pre-fix path upstream of the edited lines.
 
 ## Preserved fields
 
@@ -29,11 +29,11 @@ reports. Every cause has one final first-invalid-decision site and one primary
 obligation; the final cause table contains zero unresolved records. The archive
 does not retain pre-adjudication candidate lists, so initial competing-
 candidate counts remain unavailable. `causal-selection-audit.csv` records each
-final selection and its source evidence.
+selected repair-supported decision and its source evidence.
 
-For a multi-hunk repair, classify the semantic action that restores the violated
-obligation, not the largest edit. Keep build changes, tests, and other supporting
-edits in the complete patch. The patch index lists all changed files; it does
+For a multi-hunk repair, the semantic action that restores the violated
+obligation determines the repair family. Build changes, tests, and other
+supporting edits remain in the complete patch. The patch index lists all changed files; it does
 not assign an independently reviewed semantic role to every hunk. A separate
 per-hunk role annotation is not claimed.
 

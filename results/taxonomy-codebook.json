@@ -407,9 +407,9 @@
         }
       },
       "transformation equivalence": {
-        "definition": "A rewrite, fusion, substitution, or fast path must preserve program behavior under its preconditions.",
-        "inclusion_rule": "The critical condition governs legality of a transformation as a whole.",
-        "exclusion_rule": "Exclude the competing case according to this boundary: Prefer a more specific obligation when its violation first permits the effect; use transformation equivalence for remaining rewrite-level conditions.",
+        "definition": "For an already in-scope binding transition, a rewrite, fusion, substitution, or fast path must preserve the associated operation, storage, representation, or execution behavior under its preconditions.",
+        "inclusion_rule": "Apply only after the record passes the binding-scope test; the critical condition governs legality of the binding transformation as a whole.",
+        "exclusion_rule": "A transformation-local semantic defect without an established value--operation, storage, representation, ownership, or execution relation is outside the construct. Within an in-scope record, prefer a more specific obligation when its violation first permits the effect.",
         "nearest_competing_family": "value semantics preservation",
         "tie_breaking_rule": "Prefer a more specific obligation when its violation first permits the effect; use transformation equivalence for remaining rewrite-level conditions.",
         "positive_example": {
@@ -421,9 +421,9 @@
         }
       },
       "value semantics preservation": {
-        "definition": "A decision must preserve the specified observable value behavior.",
-        "inclusion_rule": "The first violated condition concerns value identity, mutation visibility, or numerical behavior without a more specific primary condition.",
-        "exclusion_rule": "Exclude the competing case according to this boundary: Use value semantics for the value-level condition; transformation equivalence for validity of a program rewrite.",
+        "definition": "For an already in-scope binding transition, a decision must preserve the value behavior attached to the established relation.",
+        "inclusion_rule": "Apply only after the record passes the binding-scope test; the first violated condition concerns value identity or mutation visibility without a more specific primary condition.",
+        "exclusion_rule": "A numerical wrong-code result without an established value--operation, storage, representation, ownership, or execution relation is outside the construct. Within an in-scope record, use value semantics for the value-level condition and transformation equivalence for validity of a binding rewrite.",
         "nearest_competing_family": "transformation equivalence",
         "tie_breaking_rule": "Use value semantics for the value-level condition; transformation equivalence for validity of a program rewrite.",
         "positive_example": {

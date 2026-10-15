@@ -81,6 +81,38 @@
       "raw_agreement": 0.8657718120805369
     }
   },
+  "failure_mode_marginals": {
+    "pass_a": {
+      "incorrect mapping or translation": 34,
+      "lost or omitted relation": 29,
+      "missing eligibility check": 31,
+      "missing ordering or enforcement": 7,
+      "omitted operation": 3,
+      "premature invalidation or stale state": 1,
+      "premature or unordered transition": 13,
+      "unsound assumption or inference": 31
+    },
+    "pass_b": {
+      "incorrect mapping or translation": 41,
+      "lost or omitted relation": 29,
+      "missing eligibility check": 37,
+      "missing ordering or enforcement": 9,
+      "omitted operation": 4,
+      "premature invalidation or stale state": 3,
+      "premature or unordered transition": 10,
+      "unsound assumption or inference": 16
+    },
+    "reconciled": {
+      "incorrect mapping or translation": 35,
+      "lost or omitted relation": 32,
+      "missing eligibility check": 37,
+      "missing ordering or enforcement": 8,
+      "omitted operation": 5,
+      "premature invalidation or stale state": 3,
+      "premature or unordered transition": 10,
+      "unsound assumption or inference": 19
+    }
+  },
   "schema_version": "1.0.0",
   "units": 149
 }

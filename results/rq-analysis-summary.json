@@ -113,8 +113,8 @@
     "memory safety": 8,
     "other observable failure": 39,
     "resource leak or exhaustion": 6,
-    "runtime rejection or crash": 49,
-    "wrong result": 55
+    "runtime rejection or crash": 48,
+    "wrong result": 56
   },
   "cross_tabs": {
     "failure_by_repair": {
@@ -593,7 +593,7 @@
       }
     ],
     "raw_label_agreement": 0.9552572706935123,
-    "resolution_rule": "A label is published as secondary only when both independent reviewers selected it after the reconciled primary label is removed from each set."
+    "resolution_rule": "A label is published as secondary only when both archived coding passes selected it after the reconciled primary label is removed from each set."
   },
   "transition_family": {
     "identity or index remapping": 31,
