@@ -21,7 +21,7 @@ class CollectionCLITests(unittest.TestCase):
         for repo in plan:
             if repo['repository'] in ('iree-org/iree', 'jax-ml/jax'):
                 self.assertEqual(len(repo['queries']), 19)
-                self.assertIn('created:2026-01-01..2026-06-24', repo['queries'][-1])
+                self.assertIn('created:2026-01-01..2026-09-24', repo['queries'][-1])
             else:
                 self.assertEqual(len(repo['queries']), 1)
         self.assertIn('label:"module: correctness (silent)"', plan[1]['queries'][0])

@@ -8,7 +8,7 @@ artifact directory.
 ## GitHub issues
 
 ```sh
-python3 -m tensorbound init .work-tmp/collection --through 2026-06-24
+python3 -m tensorbound init .work-tmp/collection --through 2026-09-24
 python3 -m tensorbound collect-frame .work-tmp/collection \
   --spec results/collection-frame.json --source github --plan
 python3 -m tensorbound collect-frame .work-tmp/collection \
@@ -27,7 +27,7 @@ For an individual query:
 ```sh
 python3 -m tensorbound collect-github .work-tmp/collection \
   --system-id iree --repository iree-org/iree \
-  --through 2026-06-24 --query 'label:"bug 🐞" created:2025-01-01..2025-12-31'
+  --through 2026-09-24 --query 'label:"bug 🐞" created:2025-01-01..2025-12-31'
 ```
 
 To collect issue bodies and comment pages after discovery:
@@ -52,11 +52,12 @@ python3 -m tensorbound collect-frame .work-tmp/collection \
   --spec results/collection-frame.json --source cve-list --plan
 ```
 
-Inspect the plan before a live run. The released frame preserves a June 24,
-2026 cutoff alongside a CVE revision dated September 24, 2026. The collector
-rejects a revision newer than its workspace cutoff. The frozen evidence and
-results are preserved as supplied; changing the cutoff or revision for a new
-collection produces a new dataset, not an exact recreation of the frozen one.
+Inspect the plan before a live run. The released frame preserves a September
+24, 2026 cutoff and pins CVE content to a revision dated September 24, 2026.
+The collector rejects a revision newer than its workspace cutoff. The frozen
+evidence and results are preserved as supplied; changing the cutoff or revision
+for a new collection produces a new dataset, not an exact recreation of the
+frozen one.
 
 For a new collection, initialize a separate workspace with the intended cutoff
 and supply a compatible 40-character commit SHA:
