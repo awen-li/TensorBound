@@ -1,0 +1,11 @@
+{
+  "schema_version": "1.0.0",
+  "collection_boundary": "2026-09-24",
+  "repositories": {
+    "iree-org/iree": "c83444ba6ca9c0f54e182d8f17d81f016fa7810c",
+    "jax-ml/jax": "c54c660a6095898a054304115afde04c4a0e9621",
+    "openxla/xla": "8a4dadd840e3964149b177199fa4750c6778776b",
+    "pytorch/pytorch": "6d03f2608c11ac75af45b126b1b75590db3b4d22",
+    "triton-lang/triton": "654b1d1499569f6f66ad4db13f6478305874f8f4"
+  }
+}

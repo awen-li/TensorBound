@@ -43,6 +43,7 @@ def sha256(path: Path) -> str:
 
 def verify_collection_frame() -> dict[str, int | str]:
     frame = read_json("results/collection-frame.json")
+    baselines = read_json("results/source-baselines.json")
     github = frame["github"]
     repositories = github["repositories"]
     boundary = frame["collection_boundary"]
@@ -59,10 +60,31 @@ def verify_collection_frame() -> dict[str, int | str]:
         github_records + cve_records == frame["total_records"],
         "GitHub and CVE counts do not sum to the total collection frame",
     )
+    expected_baselines = {
+        "iree-org/iree": "c83444ba6ca9c0f54e182d8f17d81f016fa7810c",
+        "jax-ml/jax": "c54c660a6095898a054304115afde04c4a0e9621",
+        "openxla/xla": "8a4dadd840e3964149b177199fa4750c6778776b",
+        "pytorch/pytorch": "6d03f2608c11ac75af45b126b1b75590db3b4d22",
+        "triton-lang/triton": "654b1d1499569f6f66ad4db13f6478305874f8f4",
+    }
+    require(
+        baselines == {
+            "schema_version": "1.0.0",
+            "collection_boundary": boundary,
+            "repositories": expected_baselines,
+        },
+        "common source baselines differ",
+    )
+    require(
+        all(re.fullmatch(r"[0-9a-f]{40}", revision)
+            for revision in baselines["repositories"].values()),
+        "a common source baseline is not a full commit identifier",
+    )
     return {
         "boundary": boundary,
         "github_records": github_records,
         "cve_records": cve_records,
+        "source_baselines": len(expected_baselines),
         "total_records": frame["total_records"],
     }
 

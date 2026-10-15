@@ -7,6 +7,7 @@ It makes no changes to the data and requires no network access.
 | Result | Input |
 |---|---|
 | Declared 7,509-record frame | `results/collection-frame.json` |
+| Five common source baselines | `results/source-baselines.json` |
 | 264 retained and 7,245 excluded records | `results/selection.csv` |
 | 162 repair-linked reports and 149 causes | `data/final/cases.csv` |
 | RQ1, RQ3, RQ4, RQ5 distributions and cross-tabs | `results/rq-cause-analysis.csv` |

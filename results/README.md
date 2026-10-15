@@ -15,6 +15,10 @@ totals. Intermediate per-pass selection columns are omitted. The 19 positives
 found by the later recheck remain outside this frozen cohort and appear in the
 separate sensitivity files.
 
+`source-baselines.json` records the full 40-character commit identifier for
+each of the five common implementation snapshots used during source tracing.
+Report-specific historical revisions remain in the case and alignment records.
+
 `scope-boundary-examples.csv` links three included/excluded pairs to archived
 source evidence and states the decisive construct distinction for each pair.
 Its seventh row illustrates a separate selection limit: the record establishes

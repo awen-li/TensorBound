@@ -32,6 +32,7 @@ Without Make, run `python3 scripts/verify_artifact.py` and
 | `data/raw/` | Archived evidence for released GitHub and CVE List records |
 | `data/final/` | 264 case reports, their index, and archived repair patches |
 | `results/` | Final RQ tables, source paths, codebooks, selection, and sensitivity results |
+| `results/source-baselines.json` | Full commit identifiers for the five common source baselines |
 | `results/causal-selection-audit.csv` | Final decision, primary-obligation status, selection basis, and evidence links for 149 repaired causes |
 | `results/human-validation-coverage.json` | Scope, evidence, coded fields, and outcome of the completed two-human review |
 | `results/scope-boundary-examples.csv` | Three paired construct-boundary examples and one mechanism-documentation example, each linked to archived evidence |
