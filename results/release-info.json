@@ -1,0 +1,58 @@
+{
+  "analysis_script_sha256": "80e81832ef725e8ccb60dbb1932e875e4908d56f4e018718d953842029fd9b15",
+  "archived_assignment_export": {
+    "operation": "Copy original primary and secondary assignment values plus evidence references into separate A/B fields. Historical actors remain unknown; rationales and execution scripts are outside the release.",
+    "released_file": "results/statistics/archived-taxonomy-assignments.jsonl",
+    "source_file_sha256": "d4f43a2de76282c41345bc6a792e0d3f50dada70efe977e8ff4af60f2e600f39"
+  },
+  "artifact_link_note": "The manuscript pins the final artifact commit. Its link is outside these content hashes to avoid a circular commit dependency.",
+  "baseline_counts": {
+    "candidate_records": 7509,
+    "diagnostic_attempts": 4,
+    "distinct_causes": 149,
+    "primary_provenance_records": 149,
+    "repair_linked_reports": 162,
+    "reports": 264
+  },
+  "codebook_documentation_date": "2026-10-01",
+  "codebook_sha256": "acf22dafe57ad2a8e6d57d406d49e3b239516dc4eb4d2beaa1bece8adfe777ea",
+  "current_human_audit": "results/statistics/phase1-human-review.json",
+  "manuscript_baseline_commit": "91c409606e83ad7ec01803b0f6f6278fec46cc6c",
+  "manuscript_content_sha256": {
+    "sections/0-abstract/abstract.tex": "09f42dd2f55acdc656563070afec0a2d73981e8b3de48a84d07c28d3ea5d4d31",
+    "sections/1-intro/introduction.tex": "97149dfc1df48f8b241a719977c9b727cb2ed3368f03a9807b29233b94ee6c96",
+    "sections/2-motivation/motivation.tex": "6dea564ece853b594140693997d955efe9ebc6e3dec55b14f7fcb0727317da0a",
+    "sections/3-design/0_datasource.tex": "4d9ade820cdaa0dc5106e7d43237aa592050db265438d0f5e7317f3f7f1924fd",
+    "sections/3-design/0_overview.tex": "a19c8861e014d6e20b73d540ceee994ae9cc5b3953f5d8a03504bcbc9b926504",
+    "sections/3-design/0_scope.tex": "361373730f6230a73804fef7ba64e48ac153f2edd4e5c758d7a3f59cb903e746",
+    "sections/3-design/1_phase1.tex": "e35b54c5475e0fa72bc7ca31daf42b5df77950135b58fadb28423a9451dfc802",
+    "sections/3-design/2_phase2.tex": "6a2473b583388002074310f6e7d70a48bfd33268df222a4773f99ae386bde48a",
+    "sections/3-design/3_phase3.tex": "3bb2a79f709f1d559f78ff3f7055912e9cac0fc73702ed82baab4f122064f051",
+    "sections/5-evaluation/0_evaluation.tex": "24bcf2611210e78973398095321e36c55d4640ea2a8b3d628c906fee2ce1ab28",
+    "sections/5-evaluation/1_RQ1.tex": "c361cd139db3647ebb57589a575dcfc26515fbbc15e1d661cdd2873de5c335c0",
+    "sections/5-evaluation/2_RQ2.tex": "52f183c2b0b45164c9924a8cb9bcac406031d51886be640324e9ba747e27e7a9",
+    "sections/5-evaluation/3_RQ3.tex": "390e285c9502aa294c7d2a9d33da6fe3c17a03d069a0f0eada17e96668675c29",
+    "sections/5-evaluation/4_RQ4.tex": "a788d0c1a979fc7ece97909d0ac7818bb29a474b6c90331d8d35c8a3e9dec740",
+    "sections/5-evaluation/5_RQ5.tex": "2f5230d8edbd7d07c07281741f9b0d3242344678da096d9ba85b35ccc42653e8",
+    "sections/5-evaluation/6_RQ6.tex": "72680a053494aed45ae7e1b75bae4910fc08a15064a4223602d7f1c479d256c6",
+    "sections/6-discussion/discussion.tex": "a49216f5c4d007521ab7780c70ec424f76cec5d542493a75e97c35d5c398d55d",
+    "sections/7-related/related.tex": "bd50ac76f930c7d8a2ce2cb282da0575d55c555cfe5a3c047746bf4150c952d2",
+    "sections/8-appendix/appendix.tex": "df117a5d33a3a38c72860295d21beaeb50ac635281491f140dfc7b2c1f29d43a",
+    "sections/8-appendix/taxonomy-codebook.tex": "4a6b6793efe2e1dfdd3ece58744d4c60647130d2a70b68d894b4fcab4a3cc0ab",
+    "sections/concl.tex": "c04af2c44ecdeca11834f79d29e0580071e7eb0d1f0819c9091964fcea85e87a"
+  },
+  "manuscript_repository": "https://github.com/awen-li/TensorBound-paper",
+  "manuscript_revision": "Presentation and reproducibility revision, 2026-10-25; blue modify annotations",
+  "parent_artifact_commit": "e70da3bfe4dc69e167015692d5510e28c18a9b00",
+  "release_id": "tensorbound-2026-10-25-presentation",
+  "schema_version": "1.0.0",
+  "superseded_audit": "The 142-record targeted recheck and 19-omission sensitivity remain in parent artifact commit e70da3b; they are not the current 600-record audit.",
+  "verification_boundaries": {
+    "historical_diagnostics": "archived evidence inspected; not rerun",
+    "historical_model_calls": "exact replay unavailable",
+    "independent_localization": "not measured",
+    "phase1_human_review": "arithmetic from author-supplied totals; individual records unavailable",
+    "rq_results": "recomputed from released per-record final labels",
+    "taxonomy_agreement": "recomputed from archived A/B assignments"
+  }
+}

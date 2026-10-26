@@ -1,99 +1,90 @@
-# TensorBound Artifact
+# TensorBound artifact
 
-Data, final results, and collection code for **TensorBound: A Repair-Centered
-Study of Tensor Binding Failures in AI Compiler and Runtime Stacks**.
+Data, final analysis records, results, and collection code for **TensorBound:
+Characterizing Tensor Binding Failures in AI Compiler and Runtime Stacks**.
 
-The artifact contains an analysis cohort of 264 public reports, including 162
-repair-linked reports grouped into 149 distinct repaired causes. A targeted
-recheck found 19 additional in-scope reports. The released selection table
-records frozen primary-cohort membership for the 7,509-record collection
-frame; population recall remains unknown.
+The analysis contains 264 reports. Of these, 162 repair-linked reports map
+to 149 distinct repaired causes. The current Phase 1 validation reports
+600 sampled initial exclusions, four binding failures, and 28 reversals of
+removal proposals. Restored reports are already included in the 264.
+
+## Release and supported tasks
+
+[release-info.json](results/release-info.json) identifies this revision, its
+baseline manuscript, and data/code fingerprints. Use the commit linked by the
+paper, then record `git rev-parse HEAD`.
+
+The offline route supports:
+
+- Recomputing RQ distributions, cross-tabulations, and sensitivity subsets
+  from final report and cause records.
+- Recomputing archived taxonomy-label agreement from its two assignment sets.
+- Recomputing Phase 1 estimates and table arithmetic from **author-supplied
+  human-review totals**. Individual human labels and sample membership are
+  unavailable in this release.
+- Inspecting archived reports, patches, source anchors, and diagnostic outputs.
+
+The checks do not repeat human judgments, establish independent localization
+agreement, rerun historical diagnostics, or replay historical model calls.
 
 ## Quick start
 
-Python 3.10 or newer is sufficient; the runtime has no third-party dependencies.
-No network access, GPU, compiler installation, or API token is needed to check
-the packaged results.
+Run from this artifact checkout with Python 3.10 or later:
 
 ```sh
-git clone https://github.com/awen-li/TensorBound.git
-cd TensorBound
+git rev-parse HEAD
 make reproduce-main
 make test
+python3 scripts/verify_artifact.py --result-index
 ```
 
 Without Make, run `python3 scripts/verify_artifact.py` and
-`python3 -m unittest discover -s tests -v`.
+`python3 -m unittest discover -s tests -v`. Analysis uses only the standard
+library, without network access, GPU hardware, or API credentials. The verifier
+prints JSON with `"status": "ok"` and exits zero when checks pass. A mismatch
+exits nonzero; it never rewrites the supplied records to match expected counts.
+The result-index command prints the identifiers supporting each table cell,
+matrix cell, and sensitivity subset. Human-review tables are marked aggregate-only.
 
-## Contents
+## Contents and provenance
 
 | Path | Contents |
 |---|---|
-| `data/raw/` | Archived evidence for released GitHub and CVE List records |
-| `data/final/` | 264 case reports, their index, and archived repair patches |
-| `results/` | Final RQ tables, source paths, codebooks, selection, and sensitivity results |
-| `results/source-baselines.json` | Full commit identifiers for the five common source baselines |
-| `results/causal-selection-audit.csv` | Final decision, primary-obligation status, selection basis, and evidence links for 149 repaired causes |
-| `results/human-validation-coverage.json` | Scope, evidence, coded fields, and outcome of the completed two-human review |
-| `results/scope-boundary-examples.csv` | Three paired construct-boundary examples and one mechanism-documentation example, each linked to archived evidence |
-| `results/statistics/` | Agreement summaries, 142 final-codebook rechecks, and the 19 observed omissions |
-| `results/artifact-manifest.json` | Data inventory with sizes and hashes |
-| `tensorbound/` | GitHub/CVE collection code and supporting storage utilities |
-| `scripts/verify_artifact.py` | Read-only result and integrity checks |
+| `data/raw/` | Available GitHub snapshots and 693 unique CVE records |
+| `data/final/` | 264 case reports, report-to-cause membership, and repair patches |
+| `results/rq-*.csv`, `results/rq*.json` | Final RQ records and distributions |
+| `results/historical-alignment.csv` | Pre-fix and fixed revisions, operation and repair sites, evidence flags |
+| `results/source-location-corrections.json` | Three revision-time source-anchor corrections and their evidence |
+| `results/statistics/phase1-human-review.json` | Supplied sample and review-step totals; explicit missing individual records |
+| `results/statistics/archived-taxonomy-assignments.jsonl` | Original A/B assignment values used in the published comparison; actor identities unknown |
+| `results/human-validation-coverage.json` | Authors' account of the completed two-human cause review |
+| `results/artifact-manifest.json` | Released data/result file sizes and hashes |
+| `tensorbound/` | Optional GitHub/CVE collection code |
+| `scripts/verify_artifact.py` | Offline numerical and integrity checks |
 | `tests/` | Offline collector and artifact tests |
 
-The artifact excludes intermediate coding outputs, review execution scripts,
-review prompts, blank audit forms, manuscript revision assessments, paper
-sources, and development caches. Archived evidence preserves technical content;
-credential-bearing notification links are replaced with a redaction marker.
-The development repository is maintained separately.
+The artifact omits review-execution scripts, prompts, intermediate coding
+outputs, blank review forms, development caches, and paper sources. The two
+archived taxonomy assignment sets are retained as inputs to the reported
+agreement analysis, separately from final labels and the derived secondary mask.
 
-## Reproduction and collection
+## Documentation
 
-- [REPRODUCE.md](REPRODUCE.md) maps the results to their inputs and checks.
-- [COLLECTION.md](COLLECTION.md) describes optional collection in a separate workspace.
-- [INSTALL.md](INSTALL.md) gives local and container setup.
-- [results/README.md](results/README.md) explains the final outputs and their scope.
+- [REPRODUCE.md](REPRODUCE.md): tested entry points and result-to-input index.
+- [PROVENANCE.md](PROVENANCE.md): available evidence, missing history, and replay boundaries.
+- [COLLECTION.md](COLLECTION.md): optional live collection in a separate workspace.
+- [INSTALL.md](INSTALL.md): local and container requirements.
+- [results/README.md](results/README.md): record definitions and analysis conventions.
+- [VERIFICATION.json](VERIFICATION.json): environment, commands, outcomes, and limitations of the verification run.
 
-The offline checks recompute distributions and observed sensitivity results
-from final records. They also verify that the 162 repair-linked reports map to
-149 final cause selections and 13 duplicates, with zero unresolved final
-decisions or primary obligations. The checks verify packaged results; they do
-not rerun the historical review process or measure independent localization
-agreement.
-
-The sensitivity outputs also separate primary-cohort consequences by the five
-repository query frames and recompute failure-family counts after
-removing the 23 value--operation/identity causes closest to the construct
-boundary.
-
-Each of the 19 recheck-positive rows links to an archived report snapshot.
-Sixteen snapshots were already part of the 780 reports advanced to detailed
-review; the release also archives the three positives found among screening
-exclusions. The recheck table retains final decisions for all 142 records, while
-raw report snapshots for 63 screen-excluded negatives are outside the release.
-
-The 102 report-only cases establish an in-scope failure and observed effect,
-but every record lacks an archived landed patch and public fix URL for the
-pre-fix/repaired causal contrast. Seventy remain open, 32 are closed, and 100
-contain a proposal or workaround. These reports remain in report-level
-analyses.
-
-The authors report that two human reviewers inspected all 149 final cause
-records and their source and repair evidence. Their review covered primary
-labels, secondary obligations, provenance endpoints, and duplicate links.
-Identified issues were corrected against the evidence, and both reviewers
-confirmed the final records. Item-level reviewer logs and blinded
-pre-adjudication localization choices are unavailable.
-
-The paired scope examples contrast operation semantics with storage-offset
-preservation, numerical semantics with external representation, and compiler
-metadata with runtime ownership. A separate evidence-limited example records a
-reproducible symptom whose causal operation remains unidentified. These records
-distinguish construct exclusion from insufficient mechanism documentation.
+The previous release `e70da3bfe4dc69e167015692d5510e28c18a9b00` preserves
+the older targeted 142-record audit and 19-omission sensitivity. Those outputs
+are superseded, not relabeled as the current 600-record human audit. Their
+historical evidence remains recoverable from Git.
 
 ## License and data use
 
-TensorBound-authored code and documentation use the [Apache License 2.0](LICENSE).
-Archived upstream records and patches retain their original terms; see
+TensorBound-authored code and documentation use [Apache License 2.0](LICENSE).
+Archived upstream evidence retains its original terms; see
 [THIRD_PARTY.md](THIRD_PARTY.md) and [ETHICS.md](ETHICS.md).
+Credential-bearing notification links are redacted.

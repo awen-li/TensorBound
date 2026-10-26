@@ -6,6 +6,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import math
 import re
 import sys
 from collections import Counter
@@ -80,12 +81,34 @@ def verify_collection_frame() -> dict[str, int | str]:
             for revision in baselines["repositories"].values()),
         "a common source baseline is not a full commit identifier",
     )
+    selection = read_csv("results/selection.csv")
+    selection_ids = [row["record_id"] for row in selection]
+    require(len(selection_ids) == len(set(selection_ids)) == frame["total_records"],
+            "collection identifiers are missing or repeated")
+    for repository in repositories:
+        prefix = "github-" + repository["repository"].replace("/", "-") + "-"
+        require(sum(identifier.startswith(prefix) for identifier in selection_ids) == repository["unique_records"],
+                f"collection repository identifiers differ: {repository['repository']}")
+    cve_ids = {row["record_id"] for row in selection if row["record_id"].startswith("CVE-")}
+    sources = [json.loads(path.read_text(encoding="utf-8"))
+               for path in (ROOT / "data/raw/cve-list").glob("*/source.json")]
+    require(len(sources) == len(cve_ids) == cve_records,
+            "CVE source inventory and selection count differ")
+    require({row["source_record_id"] for row in sources} == cve_ids,
+            "CVE source identifiers differ from the selection frame")
+    require(len({row["source_url"] for row in sources}) == cve_records,
+            "CVE source paths are not unique")
+    require(all(frame["cve_list"]["revision"] in row["source_url"] for row in sources),
+            "CVE source revision differs")
     return {
         "boundary": boundary,
         "github_records": github_records,
         "cve_records": cve_records,
         "source_baselines": len(expected_baselines),
         "total_records": frame["total_records"],
+        "cve_unique_source_paths": len(sources),
+        "cve_capture_start": min(row["retrieved_at"] for row in sources),
+        "cve_capture_end": max(row["retrieved_at"] for row in sources),
     }
 
 
@@ -369,6 +392,11 @@ def verify_scope_boundary_examples() -> dict[str, object]:
 
 def verify_manifest() -> int:
     manifest = read_json("results/artifact-manifest.json")
+    release = read_json("results/release-info.json")
+    require(sha256(ROOT / "scripts/verify_artifact.py") == release["analysis_script_sha256"],
+            "analysis script differs from the release fingerprint")
+    require(sha256(ROOT / "results/taxonomy-codebook.json") == release["codebook_sha256"],
+            "codebook differs from the release fingerprint")
     expected = set()
     for entry in manifest["files"]:
         path = ROOT / entry["path"]
@@ -402,6 +430,170 @@ def verify_redactions() -> dict[str, int]:
 
 def jsonl(path):
     return [json.loads(line) for line in (ROOT / path).read_text().splitlines() if line.strip()]
+
+
+def hypergeometric_cdf_numerator(population, positives, sample, observed):
+    """Exact count of samples containing at most `observed` positives."""
+    require(0 <= positives <= population and 0 <= sample <= population,
+            "invalid hypergeometric population or sample")
+    lo = max(0, sample - (population - positives))
+    hi = min(observed, sample, positives)
+    return sum(math.comb(positives, k) * math.comb(population - positives, sample - k)
+               for k in range(lo, hi + 1))
+
+
+def first_true(lo, hi, predicate):
+    """First integer satisfying a monotone predicate; hi + 1 if none."""
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if predicate(mid):
+            hi = mid - 1
+        else:
+            lo = mid + 1
+    return lo
+
+
+def missed_interval(population, sample, observed, tail_denominator=40):
+    """Invert exact tails (1/40 for equal-tailed 95%, 1/20 for one-sided)."""
+    require(0 <= observed <= sample <= population, "invalid observed audit count")
+    denominator = math.comb(population, sample)
+    lower = first_true(0, population, lambda m:
+        (denominator - hypergeometric_cdf_numerator(population, m, sample, observed - 1))
+        * tail_denominator >= denominator)
+    upper = first_true(0, population, lambda m:
+        hypergeometric_cdf_numerator(population, m, sample, observed)
+        * tail_denominator < denominator) - 1
+    return lower, upper
+
+
+def verify_phase1_human_totals():
+    """Arithmetic only: the release has no individual human decisions."""
+    data = read_json("results/statistics/phase1-human-review.json")
+    n = sum(row["reviewed"] for row in data["samples"])
+    m = sum(row["binding_failures"] for row in data["samples"])
+    agreements = sum(row["pre_discussion_agreements"] for row in data["samples"])
+    population = data["initial_exclusions"]
+    require(len(data["samples"]) == 3 and all(row["reviewed"] == 200 for row in data["samples"]),
+            "reported sample sizes differ")
+    for row in data["samples"]:
+        require(0 <= row["binding_failures"] <= row["reviewed"]
+                and 0 <= row["pre_discussion_agreements"] <= row["reviewed"],
+                "human audit totals are out of range")
+    previous = 780
+    for row in data["review_steps"]:
+        require(row["input"] == previous, "selection step inputs do not join")
+        require(0 <= row["restored"] <= row["proposed_removals"] <= row["input"],
+                "selection removal counts are out of range")
+        require(row["final_removals"] == row["proposed_removals"] - row["restored"]
+                and row["output"] == row["input"] - row["final_removals"],
+                "selection step does not balance")
+        previous = row["output"]
+    final = data["final_set"]["reports"]
+    require(previous == final == len(read_csv("data/final/cases.csv")) == 264,
+            "final human-review total differs from retained membership")
+    require(data["final_set"]["confirmed_by_both_before_discussion"] == final,
+            "final-set confirmation count differs")
+    parts = data["detailed_review_removals"]
+    require(sum(row["proposed"] for row in parts) == data["review_steps"][0]["proposed_removals"]
+            and sum(row["restored"] for row in parts) == data["review_steps"][0]["restored"],
+            "appendix detailed-review groups differ")
+    denominator = math.comb(population, n)
+    missed = population * m / n
+    lower, upper = missed_interval(population, n, m)
+    one_sided_upper = missed_interval(population, n, m, 20)[1]
+    null_missed = math.ceil(population * 0.05)
+    threshold = first_true(0, n, lambda k:
+        hypergeometric_cdf_numerator(population, null_missed, n, k) * 20 > denominator) - 1
+    power = hypergeometric_cdf_numerator(population, round(population * 0.03), n, threshold) / denominator
+    observed = {
+        "sample_records": n,
+        "sample_binding_failures": m,
+        "sample_agreements": agreements,
+        "estimated_missed": round(missed, 2),
+        "missed_equal_tailed_95_interval": [lower, upper],
+        "correctly_excluded_percent": round(100 * (1 - m / n), 2),
+        "correctly_excluded_95_interval_percent": [round(100 * (1 - v / population), 2)
+                                                   for v in (upper, lower)],
+        "correctly_excluded_one_sided_95_lower_percent": round(100 * (1 - one_sided_upper / population), 2),
+        "acceptance_threshold": threshold,
+        "power_at_97_percent_correct": round(power, 2),
+        "initial_recall_percent": round(100 * final / (final + missed), 2),
+        "initial_recall_95_interval_percent": [round(100 * final / (final + v), 2) for v in (upper, lower)],
+        "removal_proposals": sum(row["proposed_removals"] for row in data["review_steps"]),
+        "restoration_decisions": sum(row["restored"] for row in data["review_steps"]),
+        "final_removals": sum(row["final_removals"] for row in data["review_steps"]),
+    }
+    require(observed == data["expected"], "Phase 1 arithmetic differs from published values")
+    return {"verification_scope": data["verification_scope"],
+            "missing_records": data["missing_records"], **observed}
+
+
+def verify_archived_assignments():
+    rows = jsonl("results/statistics/archived-taxonomy-assignments.jsonl")
+    causes = {row["cause_id"]: row for row in read_csv("results/rq-cause-analysis.csv")}
+    require(len(rows) == len(causes) == 149 and {row["cause_id"] for row in rows} == set(causes),
+            "archived assignment coverage differs")
+    published = read_json("results/statistics/taxonomy-agreement-summary.json")
+    primary_results = {}
+    for field, expected in published["fields"].items():
+        a = Counter(row["pass_a"][field] for row in rows)
+        b = Counter(row["pass_b"][field] for row in rows)
+        count = sum(row["pass_a"][field] == row["pass_b"][field] for row in rows)
+        chance = sum(a[label] * b[label] for label in set(a) | set(b)) / len(rows) ** 2
+        kappa = (count / len(rows) - chance) / (1 - chance)
+        require(count == expected["agreements"] and abs(kappa - expected["cohens_kappa"]) < 1e-12,
+                f"archived assignment agreement differs: {field}")
+        primary_results[field] = {"agreements": count, "kappa": kappa}
+    secondary = read_json("results/statistics/secondary-obligation-summary.json")
+    vocabulary = set(secondary["label_vocabulary"])
+    counts = Counter()
+    retained_labels = compound = exact_sets = 0
+    for row in rows:
+        cause = causes[row["cause_id"]]
+        primary = cause["obligation_family"]
+        # The source assignment arrays are unchanged; the mask is a derived view.
+        a = set(row["pass_a"]["secondary_obligation_families"]) - {primary}
+        b = set(row["pass_b"]["secondary_obligation_families"]) - {primary}
+        require(a <= vocabulary and b <= vocabulary, "unknown secondary obligation")
+        counts.update(("present" if label in a else "absent") + "|" +
+                      ("present" if label in b else "absent") for label in vocabulary)
+        jointly_assigned = a & b
+        retained = {label.strip() for label in cause["secondary_obligation_families"].split(";") if label.strip()}
+        require(jointly_assigned == retained, f"retained secondary labels differ: {row['cause_id']}")
+        retained_labels += len(jointly_assigned)
+        compound += bool(jointly_assigned)
+        exact_sets += a == b
+    require(dict(counts) == secondary["pair_counts"], "secondary binary comparison differs")
+    require(exact_sets == secondary["exact_set_agreements"], "secondary set agreement differs")
+    positive = 2 * counts["present|present"]
+    disagreements = counts["present|absent"] + counts["absent|present"]
+    return {"actor_type": "unknown", "primary_agreement": primary_results,
+            "secondary_pairs": sum(counts.values()), "secondary_pair_counts": dict(counts),
+            "automatic_primary_family_omissions": len(rows),
+            "secondary_overall_agreement_percent": round(100 * (1 - disagreements / sum(counts.values())), 1),
+            "secondary_positive_agreement_percent": round(100 * positive / (positive + disagreements), 1),
+            "retained_secondary_labels": retained_labels, "causes_with_secondary_labels": compound}
+
+
+def verify_source_corrections():
+    corrections = read_json("results/source-location-corrections.json")["corrections"]
+    alignment = {row["cause_id"]: row for row in read_csv("results/historical-alignment.csv")}
+    paths = {row["cause_id"]: row for row in jsonl("results/rq-cause-paths.jsonl")}
+    for row in corrections:
+        cause = alignment[row["cause_id"]]
+        require(cause["first_invalid_decision_site"] == row["new_site"]
+                and cause["pre_fix_revision"] == row["pre_fix_revision"],
+                f"source-location correction not propagated: {row['cause_id']}")
+        require(paths[row["cause_id"]]["pre_fix_decision_site"] == row["new_site"]
+                and paths[row["cause_id"]]["path_kind"] == "required_or_repaired_propagation",
+                "pre-fix decision and repaired propagation path are not distinguished")
+        for reference in row["evidence"]:
+            require((ROOT / reference.split("#", 1)[0]).is_file(), f"missing source evidence: {reference}")
+        if "pre_fix_patch_text" in row:
+            patches = [ROOT / ref for ref in row["evidence"] if ref.endswith(".patch")]
+            require(any(row["pre_fix_patch_text"] in path.read_text() for path in patches),
+                    "corrected operation is not in the pre-fix patch context")
+    return {"corrected_records": len(corrections), "independent_human_validation": False}
 
 
 def verify_results():
@@ -506,70 +698,7 @@ def verify_sensitivity():
     cases = read_csv("data/final/cases.csv")
     require(retained == {f"github-{r['repository'].replace('/', '-')}-{r['case_id']}" for r in cases},
             "selection differs from the cohort")
-    audit = jsonl("results/statistics/exclusion-audit.jsonl")
-    positives = [r for r in audit if r["final_codebook_decision"] == "in_scope"]
-    require(len(audit) == len({r["record_id"] for r in audit}) == 142 and len(positives) == 19,
-            "final-codebook recheck counts differ")
-    require(all(r["frozen_analysis_membership"] == "excluded" for r in audit),
-            "a rechecked record has unexpected frozen membership")
-    audit_summary = read_json("results/statistics/exclusion-audit-summary.json")
-    require(audit_summary["schema_version"] == "3.0.0"
-            and audit_summary["excluded_records_examined"] == 2516
-            and audit_summary["carried_prior_negative_decisions"] == 2374
-            and audit_summary["final_codebook_rechecks"] == len(audit)
-            and audit_summary["observed_in_scope_rechecks"] == len(positives)
-            and audit_summary["observed_out_of_scope_rechecks"] == len(audit) - len(positives)
-            and audit_summary["population_recall"] is None,
-            "exclusion-audit accounting differs")
-    omissions = read_csv("results/statistics/omitted-positive-sensitivity.csv")
-    require({r["record_id"] for r in omissions} == {r["record_id"] for r in positives}, "omission IDs differ")
-    require(all("sampling_weight" not in row for row in omissions),
-            "omission export contains unsupported sampling weights")
-    for row in omissions:
-        evidence_path = ROOT / row["evidence_path"]
-        require(evidence_path.resolve().is_relative_to(ROOT)
-                and evidence_path.is_file(),
-                f"omission evidence is missing: {row['record_id']}")
-        evidence_record = json.loads(evidence_path.read_text(encoding="utf-8"))
-        require(evidence_record["record_id"] == row["record_id"],
-                f"omission evidence ID differs: {row['record_id']}")
-    published = read_json("results/statistics/selection-sensitivity-summary.json")
-    primary = Counter(r["primary_observed_consequence"] for r in read_csv("results/rq5-report-impacts.csv"))
-    observed = primary + Counter(r["primary_consequence"] for r in omissions)
-    require(published["schema_version"] == "3.0.0"
-            and published["analysis_cohort_reports"] == len(cases)
-            and published["observed_omitted_positive_reports"] == len(omissions)
-            and published["known_in_scope_reports"] == len(cases) + len(omissions)
-            and published["population_recall"] is None,
-            "selection-sensitivity accounting differs")
-    omission_distributions = published["observed_omitted_report_distributions"]
-    for name, field in {
-        "primary_consequence": "primary_consequence",
-        "relation_family": "relation_family",
-        "repository": "repository",
-        "review_evidence_status": "review_evidence_status",
-        "stack": "stack",
-        "transition_family": "transition_family",
-    }.items():
-        require(dict(Counter(r[field] for r in omissions)) == omission_distributions[name],
-                f"omission distribution differs: {name}")
-    cause_sensitivity = published["cause_level_sensitivity"]
-    primary_report_ids = {r["primary_report_id"] for r in read_csv("results/rq-cause-analysis.csv")}
-    require(cause_sensitivity["completed_repair_linked_reconstructions"] == 0
-            and cause_sensitivity["status"] == "not estimated"
-            and not ({r["record_id"] for r in omissions} & primary_report_ids),
-            "omission cause-level reconstruction status differs")
-    require(dict(observed) == published["combined_observed_report_consequences"],
-            "observed consequence sensitivity differs")
     evidence = read_json("results/evidence-sensitivity.json")
-    require(evidence["known_in_scope_records"] == sum(observed.values()) == 283,
-            "known in-scope consequence denominator differs")
-    consequence_rows = {row["consequence"]: row for row in evidence["consequence_sensitivity"]}
-    require(set(consequence_rows) == set(observed), "consequence sensitivity families differ")
-    for family in observed:
-        require(consequence_rows[family]["analysis_cohort"] == primary[family]
-                and consequence_rows[family]["known_in_scope"] == observed[family],
-                f"consequence sensitivity differs: {family}")
     causes = read_csv("results/rq-cause-analysis.csv")
     support = {r["cause_id"]: r for r in read_csv("results/historical-alignment.csv")}
     require(set(support) == {r["cause_id"] for r in causes}, "support coverage differs")
@@ -618,12 +747,90 @@ def verify_sensitivity():
         files = sorted({line.split(" b/", 1)[1] for line in path.read_text().splitlines()
                         if line.startswith("diff --git ") and " b/" in line})
         require(files == patch["changed_files"], f"changed-file list differs: {path}")
-    return {"final_codebook_rechecks": len(audit), "carried_prior_decisions": 2374,
-            "observed_omissions": len(omissions), "known_in_scope": sum(observed.values()),
-            "population_recall": None,
-            "stronger_evidence_causes": len(stronger),
+    return {"stronger_evidence_causes": len(stronger),
             "construct_boundary_restricted_causes": len(restricted),
             "archived_patches": len(patches)}
+
+
+def verify_headline_results():
+    causes = read_csv("results/rq-cause-analysis.csv")
+    reports = read_csv("results/rq5-report-impacts.csv")
+    corresponding = {"missing eligibility check": "strengthen eligibility check",
+                     "incorrect mapping or translation": "correct mapping or representation",
+                     "lost or omitted relation": "preserve or propagate relation"}
+    leading = [row for row in causes if row["failure_mode"] in corresponding]
+    matching = [row for row in leading if row["repair_strategy"] == corresponding[row["failure_mode"]]]
+    flag_fields = ("memory_access_signal", "concurrency_signal", "availability_signal")
+    flagged = [row for row in reports if any(row[field] == "yes" for field in flag_fields)]
+    flags = {field: sum(row[field] == "yes" for row in reports) for field in flag_fields}
+    require(len(leading) == 104 and len(matching) == 94, "headline mechanism/repair counts differ")
+    require(list(flags.values()) == [23, 14, 24] and len(flagged) == 60,
+            "report flag counts or union differ")
+    other_reports = [row for row in reports if row["repository"] != "pytorch/pytorch"]
+    other_causes = [row for row in causes if not row["primary_report_id"].startswith("github-pytorch-pytorch-")]
+    require(len(other_reports) == 193 and len(other_causes) == 112,
+            "PyTorch-repository exclusion membership differs")
+    incorrect = sum(row["primary_observed_consequence"] == "incorrect result or state" for row in other_reports)
+    remaining_leading = sum(row["failure_mode"] in corresponding for row in other_causes)
+    require(incorrect == 103 and remaining_leading == 77, "repository sensitivity counts differ")
+    attempts = read_csv("results/rq6-diagnostic-attempts.csv")
+    require(len(attempts) == 4 and len({row["cause_id"] for row in attempts}) == 3,
+            "diagnostic attempt/cause grouping differs")
+    for row in attempts:
+        if row["failing_path_coverage"] == "no":
+            require(all(row[field] == "not_evaluated" for field in
+                        ("effect_detection", "effect_localization", "cause_localization", "cause_explanation")),
+                    "uncovered diagnostic path has an evaluated outcome")
+    return {"leading_failure_causes": len(leading), "corresponding_repairs": len(matching),
+            "flag_counts": flags, "flagged_report_union": len(flagged),
+            "without_pytorch_repository": {"reports": len(other_reports), "causes": len(other_causes),
+                "incorrect_results": incorrect, "leading_failure_causes": remaining_leading}}
+
+
+def result_index():
+    """Return memberships behind numerical displays; never invent human IDs."""
+    cases = read_csv("data/final/cases.csv")
+    causes = read_csv("results/rq-cause-analysis.csv")
+    reports = read_csv("results/rq5-report-impacts.csv")
+    def group(rows, fields, identifier):
+        grouped = {}
+        for row in rows:
+            key = " | ".join(row[field] for field in fields)
+            grouped.setdefault(key, []).append(identifier(row))
+        return {key: {"count": len(ids), "ids": sorted(ids)} for key, ids in sorted(grouped.items())}
+    cause_id = lambda row: row["cause_id"]
+    report_id = lambda row: "github-" + row["repository"].replace("/", "-") + "-" + row["case_id"]
+    output = {
+        "collection": {"input": "results/selection.csv", "ids": [row["record_id"] for row in read_csv("results/selection.csv")]},
+        "phase1_human_tables": {"input": "results/statistics/phase1-human-review.json",
+                                "unit": "reported review decisions", "record_ids": None,
+                                "status": "aggregate_only; individual human records unavailable"},
+        "report_cause_mapping": group([row for row in cases if row["cause_id"]], ["cause_id"], report_id),
+        "relation_by_ecosystem": group(causes, ["relation_family", "stack"], cause_id),
+        "provenance_endpoints": group(read_csv("results/rq2-provenance-analysis.csv"),
+                                      ["fact_origin_layer", "fact_consumer_layer"], cause_id),
+        "obligation_by_relation": group(causes, ["obligation_family", "relation_family"], cause_id),
+        "relation_transition_matrix": group(causes, ["relation_family", "transition_family"], cause_id),
+        "failure_repair_matrix": group(causes, ["failure_mode", "repair_strategy"], cause_id),
+        "obligation_repair_matrix": group(causes, ["obligation_family", "repair_strategy"], cause_id),
+        "consequences": group(reports, ["primary_observed_consequence"], report_id),
+        "diagnostics": read_csv("results/rq6-diagnostic-attempts.csv"),
+        "label_comparison": {"input": "results/statistics/archived-taxonomy-assignments.jsonl",
+                             "mask": "remove final primary family from both secondary-label sets"},
+        "figure_overview": {"reports": len(cases), "repair_linked": sum(bool(row["cause_id"]) for row in cases),
+                            "causes": len(causes), "check": "source-drawn workflow, not an inferred graph"},
+        "figure_initialization": {"case": "data/final/iree/12161/report.md",
+                                  "check": "manually compare the pre-fix publication and repaired write/check/publication"}
+    }
+    support = {row["cause_id"]: row for row in read_csv("results/historical-alignment.csv")}
+    output["sensitivity_memberships"] = {
+        "test_or_diagnosis": sorted(row["cause_id"] for row in causes
+                                   if any(support[row["cause_id"]][field] == "yes" for field in ("regression_test", "developer_diagnosis"))),
+        "without_pytorch_reports": sorted(report_id(row) for row in reports if row["repository"] != "pytorch/pytorch"),
+        "without_pytorch_causes": sorted(row["cause_id"] for row in causes if not row["primary_report_id"].startswith("github-pytorch-pytorch-")),
+        "without_operation_identity": sorted(row["cause_id"] for row in causes if row["relation_family"] != "value--operation/identity")
+    }
+    return output
 
 
 def verify() -> dict[str, object]:
@@ -639,12 +846,20 @@ def verify() -> dict[str, object]:
         "redactions": verify_redactions(),
         "results": verify_results(),
         "sensitivity": verify_sensitivity(),
+        "phase1_reported_human_totals": verify_phase1_human_totals(),
+        "archived_taxonomy_assignments": verify_archived_assignments(),
+        "source_location_corrections": verify_source_corrections(),
+        "headlines": verify_headline_results(),
     }
 
 
 def main() -> int:
     try:
         summary = verify()
+        if sys.argv[1:] == ["--result-index"]:
+            summary = result_index()
+        elif sys.argv[1:]:
+            raise ArtifactError("usage: verify_artifact.py [--result-index]")
     except (ArtifactError, KeyError, OSError, ValueError, json.JSONDecodeError) as error:
         print(f"artifact verification failed: {error}", file=sys.stderr)
         return 1

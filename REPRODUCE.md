@@ -1,51 +1,93 @@
-# Reproducing the results
+# Reproducing the reported outputs
 
-Run `make reproduce-main`. The verifier reads the published records, checks
-their SHA-256 hashes, and prints a JSON summary with `"status": "ok"`.
-It makes no changes to the data and requires no network access.
+All commands below run from the artifact root. They read the released records,
+use Python 3.10+ and its standard library, require no network, and leave input
+files unchanged.
 
-| Result | Input |
+| Command | Output and expected status |
 |---|---|
-| Declared 7,509-record frame | `results/collection-frame.json` |
-| Five common source baselines | `results/source-baselines.json` |
-| 264 retained and 7,245 excluded records | `results/selection.csv` |
-| 162 repair-linked reports and 149 causes | `data/final/cases.csv` |
-| RQ1, RQ3, RQ4, RQ5 distributions and cross-tabs | `results/rq-cause-analysis.csv` |
-| RQ2 origin and consumer layers; 71 differing endpoint pairs | `results/rq2-provenance-analysis.csv` |
-| RQ4 secondary obligations: 68 causes, 72 labels | `results/rq-cause-analysis.csv` |
-| RQ5 consequences for 264 reports | `results/rq5-report-impacts.csv` |
-| RQ5 consequences by five repository query frames | `results/rq5-report-impacts.csv`, `results/rq5-impact-summary.json` |
-| A/B and reconciled failure-family marginals | `results/statistics/taxonomy-agreement-summary.json` |
-| RQ6 four diagnostic attempts | `results/rq6-diagnostic-attempts.csv` |
-| 142 final-codebook rechecks and 19 observed omissions | `results/statistics/exclusion-audit.jsonl`, `omitted-positive-sensitivity.csv` |
-| Construct-boundary sensitivity excluding 23 value--operation/identity causes | `results/rq-cause-analysis.csv`, `results/statistics/construct-boundary-sensitivity.json` |
-| Full versus 136-cause stronger-evidence distributions | `results/historical-alignment.csv`, `results/evidence-sensitivity.json` |
-| 167 indexed repair patches | `results/repair-patch-index.jsonl` and the referenced patches |
-| 45 taxonomy definitions and examples | `results/taxonomy-codebook.json` |
-| 149 selected repair-supported decisions and zero unresolved final fields | `results/causal-selection-audit.csv`, `results/causal-selection-audit-summary.json` |
-| Complete two-human review coverage for final cause records | `results/human-validation-coverage.json` |
-| Three paired scope boundaries and one evidence-limited exclusion | `results/scope-boundary-examples.csv` and its archived evidence paths |
+| `python3 scripts/verify_artifact.py` | JSON summary, `status: ok`, exit 0; otherwise an explicit error and exit 1 |
+| `python3 scripts/verify_artifact.py --result-index` | JSON membership index with supporting report/cause/attempt IDs; all integrity checks run first |
+| `python3 -m unittest discover -s tests -v` | Offline unit and package tests, exit 0 |
 
-The manifest verifies the packaged data inventory and file contents. The
-collection totals are checked against the declared frame; this is not a new
-enumeration of GitHub's changing index or verification of historical search
-completeness. Source paths and case records preserve the available archived
-evidence.
+`make reproduce-main` and `make test` invoke the first and third commands.
+See [VERIFICATION.json](VERIFICATION.json) for the recorded run and fingerprints.
 
-The causal-selection audit joins the cohort, cause analysis, and historical
-alignment tables. It verifies the final repair-linked denominator and publishes
-the obligation-selection basis for each cause. Pre-adjudication candidate
-lists are absent from the archive, so counts of initially competing operations
-or obligations remain unavailable.
+## Result index
 
-The agreement summaries in `results/statistics/` are final reported outputs.
-They are hash-checked rather than regenerated from intermediate reviewer
-decisions. The released audit contains the 142 records that received a
-final-codebook recheck. The remaining 2,374 examined exclusions retain earlier
-negative decisions. Because the rechecked subset was targeted rather than
-probability sampled, the artifact reports the 19 observed omissions and leaves
-population recall unknown.
+Display names are used here because table numbers can change during layout.
 
-Run `make test` for offline tests of collection, record validation, CLI safety,
-and package consistency. These tests use synthetic responses and perform no
-live collection. Historical compiler failures are not rerun.
+| Paper output | Released input and check |
+|---|---|
+| Collection table and 7,509-record frame | `collection-frame.json`, `selection.csv`, CVE source inventory: 6,816 distinct GitHub IDs and 693 distinct CVE IDs/paths |
+| Human exclusion audit and accuracy/recall formulas | `statistics/phase1-human-review.json`: recompute 600/4/592 totals, exact hypergeometric bounds, 44.86 missed failures, 85.48% estimated initial recall |
+| Review-flow and appendix review tables | Same aggregate file: each stage balances, outputs join, 544 proposals minus 28 reversals gives 516 removals; individual stage memberships unavailable |
+| Analysis sets | `data/final/cases.csv`: 264 reports partition into 162 repair-linked and 102 report-only; 162 links map to 149 causes |
+| RQ1 relation distribution | `rq-cause-analysis.csv`: one primary relation per cause, by ecosystem |
+| RQ2 provenance table | `rq2-provenance-analysis.csv`: origin and consumer endpoints; 71 different categories, 101 compiler and 48 runtime consumers |
+| RQ3 relation–transition matrix | `rq-cause-analysis.csv`: one contribution per cause; matrix margins agree |
+| RQ4 obligation table | Same cause table: 15 primary families, 149 contributions |
+| RQ4 secondary results | `statistics/archived-taxonomy-assignments.jsonl`: mask final primary family separately, compare all 2,235 pairs, retain intersections, check against final labels |
+| RQ5 consequence table and flags | `rq5-report-impacts.csv`: 264 primary consequences; flag union 60, with counts 23/14/24 |
+| RQ5 failure–repair and obligation–repair matrices | Cause table: 149 contributions; 104 leading-family causes and 94 corresponding repairs |
+| RQ5 sensitivity | `historical-alignment.csv`, cause and report tables: 136 test-or-diagnosis causes; removing PyTorch repository retains Triton and yields 193 reports/112 causes |
+| RQ6 diagnostics | `rq6-diagnostic-attempts.csv`: four attempts, three causes; uncovered paths leave the other dimensions not evaluated |
+| Taxonomy definitions | `taxonomy-codebook.json`: 45 families and positive-example links |
+| Repair evidence | `repair-patch-index.jsonl`: 167 patches, file paths, hashes, and cause coverage |
+
+Paths without a prefix above are under `results/`. The result-index command
+exposes matrix-cell memberships and sensitivity subset IDs. It reports null
+membership for the human-review aggregates instead of inventing sample IDs.
+
+## Statistical conventions
+
+The exclusion audit is treated as the author-reported simple random sample
+without replacement from 6,729 initial exclusions. Exact integer combinations
+evaluate hypergeometric tails. Equal-tailed 95% bounds retain population counts
+whose two tail probabilities are at least 0.025; the one-sided bound uses 0.05.
+The 95%-correct exclusion test rejects populations with at least 337 missed
+failures when at most 21 positives are sampled. Power at 97% correct uses
+202 missed failures, the nearest integer to 3% of 6,729.
+
+The script computes with unrounded values. Displayed percentages are rounded
+to two decimals, secondary agreement to one decimal, and power to two decimals.
+The estimated number missed is 44.86 (45 when reported as a whole number).
+The recall transformation uses 264 / (264 + missed).
+
+The two original taxonomy assignment sets remain unchanged. A separate view
+removes the final primary family from each secondary set. Overall agreement
+still includes its 149 automatic joint omissions. The resulting counts are
+72 joint assignments, 2,063 joint omissions, and 100 disagreements; positive
+agreement is 59.0%. Human confirmation of the retained labels is author-reported.
+
+## Inspecting a source record
+
+For the cached-buffer example, start with `data/final/iree/12161/report.md`
+and its `fixes/` patch, then join its cause ID to
+`historical-alignment.csv`, `rq-cause-analysis.csv`, and
+`rq6-diagnostic-attempts.csv`. The pre-fix publication differs from the
+repaired write, success check, and publication. This source comparison explains
+the example figure; the figure is not inferred by the numerical script.
+
+Three corrected JAX anchors are documented in
+`results/source-location-corrections.json`. Repair-side helpers remain in
+required/repaired propagation paths, while pre-fix operations occupy the
+causal-location fields. These checks preserve the taxonomy and distributions;
+they are revision-time evidence checks, not new human localization measurements.
+
+## Diagnostics, figures, and manuscript
+
+The RQ6 table's `evidence_path` identifies each archived command/output record.
+An attempt can group multiple commands or allocator configurations: the
+run-trace comparison and the four run-module allocator configurations each
+count as one attempt. Diagnostic observations remain separate from later
+source-based explanations. This verification run inspects the records; it
+does not build old compiler revisions or rerun the attempts.
+
+Paper sources are maintained in the separate TensorBound-paper repository.
+Its README documents LaTeX compilation, a blue revision copy, a clean reading
+copy, and ReportLab figure generation. Supplied PDF figures support compilation
+without regenerating them. The matrix generator accepts this release's
+`rq-analysis-summary.json` explicitly. TeX fonts, ReportLab, compiler builds,
+device hardware, and model services are outside the standard-library numerical
+verification environment.

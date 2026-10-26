@@ -1,0 +1,265 @@
+{
+  "analysis_script_sha256": "80e81832ef725e8ccb60dbb1932e875e4908d56f4e018718d953842029fd9b15",
+  "commands": [
+    {
+      "command": [
+        "python3",
+        "scripts/verify_artifact.py"
+      ],
+      "exit_status": 0,
+      "status": "ok",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stdout_sha256": "ba94b9a48593433135e00184301038ffba3232b5e924a08b1c5476a75f352674",
+      "working_directory": "artifact root in a fresh staged-file export"
+    },
+    {
+      "command": [
+        "python3",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-v"
+      ],
+      "exit_status": 0,
+      "stderr_sha256": "c0ce46785031fb71f021afe5085088f892c64a88fc9f8ab6a43ebc548d580368",
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "test_output": "test_package_has_no_intermediate_results_or_review_scripts (test_artifact_package.ArtifactPackageTests.test_package_has_no_intermediate_results_or_review_scripts) ... ok\ntest_published_artifact_is_internally_consistent (test_artifact_package.ArtifactPackageTests.test_published_artifact_is_internally_consistent) ... ok\ntest_raw_exports_have_no_notification_capability_links (test_artifact_package.ArtifactPackageTests.test_raw_exports_have_no_notification_capability_links) ... ok\ntest_incomplete_query_returns_nonzero_status (test_collection_cli.CollectionCLITests.test_incomplete_query_returns_nonzero_status) ... ok\ntest_initialization_registers_collector_systems (test_collection_cli.CollectionCLITests.test_initialization_registers_collector_systems) ... ok\ntest_no_review_commands_are_published (test_collection_cli.CollectionCLITests.test_no_review_commands_are_published) ... ok\ntest_plan_needs_no_workspace_or_network (test_collection_cli.CollectionCLITests.test_plan_needs_no_workspace_or_network) ... ok\ntest_plan_preserves_all_five_predicates_and_final_cutoff (test_collection_cli.CollectionCLITests.test_plan_preserves_all_five_predicates_and_final_cutoff) ... ok\ntest_refuses_to_write_into_published_artifact (test_collection_cli.CollectionCLITests.test_refuses_to_write_into_published_artifact) ... ok\ntest_archives_all_search_pages_and_pinned_records (test_cve_list.CVEListCollectionTests.test_archives_all_search_pages_and_pinned_records) ... ok\ntest_rejects_post_cutoff_revision (test_cve_list.CVEListCollectionTests.test_rejects_post_cutoff_revision) ... ok\ntest_collection_deduplicates_queries_and_preserves_snapshots (test_github.GitHubCollectionTests.test_collection_deduplicates_queries_and_preserves_snapshots) ... ok\ntest_detail_collection_preserves_all_comment_pages (test_github.GitHubCollectionTests.test_detail_collection_preserves_all_comment_pages) ... ok\ntest_detail_collection_preserves_issue_and_comments (test_github.GitHubCollectionTests.test_detail_collection_preserves_issue_and_comments) ... ok\ntest_page_limit_is_reported_as_incomplete (test_github.GitHubCollectionTests.test_page_limit_is_reported_as_incomplete) ... ok\ntest_resumed_collection_merges_query_provenance (test_github.GitHubCollectionTests.test_resumed_collection_merges_query_provenance) ... ok\ntest_successful_pages_are_materialized_before_later_fetch_failure (test_github.GitHubCollectionTests.test_successful_pages_are_materialized_before_later_fetch_failure) ... ok\ntest_pinned_source_checks_blob_and_is_idempotent (test_historical_source.HistoricalSourceTests.test_pinned_source_checks_blob_and_is_idempotent) ... ok\ntest_rejects_unsafe_paths_and_wrong_patch_header (test_historical_source.HistoricalSourceTests.test_rejects_unsafe_paths_and_wrong_patch_header) ... ok\ntest_complete_census_and_extreme_observations (test_paper_results.PaperResultsTests.test_complete_census_and_extreme_observations) ... ok\ntest_exact_hypergeometric_counts (test_paper_results.PaperResultsTests.test_exact_hypergeometric_counts) ... ok\ntest_finite_population_interval (test_paper_results.PaperResultsTests.test_finite_population_interval) ... ok\ntest_human_totals_keep_unavailable_records_explicit (test_paper_results.PaperResultsTests.test_human_totals_keep_unavailable_records_explicit) ... ok\ntest_original_assignments_and_secondary_mask (test_paper_results.PaperResultsTests.test_original_assignments_and_secondary_mask) ... ok\ntest_pre_fix_sites_are_separate_from_repaired_paths (test_paper_results.PaperResultsTests.test_pre_fix_sites_are_separate_from_repaired_paths) ... ok\ntest_result_index_contains_actual_members (test_paper_results.PaperResultsTests.test_result_index_contains_actual_members) ... ok\ntest_case_requires_candidate (test_records.RecordValidationTests.test_case_requires_candidate) ... ok\ntest_system_record_is_valid (test_records.RecordValidationTests.test_system_record_is_valid) ... ok\ntest_unknown_evidence_level_is_rejected (test_records.RecordValidationTests.test_unknown_evidence_level_is_rejected) ... ok\ntest_unknown_teb_components_remain_explicit (test_records.RecordValidationTests.test_unknown_teb_components_remain_explicit) ... ok\n\n----------------------------------------------------------------------\nRan 30 tests in 4.841s\n\nOK\n",
+      "working_directory": "artifact root in a fresh staged-file export"
+    },
+    {
+      "command": [
+        "python3",
+        "scripts/verify_artifact.py",
+        "--result-index"
+      ],
+      "exit_status": 0,
+      "indexed_causes": 149,
+      "result_index_sections": [
+        "collection",
+        "consequences",
+        "diagnostics",
+        "failure_repair_matrix",
+        "figure_initialization",
+        "figure_overview",
+        "label_comparison",
+        "obligation_by_relation",
+        "obligation_repair_matrix",
+        "phase1_human_tables",
+        "provenance_endpoints",
+        "relation_by_ecosystem",
+        "relation_transition_matrix",
+        "report_cause_mapping",
+        "sensitivity_memberships"
+      ],
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stdout_sha256": "a50d4f3c665ed2edb9a756a630a827ded32f95d63fd5970dd5e20d4169312fdc",
+      "working_directory": "artifact root in a fresh staged-file export"
+    },
+    {
+      "command": [
+        "make",
+        "reproduce-main"
+      ],
+      "exit_status": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stdout_sha256": "a34cf04c63685dc2fafc8a7e3e3dcc935445681dd5c0cffe35b8c0200dac3105",
+      "working_directory": "artifact root in a fresh staged-file export"
+    }
+  ],
+  "computed_summary": {
+    "analysis_rows": {
+      "report-accountability.csv": 264,
+      "rq-cause-analysis.csv": 149,
+      "rq2-provenance-analysis.csv": 149,
+      "rq5-report-impacts.csv": 264,
+      "rq6-diagnostic-attempts.csv": 4,
+      "rq6-repair-relevant-facts.csv": 149
+    },
+    "archived_taxonomy_assignments": {
+      "actor_type": "unknown",
+      "automatic_primary_family_omissions": 149,
+      "causes_with_secondary_labels": 68,
+      "primary_agreement": {
+        "failure_mode": {
+          "agreements": 112,
+          "kappa": 0.6956665746618824
+        },
+        "obligation_family": {
+          "agreements": 123,
+          "kappa": 0.8098463652873902
+        },
+        "relation_family": {
+          "agreements": 133,
+          "kappa": 0.8734271303424477
+        },
+        "repair_strategy": {
+          "agreements": 119,
+          "kappa": 0.7459216733928267
+        },
+        "transition_family": {
+          "agreements": 129,
+          "kappa": 0.8372296263928337
+        }
+      },
+      "retained_secondary_labels": 72,
+      "secondary_overall_agreement_percent": 95.5,
+      "secondary_pair_counts": {
+        "absent|absent": 2063,
+        "absent|present": 50,
+        "present|absent": 50,
+        "present|present": 72
+      },
+      "secondary_pairs": 2235,
+      "secondary_positive_agreement_percent": 59
+    },
+    "causal_selection": {
+      "selected_first_invalid_decisions": 149,
+      "selected_primary_obligations": 149,
+      "unresolved_first_invalid_decisions": 0,
+      "unresolved_primary_obligations": 0
+    },
+    "cohort": {
+      "distinct_repaired_causes": 149,
+      "repair_backed_reports": 162,
+      "reports": 264,
+      "reports_by_stack": {
+        "iree": 74,
+        "pytorch-inductor-triton": 99,
+        "xla-jax-pjrt": 91
+      },
+      "reports_without_traceable_repair": 102
+    },
+    "collection": {
+      "boundary": "2026-09-24",
+      "cve_capture_end": "2026-09-25T03:15:45Z",
+      "cve_capture_start": "2026-09-25T02:45:33Z",
+      "cve_records": 693,
+      "cve_unique_source_paths": 693,
+      "github_records": 6816,
+      "source_baselines": 5,
+      "total_records": 7509
+    },
+    "data_manifest_files": 3199,
+    "headlines": {
+      "corresponding_repairs": 94,
+      "flag_counts": {
+        "availability_signal": 24,
+        "concurrency_signal": 14,
+        "memory_access_signal": 23
+      },
+      "flagged_report_union": 60,
+      "leading_failure_causes": 104,
+      "without_pytorch_repository": {
+        "causes": 112,
+        "incorrect_results": 103,
+        "leading_failure_causes": 77,
+        "reports": 193
+      }
+    },
+    "human_validation": {
+      "cause_records_reviewed_by_each": 149,
+      "duplicate_report_links": 13,
+      "repair_linked_report_assignments": 162,
+      "reviewers": 2,
+      "unresolved_final_cause_records": 0
+    },
+    "phase1_reported_human_totals": {
+      "acceptance_threshold": 21,
+      "correctly_excluded_95_interval_percent": [
+        98.35,
+        99.79
+      ],
+      "correctly_excluded_one_sided_95_lower_percent": 98.53,
+      "correctly_excluded_percent": 99.33,
+      "estimated_missed": 44.86,
+      "final_removals": 516,
+      "initial_recall_95_interval_percent": [
+        70.4,
+        94.96
+      ],
+      "initial_recall_percent": 85.48,
+      "missed_equal_tailed_95_interval": [
+        14,
+        111
+      ],
+      "missing_records": {
+        "individual_human_labels": "unavailable_in_release",
+        "per_step_removal_and_restoration_ids": "unavailable_in_release",
+        "review_dates": "not_recorded_in_available_metadata",
+        "reviewer_identifiers": "not_recorded_in_available_metadata",
+        "sample_membership": "unavailable_in_release",
+        "unique_restored_records": null
+      },
+      "power_at_97_percent_correct": 0.81,
+      "removal_proposals": 544,
+      "restoration_decisions": 28,
+      "sample_agreements": 592,
+      "sample_binding_failures": 4,
+      "sample_records": 600,
+      "verification_scope": "Recompute arithmetic from supplied totals. Sample membership, disjointness, blinding, and human decisions are author-reported procedures, not independently checked by the script."
+    },
+    "redactions": {
+      "raw_files_scanned": 2714,
+      "redaction_markers": 22
+    },
+    "results": {
+      "diagnostic_attempts": 4,
+      "different_endpoint_categories": 71,
+      "families": {
+        "failure_mode": 8,
+        "obligation_family": 15,
+        "relation_family": 8,
+        "repair_strategy": 7,
+        "transition_family": 7
+      },
+      "secondary_causes": 68,
+      "secondary_labels": 72
+    },
+    "scope_boundaries": {
+      "evidence_limited_records": 1,
+      "paired_construct_boundaries": 3,
+      "paired_records": 6
+    },
+    "sensitivity": {
+      "archived_patches": 167,
+      "construct_boundary_restricted_causes": 126,
+      "stronger_evidence_causes": 136
+    },
+    "source_location_corrections": {
+      "corrected_records": 3,
+      "independent_human_validation": false
+    },
+    "status": "ok"
+  },
+  "data_manifest_sha256": "a5f7757303f0b0fb510ae5c15bb4dd00791f55d14a43a1078415c4d992b4cefe",
+  "environment": {
+    "os_release": {
+      "BUG_REPORT_URL": "https://bugs.launchpad.net/ubuntu/",
+      "HOME_URL": "https://www.ubuntu.com/",
+      "ID": "ubuntu",
+      "ID_LIKE": "debian",
+      "LOGO": "ubuntu-logo",
+      "NAME": "Ubuntu",
+      "PRETTY_NAME": "Ubuntu 24.04.3 LTS",
+      "PRIVACY_POLICY_URL": "https://www.ubuntu.com/legal/terms-and-policies/privacy-policy",
+      "SUPPORT_URL": "https://help.ubuntu.com/",
+      "UBUNTU_CODENAME": "noble",
+      "VERSION": "24.04.3 LTS (Noble Numbat)",
+      "VERSION_CODENAME": "noble",
+      "VERSION_ID": "24.04"
+    },
+    "platform": "Linux-6.14.0-1017-oem-x86_64-with-glibc2.39",
+    "python": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]"
+  },
+  "execution": "Fresh export of staged artifact files; no development repository files, external analysis inputs, network retrieval, model calls, or diagnostic reruns.",
+  "limitations": [
+    "Human audit membership, individual labels, and restoration IDs are unavailable; only supplied aggregate arithmetic is verified.",
+    "Original taxonomy actors and independent source-operation selections remain unknown.",
+    "Historical diagnostics and model calls were not rerun.",
+    "Manuscript and figure builds are checked separately in the paper repository."
+  ],
+  "release_id": "tensorbound-2026-10-25-presentation",
+  "verified_at": "2026-10-26T00:05:04.225811+00:00"
+}

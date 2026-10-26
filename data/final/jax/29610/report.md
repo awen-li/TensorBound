@@ -120,7 +120,14 @@ Deserialized execution initializes platform-specific runtime handlers independen
 
 ## Invalid decision
 
-Export deserialization relied on incidental backend initialization performed by normal lowering.
+The existing `fn(...)` call in
+`jaxlib/cpu/lapack_kernels.cc::CholeskyFactorization<dtype>::Kernel`
+invokes the LAPACK function pointer before the fresh process initializes it.
+This is line 340 at the recorded pre-fix revision. Export deserialization
+had relied on initialization during normal lowering. The repair adds
+`_ensure_backends_initialized` to exported-call setup; that new helper is a
+repair site. The revision-time [source comparison](source-evidence.md)
+separates these locations.
 
 ## Physical effect
 

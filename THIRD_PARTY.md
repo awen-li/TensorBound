@@ -6,7 +6,8 @@ sources so reviewers can audit the evidence used in the study:
 
 - GitHub issue, comment, event, and commit metadata under `data/raw/github/`;
 - CVE List records under `data/raw/cve-list/`; and
-- upstream repair patches under `data/final/*/*/fixes/`.
+- upstream repair patches under `data/final/*/*/fixes/`; and
+- pinned source excerpts in `data/final/jax/29610/source-evidence.md`.
 
 These records and patches retain the copyright and license terms of their
 original projects and authors. Each case bundle and index row preserves its

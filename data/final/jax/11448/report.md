@@ -221,7 +221,12 @@ Cache identity may depend on a function without becoming a new owner that extend
 
 ## Invalid decision
 
-The old control-flow caches used strong-reference memoization for function-keyed jaxpr construction.
+The pre-fix `@cache()` call for `_initial_style_jaxpr` in
+`jax/_src/lax/control_flow/common.py` strongly retains the function key and
+its captured buffers. The attributed diagnosis identifies this retaining
+cache. The repair replaces it with `weakref_lru_cache`; that replacement is
+not the historical invalid operation. See the revision-time
+[source-location correction](../../../../results/source-location-corrections.json).
 
 ## Physical effect
 

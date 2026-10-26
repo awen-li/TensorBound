@@ -6,49 +6,12 @@
     "repair_strategy": 7,
     "transition_family": 7
   },
-  "consequence_sensitivity": [
-    {
-      "consequence": "data race",
-      "analysis_cohort": 5,
-      "known_in_scope": 5
-    },
-    {
-      "consequence": "hang or deadlock",
-      "analysis_cohort": 12,
-      "known_in_scope": 13
-    },
-    {
-      "consequence": "incorrect result or state",
-      "analysis_cohort": 168,
-      "known_in_scope": 176
-    },
-    {
-      "consequence": "memory-access violation",
-      "analysis_cohort": 23,
-      "known_in_scope": 24
-    },
-    {
-      "consequence": "other observable failure",
-      "analysis_cohort": 3,
-      "known_in_scope": 3
-    },
-    {
-      "consequence": "resource leak or exhaustion",
-      "analysis_cohort": 12,
-      "known_in_scope": 14
-    },
-    {
-      "consequence": "runtime rejection or crash",
-      "analysis_cohort": 41,
-      "known_in_scope": 48
-    }
-  ],
-  "known_in_scope_records": 283,
   "repair_evidence": {
     "archived_patches": 167,
     "causes": 149,
     "multifile_causes": 136
   },
+  "scope": "Current cause-level evidence sensitivity; earlier 19-omission report sensitivity remains in artifact release e70da3b.",
   "stronger_evidence_distributions": {
     "failure_mode": {
       "families": [

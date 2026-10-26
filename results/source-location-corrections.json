@@ -1,0 +1,47 @@
+{
+  "schema_version": "1.0.0",
+  "checked_on": "2026-10-25",
+  "record_kind": "revision_evidence_check",
+  "actor_type": "assistant",
+  "historical_human_validation": false,
+  "basis": "Pre-fix source and archived repair patches, read without executing the reported failures.",
+  "error": "Three first-invalid-decision fields named helpers introduced by the repair. Required or repaired propagation steps are separate from the historical failing operation.",
+  "corrections": [
+    {
+      "cause_id": "cause-jax-11448-control-flow-cache-strongly-retains-closed-constant",
+      "old_site": "weakref_lru_cache",
+      "new_site": "jax/_src/lax/control_flow/common.py::_initial_style_jaxpr (pre-fix @cache() call)",
+      "pre_fix_revision": "0bc8f8abeb72870ea2fbf2b5d2a1279e993731d2",
+      "operation": "Calling the strongly memoized _initial_style_jaxpr retains its function key and captured buffers.",
+      "predicate": "Memoization preserves function identity without extending captured-buffer lifetime after caller references are released.",
+      "evidence": ["data/final/jax/11448/report.md#causal-basis", "data/final/jax/11448/fixes/jax-11448-pr11461.patch"],
+      "pre_fix_patch_text": "-@cache()\n+@weakref_lru_cache\n def _initial_style_jaxpr",
+      "alternative": "weakref_lru_cache is the replacement cache. The patch also changes related loop-body caches; the attributed diagnosis names _initial_style_jaxpr as retaining the buffer.",
+      "label_check": "Strong cache ownership supports the existing ownership/lifetime relation, transition, obligation, and repair labels; compiler consumer unchanged."
+    },
+    {
+      "cause_id": "cause-jax-29610-deserialized-export-leaves-lapack-kernels-null",
+      "old_site": "_export.py::_ensure_backends_initialized",
+      "new_site": "jaxlib/cpu/lapack_kernels.cc::CholeskyFactorization<dtype>::Kernel (fn call, line 340)",
+      "pre_fix_revision": "c83a71903d8655511510aa0e6f79dfb5bcd6b8e4",
+      "operation": "The Cholesky FFI handler invokes fn while the fresh process has not initialized the LAPACK function pointer.",
+      "predicate": "The platform-specific kernel pointer is initialized before the handler invokes it.",
+      "evidence": ["data/final/jax/29610/report.md#causal-basis", "data/final/jax/29610/source-evidence.md", "data/final/jax/29610/fixes/jax-29610-pr33522.patch"],
+      "alternative": "_ensure_backends_initialized and its call are added by the repair. Parsing or merging the exported IR does not dereference the kernel pointer; the existing fn call is the first supported operation that requires its initialized value.",
+      "label_check": "The omitted backend initialization supports the existing initialization obligation and perform-omitted-operation repair. The runtime consumer, runtime-state origin, and secondary capability obligation are unchanged."
+    },
+    {
+      "cause_id": "cause-jax-40564-max-jvp-compares-rematerialized-value-to-forward-result",
+      "old_site": "lax.py::_balanced_cmp",
+      "new_site": "jax/_src/lax/lax.py::_balanced_eq (select(_eq_meet(x, z), _ones(z), _zeros(z)))",
+      "pre_fix_revision": "f7ef90b377c3801826abaf6a08d3cec736e1d70c",
+      "operation": "The equality-based select derives the tangent mask from a rematerialized operand and the separately computed forward result.",
+      "predicate": "The mask preserves the winning operand's tangent when rematerialization changes bitwise equality with the forward result.",
+      "evidence": ["data/final/jax/40564/report.md#causal-basis", "data/final/jax/40564/fixes/jax-40564-pr40578.patch"],
+      "pre_fix_patch_text": "-def _balanced_eq(x, z, y):\n-  return div(select(_eq_meet(x, z), _ones(z), _zeros(z)),",
+      "alternative": "_balanced_cmp is introduced by the repair. The later tangent multiplication exposes the zero mask but does not make the unsupported identity inference.",
+      "label_check": "The equality-derived identity inference supports the existing relation, transition, primary value-semantics and secondary identity obligations, failure and repair labels; compiler consumer unchanged."
+    }
+  ],
+  "result_change": "Source-location metadata corrected; cohort membership, taxonomy assignments, and numerical results unchanged."
+}

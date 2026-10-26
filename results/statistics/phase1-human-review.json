@@ -1,0 +1,54 @@
+{
+  "schema_version": "1.0.0",
+  "record_kind": "author_reported_human_review_totals",
+  "source": "Author-supplied results incorporated in manuscript baseline 91c409606e83ad7ec01803b0f6f6278fec46cc6c",
+  "scope": "Current Phase 1 human review; separate from the earlier targeted 142-record recheck in release e70da3b",
+  "reviewers": 2,
+  "initial_exclusions": 6729,
+  "reported_design": "Three successive, non-overlapping simple random samples without replacement, 200 records each; both reviewers label every sampled record independently before discussion.",
+  "samples": [
+    {"sample": 1, "reviewed": 200, "binding_failures": 0, "pre_discussion_agreements": 198},
+    {"sample": 2, "reviewed": 200, "binding_failures": 3, "pre_discussion_agreements": 195},
+    {"sample": 3, "reviewed": 200, "binding_failures": 1, "pre_discussion_agreements": 199}
+  ],
+  "review_steps": [
+    {"step": "Detailed review", "input": 780, "proposed_removals": 366, "restored": 19, "final_removals": 347, "output": 433},
+    {"step": "Review round 1", "input": 433, "proposed_removals": 41, "restored": 3, "final_removals": 38, "output": 395},
+    {"step": "Review round 2", "input": 395, "proposed_removals": 67, "restored": 5, "final_removals": 62, "output": 333},
+    {"step": "Review round 3", "input": 333, "proposed_removals": 55, "restored": 1, "final_removals": 54, "output": 279},
+    {"step": "Review round 4", "input": 279, "proposed_removals": 10, "restored": 0, "final_removals": 10, "output": 269},
+    {"step": "Final review", "input": 269, "proposed_removals": 5, "restored": 0, "final_removals": 5, "output": 264}
+  ],
+  "detailed_review_removals": [
+    {"label": "excluded", "proposed": 283, "restored": 13},
+    {"label": "unresolved", "proposed": 83, "restored": 6}
+  ],
+  "final_set": {"reports": 264, "confirmed_by_both_before_discussion": 264},
+  "audit_positives_in_analysis_set": false,
+  "missing_records": {
+    "sample_membership": "unavailable_in_release",
+    "individual_human_labels": "unavailable_in_release",
+    "per_step_removal_and_restoration_ids": "unavailable_in_release",
+    "reviewer_identifiers": "not_recorded_in_available_metadata",
+    "review_dates": "not_recorded_in_available_metadata",
+    "unique_restored_records": null
+  },
+  "verification_scope": "Recompute arithmetic from supplied totals. Sample membership, disjointness, blinding, and human decisions are author-reported procedures, not independently checked by the script.",
+  "expected": {
+    "sample_records": 600,
+    "sample_binding_failures": 4,
+    "sample_agreements": 592,
+    "estimated_missed": 44.86,
+    "missed_equal_tailed_95_interval": [14, 111],
+    "correctly_excluded_percent": 99.33,
+    "correctly_excluded_95_interval_percent": [98.35, 99.79],
+    "correctly_excluded_one_sided_95_lower_percent": 98.53,
+    "acceptance_threshold": 21,
+    "power_at_97_percent_correct": 0.81,
+    "initial_recall_percent": 85.48,
+    "initial_recall_95_interval_percent": [70.40, 94.96],
+    "removal_proposals": 544,
+    "restoration_decisions": 28,
+    "final_removals": 516
+  }
+}

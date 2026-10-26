@@ -163,7 +163,13 @@ Derivative branch selection remains valid when an operand and the forward answer
 
 ## Invalid decision
 
-The max/min JVP rule derived branch identity from equality with a separately computed forward result.
+The pre-fix `_balanced_eq` helper in `jax/_src/lax/lax.py` uses
+`select(_eq_meet(x, z), _ones(z), _zeros(z))` to select the tangent mask.
+This derives branch identity from equality between a rematerialized operand
+and the separately computed forward result. The repair introduces
+`_balanced_cmp`; that new helper is not the historical invalid operation.
+See the revision-time
+[source-location correction](../../../../results/source-location-corrections.json).
 
 ## Physical effect
 
