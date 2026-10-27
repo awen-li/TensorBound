@@ -1,0 +1,64 @@
+{
+  "schema_version": "1.0.0",
+  "checked_on": "2026-10-27",
+  "actor_type": "assistant",
+  "historical_human_validation": false,
+  "baseline_artifact_commit": "37af7ddfe865f52333fef30d17d20b7e8c927d77",
+  "basis": "Pre-fix source, archived repair, and regression-test inspection; no diagnostic rerun or new human review.",
+  "corrections": [
+    {
+      "cause_id": "cause-iree-9033-buffer-retains-allocator",
+      "field": "failure_mode",
+      "old_value": "lost or omitted relation",
+      "new_value": "omitted operation",
+      "pre_fix_revision": "c0be21d0f16c793ba44bd367e81c8910b9a38521",
+      "first_invalid_decision_site": "runtime/src/iree/hal/buffer.c::iree_hal_buffer_initialize (implicit return, pre-fix line 202)",
+      "operation": "Initialization completes with the allocator pointer stored but without retaining the allocator.",
+      "condition": "The backing allocator remains alive through buffer destruction.",
+      "reason": "The pointer is stored and propagated to deallocation. The missing concrete action is an allocator retain, which the published codebook assigns to omitted operation.",
+      "source_anchor_refinement": "The earlier record named buffer initialization at file granularity. The source check locates its completion; the pointer assignment alone can still be followed by a retain.",
+      "trigger_refinement": "The failure occurs during teardown while a buffer remains live; the minimal script does not return a device array.",
+      "preserved_labels": {
+        "relation_family": "storage--ownership/lifetime",
+        "transition_family": "ownership or lifetime change",
+        "obligation_family": "ownership and lifetime",
+        "repair_strategy": "correct ownership or lifetime"
+      },
+      "evidence": [
+        "data/final/iree/9033/report.md",
+        "data/final/iree/9033/source-evidence.md",
+        "data/final/iree/9033/fixes/iree-9033-fix.patch"
+      ]
+    },
+    {
+      "cause_id": "cause-iree-9392-callback-cleanup-identity",
+      "field": "obligation_family",
+      "old_value": "ownership and lifetime",
+      "new_value": "happens-before ordering",
+      "additional_label_changes": {
+        "repair_strategy": {
+          "old_value": "correct ownership or lifetime",
+          "new_value": "preserve or propagate relation"
+        }
+      },
+      "pre_fix_revision": "d42e002ec10444ac05f77a58d7396ff3658fbfd4",
+      "first_invalid_decision_site": "runtime/src/iree/hal/drivers/local_task/task_semaphore.c::iree_hal_task_semaphore_multi_wait (timepoints[i].base.semaphore read, pre-fix line 392)",
+      "operation": "Waiter cleanup reads the callback-reset field before cancellation acquires timepoint_mutex.",
+      "condition": "A cleanup read of callback-mutated state is ordered with the conflicting reset.",
+      "reason": "The caller retains the semaphore and owns the enclosing timepoint storage through cleanup. The reported violation is the unordered read/reset pair. The repair copies the semaphore identity into a separate field, removing the conflict without changing semaphore reference counting.",
+      "source_anchor_refinement": "The paper already selects the cleanup read. The artifact's earlier file-only semaphore_base.c anchor named the competing reset; the corrected anchor agrees with the report, TSan trace, and paper.",
+      "preserved_labels": {
+        "relation_family": "storage--ownership/lifetime",
+        "transition_family": "ownership or lifetime change",
+        "failure_mode": "premature or unordered transition"
+      },
+      "evidence": [
+        "data/final/iree/9392/report.md",
+        "data/final/iree/9392/source-evidence.md",
+        "data/final/iree/9392/fixes/iree-9392-fix.patch"
+      ]
+    }
+  ],
+  "preserved_history": "Original A/B assignments, their agreement statistics, the earlier reconciled marginals, and the historical secondary-label analysis remain unchanged. Historical secondary masks use the pre-correction primary obligation. Current primary distributions apply the corrections above.",
+  "result_change": "149 causes remain. IREE 9033 changes lost or omitted relation from 32 to 31 and omitted operation from 5 to 6; the leading families contain 103 causes, 94 matching repairs, and nine exceptions. IREE 9392 changes ownership and lifetime from 13 to 12 and happens-before ordering from 20 to 21; correct ownership or lifetime repairs change from 12 to 11 and preserve or propagate relation from 32 to 33."
+}

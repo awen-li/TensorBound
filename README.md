@@ -55,6 +55,7 @@ matrix cell, and sensitivity subset. Human-review tables are marked aggregate-on
 | `results/rq-*.csv`, `results/rq*.json` | Final RQ records and distributions |
 | `results/historical-alignment.csv` | Pre-fix and fixed revisions, operation and repair sites, evidence flags |
 | `results/source-location-corrections.json` | Three revision-time source-anchor corrections and their evidence |
+| `results/coding-corrections.json` | Source-supported corrections for the allocator retain and semaphore cleanup |
 | `results/statistics/phase1-human-review.json` | Supplied sample and review-step totals; explicit missing individual records |
 | `results/statistics/archived-taxonomy-assignments.jsonl` | Original A/B assignment values used in the published comparison; actor identities unknown |
 | `results/human-validation-coverage.json` | Authors' account of the completed two-human cause review |
@@ -67,6 +68,13 @@ The artifact omits review-execution scripts, prompts, intermediate coding
 outputs, blank review forms, development caches, and paper sources. The two
 archived taxonomy assignment sets are retained as inputs to the reported
 agreement analysis, separately from final labels and the derived secondary mask.
+
+The 2026-10-27 source checks classify IREE 9033's missing retain as an omitted
+operation and IREE 9392's cleanup read as an ordering violation repaired by
+preserving the semaphore identity. Current primary results include these
+corrections. Archived A/B labels, earlier reconciled marginals, and historical
+secondary-label calculations retain their original reference labels. The
+corrections are separate from the authors' account of the earlier human review.
 
 ## Documentation
 

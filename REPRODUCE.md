@@ -29,7 +29,7 @@ Display names are used here because table numbers can change during layout.
 | RQ4 obligation table | Same cause table: 15 primary families, 149 contributions |
 | RQ4 secondary results | `statistics/archived-taxonomy-assignments.jsonl`: mask final primary family separately, compare all 2,235 pairs, retain intersections, check against final labels |
 | RQ5 consequence table and flags | `rq5-report-impacts.csv`: 264 primary consequences; flag union 60, with counts 23/14/24 |
-| RQ5 failure–repair and obligation–repair matrices | Cause table: 149 contributions; 104 leading-family causes and 94 corresponding repairs |
+| RQ5 failure–repair and obligation–repair matrices | Cause table: 149 contributions; 103 leading-family causes and 94 corresponding repairs |
 | RQ5 sensitivity | `historical-alignment.csv`, cause and report tables: 136 test-or-diagnosis causes; removing PyTorch repository retains Triton and yields 193 reports/112 causes |
 | RQ6 diagnostics | `rq6-diagnostic-attempts.csv`: four attempts, three causes; uncovered paths leave the other dimensions not evaluated |
 | Taxonomy definitions | `taxonomy-codebook.json`: 45 families and positive-example links |

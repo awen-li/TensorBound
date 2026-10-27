@@ -1,5 +1,5 @@
 {
-  "analysis_script_sha256": "80e81832ef725e8ccb60dbb1932e875e4908d56f4e018718d953842029fd9b15",
+  "analysis_script_sha256": "8ff8a699d3c629c45e8eb24c5e397474b03c4b02153d2c1f6b80b42c5b9e906c",
   "commands": [
     {
       "command": [
@@ -7,10 +7,10 @@
         "scripts/verify_artifact.py"
       ],
       "exit_status": 0,
-      "status": "ok",
+      "stdout_sha256": "7e89801a755fc3e8b99337dab2e688e7e0acb572c2cf4b5b4de2cc82bf1018f7",
       "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-      "stdout_sha256": "ba94b9a48593433135e00184301038ffba3232b5e924a08b1c5476a75f352674",
-      "working_directory": "artifact root in a fresh staged-file export"
+      "working_directory": "artifact root in a fresh staged-file export",
+      "status": "ok"
     },
     {
       "command": [
@@ -23,10 +23,10 @@
         "-v"
       ],
       "exit_status": 0,
-      "stderr_sha256": "c0ce46785031fb71f021afe5085088f892c64a88fc9f8ab6a43ebc548d580368",
       "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-      "test_output": "test_package_has_no_intermediate_results_or_review_scripts (test_artifact_package.ArtifactPackageTests.test_package_has_no_intermediate_results_or_review_scripts) ... ok\ntest_published_artifact_is_internally_consistent (test_artifact_package.ArtifactPackageTests.test_published_artifact_is_internally_consistent) ... ok\ntest_raw_exports_have_no_notification_capability_links (test_artifact_package.ArtifactPackageTests.test_raw_exports_have_no_notification_capability_links) ... ok\ntest_incomplete_query_returns_nonzero_status (test_collection_cli.CollectionCLITests.test_incomplete_query_returns_nonzero_status) ... ok\ntest_initialization_registers_collector_systems (test_collection_cli.CollectionCLITests.test_initialization_registers_collector_systems) ... ok\ntest_no_review_commands_are_published (test_collection_cli.CollectionCLITests.test_no_review_commands_are_published) ... ok\ntest_plan_needs_no_workspace_or_network (test_collection_cli.CollectionCLITests.test_plan_needs_no_workspace_or_network) ... ok\ntest_plan_preserves_all_five_predicates_and_final_cutoff (test_collection_cli.CollectionCLITests.test_plan_preserves_all_five_predicates_and_final_cutoff) ... ok\ntest_refuses_to_write_into_published_artifact (test_collection_cli.CollectionCLITests.test_refuses_to_write_into_published_artifact) ... ok\ntest_archives_all_search_pages_and_pinned_records (test_cve_list.CVEListCollectionTests.test_archives_all_search_pages_and_pinned_records) ... ok\ntest_rejects_post_cutoff_revision (test_cve_list.CVEListCollectionTests.test_rejects_post_cutoff_revision) ... ok\ntest_collection_deduplicates_queries_and_preserves_snapshots (test_github.GitHubCollectionTests.test_collection_deduplicates_queries_and_preserves_snapshots) ... ok\ntest_detail_collection_preserves_all_comment_pages (test_github.GitHubCollectionTests.test_detail_collection_preserves_all_comment_pages) ... ok\ntest_detail_collection_preserves_issue_and_comments (test_github.GitHubCollectionTests.test_detail_collection_preserves_issue_and_comments) ... ok\ntest_page_limit_is_reported_as_incomplete (test_github.GitHubCollectionTests.test_page_limit_is_reported_as_incomplete) ... ok\ntest_resumed_collection_merges_query_provenance (test_github.GitHubCollectionTests.test_resumed_collection_merges_query_provenance) ... ok\ntest_successful_pages_are_materialized_before_later_fetch_failure (test_github.GitHubCollectionTests.test_successful_pages_are_materialized_before_later_fetch_failure) ... ok\ntest_pinned_source_checks_blob_and_is_idempotent (test_historical_source.HistoricalSourceTests.test_pinned_source_checks_blob_and_is_idempotent) ... ok\ntest_rejects_unsafe_paths_and_wrong_patch_header (test_historical_source.HistoricalSourceTests.test_rejects_unsafe_paths_and_wrong_patch_header) ... ok\ntest_complete_census_and_extreme_observations (test_paper_results.PaperResultsTests.test_complete_census_and_extreme_observations) ... ok\ntest_exact_hypergeometric_counts (test_paper_results.PaperResultsTests.test_exact_hypergeometric_counts) ... ok\ntest_finite_population_interval (test_paper_results.PaperResultsTests.test_finite_population_interval) ... ok\ntest_human_totals_keep_unavailable_records_explicit (test_paper_results.PaperResultsTests.test_human_totals_keep_unavailable_records_explicit) ... ok\ntest_original_assignments_and_secondary_mask (test_paper_results.PaperResultsTests.test_original_assignments_and_secondary_mask) ... ok\ntest_pre_fix_sites_are_separate_from_repaired_paths (test_paper_results.PaperResultsTests.test_pre_fix_sites_are_separate_from_repaired_paths) ... ok\ntest_result_index_contains_actual_members (test_paper_results.PaperResultsTests.test_result_index_contains_actual_members) ... ok\ntest_case_requires_candidate (test_records.RecordValidationTests.test_case_requires_candidate) ... ok\ntest_system_record_is_valid (test_records.RecordValidationTests.test_system_record_is_valid) ... ok\ntest_unknown_evidence_level_is_rejected (test_records.RecordValidationTests.test_unknown_evidence_level_is_rejected) ... ok\ntest_unknown_teb_components_remain_explicit (test_records.RecordValidationTests.test_unknown_teb_components_remain_explicit) ... ok\n\n----------------------------------------------------------------------\nRan 30 tests in 4.841s\n\nOK\n",
-      "working_directory": "artifact root in a fresh staged-file export"
+      "stderr_sha256": "bd00626db26e506ff3534b22605693acf9ce1a15b11c002bf23c48b652615ada",
+      "working_directory": "artifact root in a fresh staged-file export",
+      "test_output": "test_package_has_no_intermediate_results_or_review_scripts (test_artifact_package.ArtifactPackageTests.test_package_has_no_intermediate_results_or_review_scripts) ... ok\ntest_published_artifact_is_internally_consistent (test_artifact_package.ArtifactPackageTests.test_published_artifact_is_internally_consistent) ... ok\ntest_raw_exports_have_no_notification_capability_links (test_artifact_package.ArtifactPackageTests.test_raw_exports_have_no_notification_capability_links) ... ok\ntest_incomplete_query_returns_nonzero_status (test_collection_cli.CollectionCLITests.test_incomplete_query_returns_nonzero_status) ... ok\ntest_initialization_registers_collector_systems (test_collection_cli.CollectionCLITests.test_initialization_registers_collector_systems) ... ok\ntest_no_review_commands_are_published (test_collection_cli.CollectionCLITests.test_no_review_commands_are_published) ... ok\ntest_plan_needs_no_workspace_or_network (test_collection_cli.CollectionCLITests.test_plan_needs_no_workspace_or_network) ... ok\ntest_plan_preserves_all_five_predicates_and_final_cutoff (test_collection_cli.CollectionCLITests.test_plan_preserves_all_five_predicates_and_final_cutoff) ... ok\ntest_refuses_to_write_into_published_artifact (test_collection_cli.CollectionCLITests.test_refuses_to_write_into_published_artifact) ... ok\ntest_archives_all_search_pages_and_pinned_records (test_cve_list.CVEListCollectionTests.test_archives_all_search_pages_and_pinned_records) ... ok\ntest_rejects_post_cutoff_revision (test_cve_list.CVEListCollectionTests.test_rejects_post_cutoff_revision) ... ok\ntest_collection_deduplicates_queries_and_preserves_snapshots (test_github.GitHubCollectionTests.test_collection_deduplicates_queries_and_preserves_snapshots) ... ok\ntest_detail_collection_preserves_all_comment_pages (test_github.GitHubCollectionTests.test_detail_collection_preserves_all_comment_pages) ... ok\ntest_detail_collection_preserves_issue_and_comments (test_github.GitHubCollectionTests.test_detail_collection_preserves_issue_and_comments) ... ok\ntest_page_limit_is_reported_as_incomplete (test_github.GitHubCollectionTests.test_page_limit_is_reported_as_incomplete) ... ok\ntest_resumed_collection_merges_query_provenance (test_github.GitHubCollectionTests.test_resumed_collection_merges_query_provenance) ... ok\ntest_successful_pages_are_materialized_before_later_fetch_failure (test_github.GitHubCollectionTests.test_successful_pages_are_materialized_before_later_fetch_failure) ... ok\ntest_pinned_source_checks_blob_and_is_idempotent (test_historical_source.HistoricalSourceTests.test_pinned_source_checks_blob_and_is_idempotent) ... ok\ntest_rejects_unsafe_paths_and_wrong_patch_header (test_historical_source.HistoricalSourceTests.test_rejects_unsafe_paths_and_wrong_patch_header) ... ok\ntest_allocator_retain_is_an_omitted_operation (test_paper_results.PaperResultsTests.test_allocator_retain_is_an_omitted_operation) ... ok\ntest_complete_census_and_extreme_observations (test_paper_results.PaperResultsTests.test_complete_census_and_extreme_observations) ... ok\ntest_exact_hypergeometric_counts (test_paper_results.PaperResultsTests.test_exact_hypergeometric_counts) ... ok\ntest_finite_population_interval (test_paper_results.PaperResultsTests.test_finite_population_interval) ... ok\ntest_historical_reconciliation_is_preserved (test_paper_results.PaperResultsTests.test_historical_reconciliation_is_preserved) ... ok\ntest_human_totals_keep_unavailable_records_explicit (test_paper_results.PaperResultsTests.test_human_totals_keep_unavailable_records_explicit) ... ok\ntest_original_assignments_and_secondary_mask (test_paper_results.PaperResultsTests.test_original_assignments_and_secondary_mask) ... ok\ntest_pre_fix_sites_are_separate_from_repaired_paths (test_paper_results.PaperResultsTests.test_pre_fix_sites_are_separate_from_repaired_paths) ... ok\ntest_result_index_contains_actual_members (test_paper_results.PaperResultsTests.test_result_index_contains_actual_members) ... ok\ntest_semaphore_cleanup_orders_access_not_resource_lifetime (test_paper_results.PaperResultsTests.test_semaphore_cleanup_orders_access_not_resource_lifetime) ... ok\ntest_case_requires_candidate (test_records.RecordValidationTests.test_case_requires_candidate) ... ok\ntest_system_record_is_valid (test_records.RecordValidationTests.test_system_record_is_valid) ... ok\ntest_unknown_evidence_level_is_rejected (test_records.RecordValidationTests.test_unknown_evidence_level_is_rejected) ... ok\ntest_unknown_teb_components_remain_explicit (test_records.RecordValidationTests.test_unknown_teb_components_remain_explicit) ... ok\n\n----------------------------------------------------------------------\nRan 33 tests in 3.745s\n\nOK\n"
     },
     {
       "command": [
@@ -35,7 +35,9 @@
         "--result-index"
       ],
       "exit_status": 0,
-      "indexed_causes": 149,
+      "stdout_sha256": "0057b2e499cfa48430249ab3ad68074e519fe874418598f3eb8ee33c91b5cf3b",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "working_directory": "artifact root in a fresh staged-file export",
       "result_index_sections": [
         "collection",
         "consequences",
@@ -53,9 +55,7 @@
         "report_cause_mapping",
         "sensitivity_memberships"
       ],
-      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-      "stdout_sha256": "a50d4f3c665ed2edb9a756a630a827ded32f95d63fd5970dd5e20d4169312fdc",
-      "working_directory": "artifact root in a fresh staged-file export"
+      "indexed_causes": 149
     },
     {
       "command": [
@@ -63,8 +63,8 @@
         "reproduce-main"
       ],
       "exit_status": 0,
+      "stdout_sha256": "e4d5e590086a70cd8effa60694fdfcc03a8a2b69c3765ae7c20e3d8606597a7c",
       "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-      "stdout_sha256": "a34cf04c63685dc2fafc8a7e3e3dcc935445681dd5c0cffe35b8c0200dac3105",
       "working_directory": "artifact root in a fresh staged-file export"
     }
   ],
@@ -112,13 +112,17 @@
         "present|present": 72
       },
       "secondary_pairs": 2235,
-      "secondary_positive_agreement_percent": 59
+      "secondary_positive_agreement_percent": 59.0
     },
     "causal_selection": {
       "selected_first_invalid_decisions": 149,
       "selected_primary_obligations": 149,
       "unresolved_first_invalid_decisions": 0,
       "unresolved_primary_obligations": 0
+    },
+    "coding_corrections": {
+      "corrected_records": 2,
+      "new_human_review": false
     },
     "cohort": {
       "distinct_repaired_causes": 149,
@@ -141,7 +145,7 @@
       "source_baselines": 5,
       "total_records": 7509
     },
-    "data_manifest_files": 3199,
+    "data_manifest_files": 3202,
     "headlines": {
       "corresponding_repairs": 94,
       "flag_counts": {
@@ -150,11 +154,11 @@
         "memory_access_signal": 23
       },
       "flagged_report_union": 60,
-      "leading_failure_causes": 104,
+      "leading_failure_causes": 103,
       "without_pytorch_repository": {
         "causes": 112,
         "incorrect_results": 103,
-        "leading_failure_causes": 77,
+        "leading_failure_causes": 76,
         "reports": 193
       }
     },
@@ -233,7 +237,7 @@
     },
     "status": "ok"
   },
-  "data_manifest_sha256": "a5f7757303f0b0fb510ae5c15bb4dd00791f55d14a43a1078415c4d992b4cefe",
+  "data_manifest_sha256": "bca677495df7077803a75373ee9cb696d72a212df6e7729235c7d74d5e929b36",
   "environment": {
     "os_release": {
       "BUG_REPORT_URL": "https://bugs.launchpad.net/ubuntu/",
@@ -258,8 +262,9 @@
     "Human audit membership, individual labels, and restoration IDs are unavailable; only supplied aggregate arithmetic is verified.",
     "Original taxonomy actors and independent source-operation selections remain unknown.",
     "Historical diagnostics and model calls were not rerun.",
-    "Manuscript and figure builds are checked separately in the paper repository."
+    "Manuscript and figure builds are checked separately in the paper repository.",
+    "The two source-supported coding corrections are revision-time checks, not new human review or independently repeated localization."
   ],
-  "release_id": "tensorbound-2026-10-25-presentation",
-  "verified_at": "2026-10-26T00:05:04.225811+00:00"
+  "release_id": "tensorbound-2026-10-27-source-coding",
+  "verified_at": "2026-10-27T15:49:47.806788+00:00"
 }

@@ -8,20 +8,20 @@
   "failure_mode": {
     "full": {
       "incorrect mapping or translation": 35,
-      "lost or omitted relation": 32,
+      "lost or omitted relation": 31,
       "missing eligibility check": 37,
       "missing ordering or enforcement": 8,
-      "omitted operation": 5,
+      "omitted operation": 6,
       "premature invalidation or stale state": 3,
       "premature or unordered transition": 10,
       "unsound assumption or inference": 19
     },
     "restricted": {
       "incorrect mapping or translation": 25,
-      "lost or omitted relation": 28,
+      "lost or omitted relation": 27,
       "missing eligibility check": 34,
       "missing ordering or enforcement": 8,
-      "omitted operation": 4,
+      "omitted operation": 5,
       "premature invalidation or stale state": 2,
       "premature or unordered transition": 10,
       "unsound assumption or inference": 15
@@ -33,7 +33,7 @@
       "lost or omitted relation",
       "incorrect mapping or translation"
     ],
-    "causes": 87,
-    "percent": 69.04761904761905
+    "causes": 86,
+    "percent": 68.25396825396825
   }
 }

@@ -151,11 +151,17 @@ The cancellation target is concurrently mutated and may no longer identify the a
 
 ## Validity obligation
 
-The synchronization-object identity used by cleanup remains outside callback-cleared state until cleanup completes.
+A cleanup read of callback-mutated state is ordered with the conflicting reset.
+The primary family is happens-before ordering. The caller keeps the semaphore
+alive, and the enclosing timepoint storage remains allocated through cleanup.
+These ownership contracts do not order the read against the callback write.
 
 ## Invalid decision
 
 The old waiter recovered the semaphore identity from the same base subobject that asynchronous resolution resets.
+The selected operation is the read of `timepoints[i].base.semaphore` at
+pre-fix `task_semaphore.c:392`, before cancellation acquires `timepoint_mutex`.
+The callback reset is permitted by its documented contract.
 
 ## Physical effect
 
@@ -176,6 +182,16 @@ Commit d83f4e46 stores a separate semaphore pointer in iree_hal_task_timepoint_t
 ## Why the repair works
 
 The callback may clear the embedded base while the enclosing task timepoint retains the cleanup identity until the waiter finishes.
+The repair therefore removes the conflicting access by preserving the identity
+in a separate field. It leaves semaphore reference counting unchanged.
+
+## Coding correction
+
+The [source check](source-evidence.md) changes the primary obligation from
+ownership and lifetime to happens-before ordering, and the repair category
+from correct ownership or lifetime to preserve or propagate relation.
+The cleanup read remains the selected decision. This is a revision-time
+correction, separate from the earlier human review and archived A/B labels.
 
 ## Causal basis
 

@@ -10,11 +10,11 @@
       "obligation_family": {
         "alias independence": 3,
         "completion and progress": 3,
-        "happens-before ordering": 3,
+        "happens-before ordering": 4,
         "identity correspondence": 8,
         "index and offset preservation": 6,
         "initialization before publication": 2,
-        "ownership and lifetime": 8,
+        "ownership and lifetime": 7,
         "placement and context consistency": 2,
         "policy and configuration propagation": 1,
         "range and alignment safety": 4,
@@ -126,7 +126,7 @@
       "lost or omitted relation": {
         "constrain unsafe transformation": 1,
         "correct mapping or representation": 1,
-        "correct ownership or lifetime": 3,
+        "correct ownership or lifetime": 2,
         "preserve or propagate relation": 27
       },
       "missing eligibility check": {
@@ -138,6 +138,7 @@
         "restore ordering or synchronization": 8
       },
       "omitted operation": {
+        "correct ownership or lifetime": 1,
         "perform omitted operation": 5
       },
       "premature invalidation or stale state": {
@@ -145,8 +146,8 @@
       },
       "premature or unordered transition": {
         "constrain unsafe transformation": 1,
-        "correct ownership or lifetime": 5,
-        "preserve or propagate relation": 1,
+        "correct ownership or lifetime": 4,
+        "preserve or propagate relation": 2,
         "restore ordering or synchronization": 3
       },
       "unsound assumption or inference": {
@@ -170,7 +171,7 @@
       "happens-before ordering": {
         "constrain unsafe transformation": 2,
         "correct mapping or representation": 2,
-        "preserve or propagate relation": 3,
+        "preserve or propagate relation": 4,
         "restore ordering or synchronization": 8,
         "strengthen eligibility check": 5
       },
@@ -196,7 +197,7 @@
         "strengthen eligibility check": 6
       },
       "ownership and lifetime": {
-        "correct ownership or lifetime": 12,
+        "correct ownership or lifetime": 11,
         "strengthen eligibility check": 1
       },
       "placement and context consistency": {
@@ -248,8 +249,8 @@
       },
       "storage--ownership/lifetime": {
         "completion and progress": 1,
-        "happens-before ordering": 1,
-        "ownership and lifetime": 13,
+        "happens-before ordering": 2,
+        "ownership and lifetime": 12,
         "policy and configuration propagation": 1
       },
       "value--operation/identity": {
@@ -319,10 +320,10 @@
   "distinct_repair_backed_causes": 149,
   "failure_mode": {
     "incorrect mapping or translation": 35,
-    "lost or omitted relation": 32,
+    "lost or omitted relation": 31,
     "missing eligibility check": 37,
     "missing ordering or enforcement": 8,
-    "omitted operation": 5,
+    "omitted operation": 6,
     "premature invalidation or stale state": 3,
     "premature or unordered transition": 10,
     "unsound assumption or inference": 19
@@ -348,12 +349,12 @@
   "obligation_family": {
     "alias independence": 11,
     "completion and progress": 4,
-    "happens-before ordering": 20,
+    "happens-before ordering": 21,
     "identity correspondence": 16,
     "index and offset preservation": 18,
     "initialization before publication": 4,
     "layout compatibility": 11,
-    "ownership and lifetime": 13,
+    "ownership and lifetime": 12,
     "placement and context consistency": 13,
     "policy and configuration propagation": 7,
     "range and alignment safety": 10,
@@ -382,9 +383,9 @@
   "repair_strategy": {
     "constrain unsafe transformation": 8,
     "correct mapping or representation": 42,
-    "correct ownership or lifetime": 12,
+    "correct ownership or lifetime": 11,
     "perform omitted operation": 6,
-    "preserve or propagate relation": 32,
+    "preserve or propagate relation": 33,
     "restore ordering or synchronization": 11,
     "strengthen eligibility check": 38
   },
@@ -593,7 +594,8 @@
       }
     ],
     "raw_label_agreement": 0.9552572706935123,
-    "resolution_rule": "A label is published as secondary only when both archived coding passes selected it after the reconciled primary label is removed from each set."
+    "resolution_rule": "A label is published as secondary only when both archived coding passes selected it after the reconciled primary label is removed from each set.",
+    "reference_labels": "Historical primary labels before the revisions in results/coding-corrections.json; this analysis is no longer reported in the current paper."
   },
   "transition_family": {
     "identity or index remapping": 31,

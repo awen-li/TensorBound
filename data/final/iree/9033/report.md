@@ -150,7 +150,7 @@ cc @powderluv
 
 ## Trigger
 
-A Python function returns a device array after its local driver and device references leave scope.
+Python teardown releases device and driver references while an array buffer remains live.
 
 ## Relevant entities
 
@@ -178,7 +178,11 @@ The backing allocator remains alive until every buffer that uses it has complete
 
 ## Invalid decision
 
-Buffer initialization stored the allocator pointer without retaining the allocator.
+Returning from `iree_hal_buffer_initialize` leaves the allocator pointer stored without acquiring the reference required through buffer destruction.
+The selected operation is the initializer's implicit return at pre-fix line 202;
+the pointer assignment at line 188 can still be followed by a retain.
+The [source evidence](source-evidence.md) records the complete initializer body,
+the downstream allocator use, and the regression test.
 
 ## Physical effect
 
@@ -203,6 +207,14 @@ The buffer now owns an allocator reference for exactly the interval in which des
 ## Causal basis
 
 The retain/release delta and regression test directly restore the lifetime relation identified in the issue.
+
+## Failure family
+
+Omitted operation. The allocator pointer reaches the buffer and its deallocation
+path, but the required retain is absent. This corrects the earlier lost-or-omitted-
+relation label under the existing codebook rule. The ownership/lifetime relation,
+transition, primary obligation, and repair strategy are unchanged. This is a
+revision-time source check, separate from the earlier human review.
 
 ## Analysis implication
 

@@ -46,6 +46,36 @@ class PaperResultsTests(unittest.TestCase):
     def test_pre_fix_sites_are_separate_from_repaired_paths(self):
         self.assertEqual(V.verify_source_corrections()["corrected_records"], 3)
 
+    def test_allocator_retain_is_an_omitted_operation(self):
+        result = V.verify_coding_corrections()
+        self.assertEqual(result["corrected_records"], 2)
+        self.assertFalse(result["new_human_review"])
+        summary = V.read_json("results/rq-analysis-summary.json")
+        matrix = summary["cross_tabs"]["failure_by_repair"]
+        self.assertEqual(matrix["lost or omitted relation"]["correct ownership or lifetime"], 2)
+        self.assertEqual(matrix["omitted operation"]["correct ownership or lifetime"], 1)
+        self.assertEqual(V.verify_headline_results()["leading_failure_causes"], 103)
+
+    def test_historical_reconciliation_is_preserved(self):
+        agreement = V.read_json("results/statistics/taxonomy-agreement-summary.json")
+        historical = agreement["failure_mode_marginals"]["reconciled"]
+        self.assertEqual(historical["lost or omitted relation"], 32)
+        self.assertEqual(historical["omitted operation"], 5)
+        self.assertEqual(V.verify_archived_assignments()["primary_agreement"]["failure_mode"]["agreements"], 112)
+
+    def test_semaphore_cleanup_orders_access_not_resource_lifetime(self):
+        cause_id = "cause-iree-9392-callback-cleanup-identity"
+        cause = next(row for row in V.read_csv("results/rq-cause-analysis.csv")
+                     if row["cause_id"] == cause_id)
+        self.assertEqual(cause["obligation_family"], "happens-before ordering")
+        self.assertEqual(cause["repair_strategy"], "preserve or propagate relation")
+        self.assertEqual(V.historical_primary_obligations()[cause_id], "ownership and lifetime")
+        summary = V.read_json("results/rq-analysis-summary.json")
+        self.assertEqual(summary["obligation_family"]["happens-before ordering"], 21)
+        self.assertEqual(summary["obligation_family"]["ownership and lifetime"], 12)
+        self.assertEqual(summary["repair_strategy"]["correct ownership or lifetime"], 11)
+        self.assertEqual(summary["repair_strategy"]["preserve or propagate relation"], 33)
+
     def test_result_index_contains_actual_members(self):
         index = V.result_index()
         mapping = index["report_cause_mapping"]

@@ -528,6 +528,13 @@ def verify_phase1_human_totals():
             "missing_records": data["missing_records"], **observed}
 
 
+def historical_primary_obligations():
+    """Keep archived secondary-mask calculations tied to their original primary labels."""
+    return {row["cause_id"]: row["old_value"]
+            for row in read_json("results/coding-corrections.json")["corrections"]
+            if row["field"] == "obligation_family"}
+
+
 def verify_archived_assignments():
     rows = jsonl("results/statistics/archived-taxonomy-assignments.jsonl")
     causes = {row["cause_id"]: row for row in read_csv("results/rq-cause-analysis.csv")}
@@ -545,12 +552,13 @@ def verify_archived_assignments():
                 f"archived assignment agreement differs: {field}")
         primary_results[field] = {"agreements": count, "kappa": kappa}
     secondary = read_json("results/statistics/secondary-obligation-summary.json")
+    historical_primary = historical_primary_obligations()
     vocabulary = set(secondary["label_vocabulary"])
     counts = Counter()
     retained_labels = compound = exact_sets = 0
     for row in rows:
         cause = causes[row["cause_id"]]
-        primary = cause["obligation_family"]
+        primary = historical_primary.get(row["cause_id"], cause["obligation_family"])
         # The source assignment arrays are unchanged; the mask is a derived view.
         a = set(row["pass_a"]["secondary_obligation_families"]) - {primary}
         b = set(row["pass_b"]["secondary_obligation_families"]) - {primary}
@@ -596,6 +604,47 @@ def verify_source_corrections():
     return {"corrected_records": len(corrections), "independent_human_validation": False}
 
 
+def verify_coding_corrections():
+    log = read_json("results/coding-corrections.json")
+    require(log["historical_human_validation"] is False,
+            "revision-time coding check is mislabeled as historical human review")
+    causes = {row["cause_id"]: row for row in read_csv("results/rq-cause-analysis.csv")}
+    alignment = {row["cause_id"]: row for row in read_csv("results/historical-alignment.csv")}
+    audit = {row["cause_id"]: row for row in read_csv("results/causal-selection-audit.csv")}
+    paths = {row["cause_id"]: row for row in jsonl("results/rq-cause-paths.jsonl")}
+    seen = set()
+    for correction in log["corrections"]:
+        cause_id = correction["cause_id"]
+        require(cause_id not in seen, "duplicate coding correction")
+        seen.add(cause_id)
+        row = causes[cause_id]
+        require(row[correction["field"]] == correction["new_value"],
+                f"coding correction not propagated: {cause_id}")
+        for field, change in correction.get("additional_label_changes", {}).items():
+            require(row[field] == change["new_value"],
+                    f"additional coding correction not propagated: {cause_id}/{field}")
+        require(all(row[field] == label for field, label in correction["preserved_labels"].items()),
+                f"unrelated labels changed: {cause_id}")
+        site = correction["first_invalid_decision_site"]
+        require(alignment[cause_id]["first_invalid_decision_site"] == site
+                and audit[cause_id]["first_invalid_decision_site"] == site
+                and paths[cause_id]["pre_fix_decision_site"] == site,
+                f"coding correction source anchors differ: {cause_id}")
+        require(alignment[cause_id]["pre_fix_revision"] == correction["pre_fix_revision"],
+                f"coding correction revision differs: {cause_id}")
+        for path in correction["evidence"]:
+            require((ROOT / path).is_file(), f"coding correction evidence missing: {path}")
+    require(seen == {"cause-iree-9033-buffer-retains-allocator",
+                     "cause-iree-9392-callback-cleanup-identity"},
+            "unexpected coding-correction scope")
+    patch = (ROOT / "data/final/iree/9033/fixes/iree-9033-fix.patch").read_text()
+    require("+    iree_hal_allocator_retain(device_allocator);" in patch
+            and "+      iree_hal_allocator_release(device_allocator_to_release);" in patch
+            and "+  def testGcShutdownFiasco(self):" in patch,
+            "allocator retain/release or supporting regression is absent")
+    return {"corrected_records": len(seen), "new_human_review": False}
+
+
 def verify_results():
     causes = read_csv("results/rq-cause-analysis.csv")
     ids = {r["cause_id"] for r in causes}
@@ -615,8 +664,14 @@ def verify_results():
     marginals = agreement["failure_mode_marginals"]
     require(all(sum(counts.values()) == 149 for counts in marginals.values()),
             "failure-mode marginal denominator differs")
-    require(marginals["reconciled"] == dict(Counter(r["failure_mode"] for r in causes)),
-            "reconciled failure-mode marginals differ")
+    # Preserve historical reconciliation; apply documented revision-time corrections.
+    current_failures = Counter(marginals["reconciled"])
+    for correction in read_json("results/coding-corrections.json")["corrections"]:
+        if correction["field"] == "failure_mode":
+            current_failures[correction["old_value"]] -= 1
+            current_failures[correction["new_value"]] += 1
+    require(dict(current_failures) == dict(Counter(r["failure_mode"] for r in causes)),
+            "corrected failure-mode marginals differ")
     require(marginals["pass_a"] == {
         "incorrect mapping or translation": 34,
         "lost or omitted relation": 29,
@@ -667,12 +722,14 @@ def verify_results():
                 expected == {family: observed.get(family, 0) for family in consequence_families},
                 f"repository consequence counts differ: {repository}")
     pairs = Counter()
+    historical_primary = historical_primary_obligations()
     secondary_causes = secondary_labels = 0
     for row in causes:
         labels = [value.strip() for value in row["secondary_obligation_families"].split(";") if value.strip()]
         secondary_causes += bool(labels)
         secondary_labels += len(labels)
-        pairs.update((row["obligation_family"], label) for label in labels)
+        primary = historical_primary.get(row["cause_id"], row["obligation_family"])
+        pairs.update((primary, label) for label in labels)
     secondary = summary["secondary_obligation_analysis"]
     require(secondary_causes == secondary["causes_with_consensus_secondary"], "secondary cause count differs")
     require(secondary_labels == secondary["consensus_secondary_labels"], "secondary label count differs")
@@ -680,6 +737,10 @@ def verify_results():
             "primary-secondary pairs differ")
     attempts = read_csv("results/rq6-diagnostic-attempts.csv")
     ds = read_json("results/rq6-summary.json")
+    require(ds["primary_obligation"] == summary["obligation_family"]
+            and ds["repair_strategy"] == summary["repair_strategy"]
+            and ds["obligation_by_repair_strategy"] == summary["cross_tabs"]["obligation_by_repair"],
+            "RQ6 primary-obligation or repair summary differs")
     for field, counts in ds["diagnostic_outcomes"].items():
         require(dict(Counter(r[field] for r in attempts)) == counts, f"diagnostic counts differ: {field}")
     return {"families": {f: len(summary[f]) for f in dimensions},
@@ -763,7 +824,7 @@ def verify_headline_results():
     flag_fields = ("memory_access_signal", "concurrency_signal", "availability_signal")
     flagged = [row for row in reports if any(row[field] == "yes" for field in flag_fields)]
     flags = {field: sum(row[field] == "yes" for row in reports) for field in flag_fields}
-    require(len(leading) == 104 and len(matching) == 94, "headline mechanism/repair counts differ")
+    require(len(leading) == 103 and len(matching) == 94, "headline mechanism/repair counts differ")
     require(list(flags.values()) == [23, 14, 24] and len(flagged) == 60,
             "report flag counts or union differ")
     other_reports = [row for row in reports if row["repository"] != "pytorch/pytorch"]
@@ -772,7 +833,7 @@ def verify_headline_results():
             "PyTorch-repository exclusion membership differs")
     incorrect = sum(row["primary_observed_consequence"] == "incorrect result or state" for row in other_reports)
     remaining_leading = sum(row["failure_mode"] in corresponding for row in other_causes)
-    require(incorrect == 103 and remaining_leading == 77, "repository sensitivity counts differ")
+    require(incorrect == 103 and remaining_leading == 76, "repository sensitivity counts differ")
     attempts = read_csv("results/rq6-diagnostic-attempts.csv")
     require(len(attempts) == 4 and len({row["cause_id"] for row in attempts}) == 3,
             "diagnostic attempt/cause grouping differs")
@@ -849,6 +910,7 @@ def verify() -> dict[str, object]:
         "phase1_reported_human_totals": verify_phase1_human_totals(),
         "archived_taxonomy_assignments": verify_archived_assignments(),
         "source_location_corrections": verify_source_corrections(),
+        "coding_corrections": verify_coding_corrections(),
         "headlines": verify_headline_results(),
     }
 

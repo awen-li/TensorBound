@@ -39,6 +39,13 @@ of exclusively pre-fix executed operations. The three corrected JAX records
 explicitly name this path kind and their separate pre-fix decision.
 `source-location-corrections.json` preserves the old/new anchors, alternatives,
 evidence, and label checks made during the 2026-10-25 revision.
+`coding-corrections.json` records the 2026-10-27 correction of IREE 9033 to
+**omitted operation**, with its initializer-completion source anchor and
+unchanged ownership/lifetime labels. The case includes the pre-fix initializer
+body and the retain/release repair evidence. The same log corrects IREE 9392's
+primary obligation to happens-before ordering and its repair category to
+preserve or propagate relation. Its source check distinguishes the unordered
+cleanup read from the unchanged semaphore ownership contract.
 
 `source-baselines.json` identifies the five lookup snapshots. Case-specific
 historical revisions, rather than those common snapshots, support each repair
@@ -69,6 +76,12 @@ their original strings. All other full family names correspond directly.
 checked all 149 causes and the report-to-cause mapping. Individual review logs
 and independent pre-discussion source-operation choices are unavailable.
 The October 25 source-location corrections are a separate evidence-check record.
+The October 27 coding corrections are also separate from that human review.
+Earlier reconciled failure-family marginals and all A/B assignments remain
+unchanged; current distributions apply the documented coding corrections.
+The secondary-obligation fields and summaries preserve the archived analysis,
+which the current paper no longer reports. Their masks use the pre-correction
+primary labels recorded in the correction log, not the revised primary labels.
 
 ## RQ outputs and verification
 

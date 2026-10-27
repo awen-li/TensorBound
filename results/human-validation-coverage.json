@@ -36,5 +36,10 @@
   },
   "review_mode": "iterative evidence-based confirmation of assembled cause dossiers",
   "reviewers": 2,
-  "schema_version": "1.0.0"
+  "schema_version": "1.0.0",
+  "revision_time_checks": {
+    "record": "results/coding-corrections.json",
+    "scope": "Two source-supported coding corrections and source-anchor checks after the reported human review.",
+    "new_human_confirmation": false
+  }
 }

@@ -18,6 +18,7 @@ a checksum or successful numerical check is not evidence of independent judgment
 | Model-review history | Procedure/configuration summarized in the manuscript | Model inputs, outputs, prompts and full run manifests are outside this clean release; exact model replay unsupported |
 | Diagnostic attempts | `results/rq6-diagnostic-attempts.csv` and each `evidence_path` | Preserved commands/output and separate later diagnosis; current reruns untested |
 | Source-location corrections | `results/source-location-corrections.json` | Assistant evidence checks dated 2026-10-25; separate from historical human confirmation |
+| Coding corrections | `results/coding-corrections.json` | Source-supported allocator-retain and semaphore-cleanup corrections dated 2026-10-27; current primary counts updated, historical review and comparison records preserved |
 | Derived results | RQ summaries, sensitivity outputs and `--result-index` | Counts, matrix cells and member IDs from final labels; human-review tables remain aggregate-only |
 | Manuscript and figures | Separate TensorBound-paper repository | LaTeX/ReportLab dependencies and build instructions are documented there |
 
